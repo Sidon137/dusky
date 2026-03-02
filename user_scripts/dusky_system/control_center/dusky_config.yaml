@@ -1072,6 +1072,24 @@ pages:
       icon: ''
       description: ''
     items:
+    - type: button
+      properties:
+        title: GSettings & GTK
+        description: Manage GNOME/GTK settings via TUI or GUI
+        icon: preferences-desktop-peripherals-symbolic
+        buttons:
+          - icon: text-x-script-symbolic
+            button_text: "Dconf"
+            on_press:
+              type: exec
+              command: dconf-editor
+          - icon: utilities-terminal-symbolic
+            button_text: "TUI"
+            style: suggested
+            on_press:
+              type: exec
+              command: kitty --class dusky_gsettings.sh --hold sh -c "$HOME/user_scripts/gtk/dusky_gsettings.sh"
+              terminal: false
     - type: selection
       properties:
         title: Clipboard Persistence
