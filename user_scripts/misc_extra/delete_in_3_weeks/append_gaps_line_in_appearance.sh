@@ -22,13 +22,26 @@ log_err()  { printf "%s[ERROR]%s %s\n" "${C_RED}${C_BOLD}" "${C_RESET}" "$*" >&2
 # EDIT HERE: USER CONFIGURATION
 # ==============================================================================
 # 1. Define the target file (Symlinks handled automatically).
-readonly TARGET_FILE="${HOME}/.config/hypr/edit_here/appearance.conf"
 
 # 2. Define the exact, literal line or lines (singluar or plural) you want to ensure exist in the file.
+# ==============================================================================
+# HOW TO ADD LINES:
+# ALWAYS wrap each line in SINGLE QUOTES (' ').
+#
+# WHY?
+# 1. It prevents Bash from breaking lines apart at the spaces.
+# 2. It prevents Bash from crashing when it sees Hyprland variables (like $mainMod).
+#
+# GOOD: '$single_window_gap = 10'
+# BAD:  $single_window_gap = 10
+# ==============================================================================
+
+readonly TARGET_FILE="${HOME}/.config/hypr/edit_here/source/appearance.conf"
+
 readonly TARGET_LINES=(
-$single_window_gap = 10
-workspace = w[tv1], gapsout:$single_window_gap, gapsin:0
-workspace = f[1], gapsout:$single_window_gap, gapsin:0
+    '$single_window_gap = 10'
+    'workspace = w[tv1], gapsout:$single_window_gap, gapsin:0'
+    'workspace = f[1], gapsout:$single_window_gap, gapsin:0'
 )
 # ==============================================================================
 
