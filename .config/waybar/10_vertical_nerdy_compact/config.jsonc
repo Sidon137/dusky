@@ -1,7 +1,4 @@
 [
-    // ===================================================================
-    // PRECISION THIN VERTICAL (Width 10)
-    // ===================================================================
     {
         "layer": "top",
         "position": "left",
@@ -14,9 +11,6 @@
         "fixed-center": true,
         "reload_style_on_change": true,
 
-        // ===================================================================
-        // MODULE ORDERING (GROUPED)
-        // ===================================================================
         "modules-left": [
             "battery",
             "group/media",
@@ -30,15 +24,10 @@
         "modules-right": [
             "group/utils",
             "group/connections",
-            "custom/audiorouter",
             "clock",
-            "custom/power"
+            "group/bottom"
         ],
 
-        // ===================================================================
-        // GROUPS
-        // ===================================================================
-        
         "group/media": {
             "orientation": "inherit",
             "modules": [
@@ -58,11 +47,15 @@
 
         "group/utils": {
             "orientation": "inherit",
+            "drawer": {
+                "transition-duration": 300,
+                "transition-left-to-right": false
+            },
             "modules": [
+                "custom/notification",
                 "custom/theme",
                 "custom/app-tray",
-                "custom/inhibit-suspend",
-                "custom/notification"
+                "custom/inhibit-suspend"
             ]
         },
 
@@ -74,16 +67,24 @@
             ]
         },
 
-        // ===================================================================
-        // HARDWARE MODULES
-        // ===================================================================
+        "group/bottom": {
+            "orientation": "inherit",
+            "drawer": {
+                "transition-duration": 300,
+                "transition-left-to-right": false
+            },
+            "modules": [
+                "custom/power",
+                "custom/audiorouter",
+                "tray"
+            ]
+        },
 
         "hyprland/workspaces": {
             "on-click": "activate",
             "all-outputs": true,
             "sort-by-number": true,
             "format": " ",
-
             "persistent-workspaces": {
                  "*": 4
             },
@@ -92,9 +93,8 @@
         },
 
         "battery": {
-            // Vertical stacking required for 10px width
-            "format": " {icon}\n{capacity}\n{power:.0f}W",
-            "format-charging": " \n+{capacity}\n{power:.0f}W",
+            "format": "{icon}\n{capacity}\n{power:.0f}W",
+            "format-charging": "\n+{capacity}\n{power:.0f}W",
             "format-plugged": "\n{capacity}",
             "format-icons": ["󰂎", "󰁺", "󰁻", "󰁼", "󰁽", "󰁾", "󰁿", "󰂀", "󰂁", "󰂂", "󰁹"],
             "interval": 10,
@@ -199,10 +199,6 @@
                 "on-scroll-down": "shift_down"
             }
         },
-
-        // ===================================================================
-        // CUSTOM MODULES
-        // ===================================================================
 
         "custom/audiorouter": {
             "format": "{}",
