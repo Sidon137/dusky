@@ -1100,36 +1100,21 @@ _Enroll the custom keys into your UEFI firmware_
 sbctl enroll-keys -m
 ```
 
-_Sign the Limine EFI binary_
+_Sign the Limine EFI binary and the Linux Kernel_
 
 ```bash
 sbctl sign -s /boot/EFI/BOOT/BOOTX64.EFI
 ```
+```bash
+sbctl sign -s /boot/vmlinuz-linux
+```
+
 >[!warning] Architectural Limitation: Kernel Verification
 > Because Limine boots the kernel using protocol: linux, it loads the kernel file directly without verifying its PE/COFF cryptographic signature against the UEFI keys.
 > This setup ensures the motherboard validates the Limine bootloader (BOOTX64.EFI), preventing straightforward tampering of the EFI partition. However, true end-to-end Secure Boot requires migrating to Unified Kernel Images (UKIs) later.
 
 > [!note]- What the -s flag does
 > Passing -s tells sbctl to save this file path to its internal database. The pacman hook we create next will automatically re-sign the Limine binary whenever the limine package is upgraded.
-
-#### 25g. Update the Limine Pacman Hook for Secure Boot
-
-> [!important] In Step 25e, we created a hook to update the Limine EFI binary. We must overwrite it so the new binary gets signed automatically on update, otherwise, a bootloader update will break your Secure Boot chain.
-
-```
-cat > /etc/pacman.d/hooks/limine-update.hook << 'EOF'
-[Trigger]
-Type = Package
-Operation = Install
-Operation = Upgrade
-Target = limine
-
-[Action]
-Description = Deploying and signing updated Limine EFI binary...
-When = PostTransaction
-Exec = /usr/bin/bash -c '/usr/bin/cp /usr/share/limine/BOOTX64.EFI /boot/EFI/BOOT/BOOTX64.EFI && /usr/bin/sbctl sign -s /boot/EFI/BOOT/BOOTX64.EFI'
-EOF
-```
 
 > [!tip] **Final Step:** After you finish the rest of this installation guide and reboot your system for the first time, go back into your BIOS and **Enable Secure Boot**. Your system will now cryptographically reject any boot binaries not signed by your custom keys.
 
@@ -2071,7 +2056,7 @@ cat /proc/cmdline                                           # Current boot cmdli
 
 # ─── Initramfs ──────────────────────────────────────────────────
 sudo mkinitcpio -P                                          # Rebuild all initramfs
-grep '^HOOKS' /etc/mkinitcpio.conf                          # Check HOOKS order
+cat /etc/mkinitcpio.conf.d/10-arch-btrfs-luks.conf          # Check HOOKS order
 
 # ─── Swap Status ────────────────────────────────────────────────
 swapon --show                                               # Show active swap devices
@@ -2187,13 +2172,22 @@ sudo systemctl enable --now snapper-cleanup.timer
 > mount -o subvol=@ /dev/mapper/cryptroot /mnt
 > mount /dev/esp_partition /mnt/boot
 > arch-chroot /mnt
+> ```
+> # Verify HOOKS in your drop-in file — keyboard MUST be before autodetect
+> ```bash
+> cat /etc/mkinitcpio.conf.d/10-arch-btrfs-luks.conf
+> ```
 >
-> # Verify HOOKS — keyboard MUST be before autodetect
-> grep '^HOOKS' /etc/mkinitcpio.conf
+> # Fix if needed using modern Bash redirection
+> ```bash
+> cat << 'EOF' > /etc/mkinitcpio.conf.d/10-arch-btrfs-luks.conf
+> MODULES=(btrfs)
+> BINARIES=(/usr/bin/btrfs)
+> HOOKS=(systemd keyboard autodetect microcode modconf kms sd-vconsole block sd-encrypt filesystems)
+> EOF
+> ```
 >
-> # Fix if needed
-> sed -i 's/^HOOKS=.*/HOOKS=(systemd keyboard autodetect microcode modconf kms sd-vconsole block sd-encrypt filesystems)/' /etc/mkinitcpio.conf
->
+> ```bash
 > mkinitcpio -P
 > exit
 > umount -R /mnt
