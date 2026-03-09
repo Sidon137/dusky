@@ -22,6 +22,7 @@
 .config/matugen/templates/
 .config/matugen/presets/
 .config/mpv/mpv.conf
+.config/opencode/opencode.json
 .config/pacman/makepkg.conf
 .config/pacseek/
 .config/swaync/
