@@ -20,6 +20,7 @@ SCRIPT_SEARCH_DIRS=(
     "${HOME}/user_scripts/arch_setup_scripts/scripts"
     "${HOME}/user_scripts/arch_setup_scripts"
     "${HOME}/user_scripts/rofi"
+    "${HOME}/user_scripts/theme_matugen"
     # "${HOME}/my_other_scripts"
     # "/opt/shared_team_scripts"
 )
@@ -60,6 +61,9 @@ INSTALL_SEQUENCE=(
     "U | 130_copy_service_files.sh"
     "U | 131_dbus_copy_service_files.sh"
     "U | 135_battery_notify_service.sh"
+
+    "U | dusky_matugen_config_tui.sh --smart"
+
     "U | 140_fc_cache_fv.sh"
     "U | 145_matugen_directories.sh"
     "U | 150_wallpapers_download.sh"

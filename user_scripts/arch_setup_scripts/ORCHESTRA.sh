@@ -31,10 +31,9 @@ POST_SCRIPT_DELAY=0
 INSTALL_SEQUENCE=(
 
 # ------ CUSTOM PATH SCRIPTS -------
-#    "U | deploy_dotfiles.sh --force"
+    "U | deploy_dotfiles.sh --force"
 
 # ------ Setup SCRIPTS -------
-
 
     "U | 005_hypr_custom_config_setup.sh"
     "U | 010_package_removal.sh --auto"
@@ -63,6 +62,9 @@ INSTALL_SEQUENCE=(
     "U | 131_dbus_copy_service_files.sh"
     "U | 135_battery_notify_service.sh --auto"
     "U | 140_fc_cache_fv.sh"
+
+    "U | dusky_matugen_config_tui.sh --smart"
+
     "U | 145_matugen_directories.sh"
     "U | 150_wallpapers_download.sh"
     "U | 155_blur_shadow_opacity.sh"
