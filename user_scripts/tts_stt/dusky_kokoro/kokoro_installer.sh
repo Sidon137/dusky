@@ -11,8 +11,8 @@ readonly MODEL_DIR="$ENV_DIR/models"
 readonly TRIGGER_DIR="$HOME/user_scripts/tts_stt/dusky_kokoro"
 readonly TARGET_TRIGGER="$TRIGGER_DIR/trigger.sh"
 
-readonly MODEL_URL="https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files/kokoro-v0_19.onnx"
-readonly VOICES_URL="https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files/voices.bin"
+readonly MODEL_URL="https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx"
+readonly VOICES_URL="https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
 
 echo ":: [V35] Initializing Dusky Kokoro Setup..."
 
@@ -118,13 +118,13 @@ case "$MODE" in
 esac
 
 # --- 5. Model Downloads ---
-if [[ ! -f "$MODEL_DIR/kokoro-v0_19.onnx" ]]; then
+if [[ ! -f "$MODEL_DIR/kokoro-v1.0.onnx" ]]; then
     echo ":: Downloading ONNX Model..."
-    curl -L "$MODEL_URL" -o "$MODEL_DIR/kokoro-v0_19.onnx"
+    curl -L "$MODEL_URL" -o "$MODEL_DIR/kokoro-v1.0.onnx"
 fi
-if [[ ! -f "$MODEL_DIR/voices.bin" ]]; then
+if [[ ! -f "$MODEL_DIR/voices-v1.0.bin" ]]; then
     echo ":: Downloading Voices..."
-    curl -L "$VOICES_URL" -o "$MODEL_DIR/voices.bin"
+    curl -L "$VOICES_URL" -o "$MODEL_DIR/voices-v1.0.bin"
 fi
 
 # --- 6. Generate Trigger ---

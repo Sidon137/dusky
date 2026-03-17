@@ -450,8 +450,8 @@ class DuskyDaemon:
         self.fifo_reader = FifoReader(self.text_queue, FIFO_PATH)
         env_dir = Path(__file__).parent
         self.kokoro = None
-        self.model_path = str(env_dir / "models/kokoro-v0_19.onnx")
-        self.voices_path = str(env_dir / "models/voices.bin")
+        self.model_path = str(env_dir / "models/kokoro-v1.0.onnx")
+        self.voices_path = str(env_dir / "models/voices-v1.0.bin")
         self.last_used = 0
 
     def get_model(self):
