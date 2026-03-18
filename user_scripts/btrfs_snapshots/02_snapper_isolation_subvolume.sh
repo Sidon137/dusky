@@ -17,10 +17,11 @@ declare -a ACTIVE_TEMP_MOUNTS=()
 declare -a ACTIVE_TEMP_FILES=()
 declare -a ROLLBACK_CMDS=()
 SUDO_PID=""
+ROLLBACK_ON_EXIT=false
 
 cleanup() {
     local cmd mnt f
-    if (( ${#ROLLBACK_CMDS[@]} > 0 )); then
+    if [[ "$ROLLBACK_ON_EXIT" == true ]] && (( ${#ROLLBACK_CMDS[@]} > 0 )); then
         warn "Executing transactional rollbacks..."
         for cmd in "${ROLLBACK_CMDS[@]}"; do eval "$cmd" 2>/dev/null || true; done
     fi
@@ -35,12 +36,12 @@ cleanup() {
 }
 
 trap_exit() { cleanup; }
-trap_interrupt() { cleanup; printf '\n\033[1;31m[FATAL]\033[0m Script interrupted.\n' >&2; exit 130; }
-trap 'printf "\n\033[1;31m[FATAL]\033[0m Script failed at line %d. Command: %s\n" "$LINENO" "$BASH_COMMAND" >&2; cleanup' ERR
+trap_interrupt() { ROLLBACK_ON_EXIT=true; cleanup; printf '\n\033[1;31m[FATAL]\033[0m Script interrupted.\n' >&2; exit 130; }
+trap 'ROLLBACK_ON_EXIT=true; printf "\n\033[1;31m[FATAL]\033[0m Script failed at line %d. Command: %s\n" "$LINENO" "$BASH_COMMAND" >&2; cleanup' ERR
 trap trap_exit EXIT
 trap trap_interrupt INT TERM HUP
 
-fatal() { printf '\033[1;31m[FATAL]\033[0m %s\n' "$1" >&2; exit 1; }
+fatal() { ROLLBACK_ON_EXIT=true; printf '\033[1;31m[FATAL]\033[0m %s\n' "$1" >&2; exit 1; }
 info() { printf '\033[1;32m[INFO]\033[0m %s\n' "$1"; }
 warn() { printf '\033[1;33m[WARN]\033[0m %s\n' "$1" >&2; }
 
@@ -152,7 +153,13 @@ verify_snapshots_mount() {
 }
 
 install_packages() { sudo pacman -S --needed --noconfirm snapper btrfs-progs; }
-post_install_checks() { require_cmd btrfs; require_cmd snapper; require_cmd systemctl; }
+
+post_install_checks() {
+    require_cmd btrfs
+    require_cmd snapper
+    require_cmd systemctl
+    path_is_btrfs_subvolume "/home" || fatal "/home is not a Btrfs subvolume."
+}
 
 ensure_snapper_config() {
     local config_name="$1" config_path="$2"
@@ -308,5 +315,4 @@ execute "Mount /home/.snapshots" mount_snapshots "/home/.snapshots" "@home_snaps
 execute "Verify Snapper home" verify_snapper_works "home"
 execute "Tune Snapper home" tune_snapper "home"
 
-# FIXED: Function declaration moved outside the execute call
 execute "Apply Global Btrfs Settings" apply_global_btrfs_tuning

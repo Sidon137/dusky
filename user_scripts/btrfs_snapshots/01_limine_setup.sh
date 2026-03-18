@@ -272,6 +272,14 @@ install_aur_packages() {
     NEEDS_LIMINE_UPDATE=true
 }
 
+get_crypt_ancestor() {
+    local source="$1" path type
+    while read -r path type; do
+        [[ "$type" == "crypt" ]] && { printf '%s\n' "$path"; return 0; }
+    done < <(lsblk -s -n -o PATH,TYPE "$source" 2>/dev/null || true)
+    return 1
+}
+
 configure_cmdline() {
     require_cmd btrfs
     load_mount_info "/"
@@ -279,13 +287,16 @@ configure_cmdline() {
     local root_source="${CACHE_MNT_SOURCE["/"]}"
     local mount_opts="${CACHE_MNT_OPTS["/"]}"
     local root_type root_subvol rootflags root_mode
-    local mapper_name backing_dev luks_uuid root_uuid tmp img
+    local crypt_source mapper_name backing_dev luks_uuid root_uuid tmp img
     local -a ucode_imgs=() cmdline_parts=()
 
     get_effective_hooks
 
     root_type="$(lsblk -no TYPE "$root_source" 2>/dev/null | head -n1 || true)"
     [[ -n "$root_type" ]] || fatal "Could not determine block device type."
+
+    root_uuid="${CACHE_MNT_UUID["/"]}"
+    [[ -n "$root_uuid" && "$root_uuid" != "-" ]] || fatal "Could not determine root filesystem UUID."
 
     root_subvol="$(get_root_subvolume_path || true)"
     rootflags="$(build_btrfs_rootflags "$mount_opts" "$root_subvol")"
@@ -296,19 +307,35 @@ configure_cmdline() {
     cmdline_parts+=("${root_mode}" "rootfstype=btrfs")
     [[ -n "$rootflags" ]] && cmdline_parts+=("rootflags=${rootflags}")
 
+    crypt_source=""
     if [[ "$root_type" == "crypt" ]]; then
-        require_cmd cryptsetup
-        mapper_name="${root_source##*/}"
-        backing_dev="$(sudo cryptsetup status "$root_source" 2>/dev/null | grep 'device:' | awk '{print $2}' || true)"
-        [[ -n "$backing_dev" ]] || fatal "Root is on dm-crypt, but backing device could not be determined."
-        luks_uuid="$(sudo blkid -s UUID -o value "$backing_dev" 2>/dev/null || true)"
+        crypt_source="$root_source"
+    else
+        crypt_source="$(get_crypt_ancestor "$root_source" || true)"
+    fi
 
-        if hook_present sd-encrypt; then cmdline_parts+=("rd.luks.name=${luks_uuid}=${mapper_name}" "root=/dev/mapper/${mapper_name}")
-        elif hook_present encrypt; then cmdline_parts+=("cryptdevice=UUID=${luks_uuid}:${mapper_name}" "root=/dev/mapper/${mapper_name}")
-        else fatal "Root is on dm-crypt, but no encrypt hook found in mkinitcpio."
+    if [[ -n "$crypt_source" ]]; then
+        require_cmd cryptsetup
+        mapper_name="${crypt_source##*/}"
+        backing_dev="$(sudo cryptsetup status "$crypt_source" 2>/dev/null | awk '/device:/ { print $2; exit }' || true)"
+        [[ -n "$backing_dev" ]] || fatal "Root depends on dm-crypt, but backing device could not be determined."
+        luks_uuid="$(sudo blkid -s UUID -o value "$backing_dev" 2>/dev/null || true)"
+        [[ -n "$luks_uuid" ]] || fatal "Could not determine LUKS UUID for $backing_dev."
+
+        if hook_present sd-encrypt; then
+            cmdline_parts+=("rd.luks.name=${luks_uuid}=${mapper_name}")
+        elif hook_present encrypt; then
+            cmdline_parts+=("cryptdevice=UUID=${luks_uuid}:${mapper_name}")
+        else
+            fatal "Root depends on dm-crypt, but no encrypt hook found in mkinitcpio."
+        fi
+
+        if [[ "$root_source" == "$crypt_source" ]]; then
+            cmdline_parts+=("root=/dev/mapper/${mapper_name}")
+        else
+            cmdline_parts+=("root=UUID=${root_uuid}")
         fi
     else
-        root_uuid="${CACHE_MNT_UUID["/"]}"
         cmdline_parts+=("root=UUID=${root_uuid}")
     fi
 
@@ -338,7 +365,12 @@ configure_cmdline() {
 
 configure_limine_defaults() {
     local limine_defaults="/etc/default/limine" esp_target current_esp
-    [[ -f /etc/limine-entry-tool.conf && ! -f "$limine_defaults" ]] && sudo install -m 0644 /etc/limine-entry-tool.conf "$limine_defaults" || sudo touch "$limine_defaults"
+
+    if [[ -f /etc/limine-entry-tool.conf && ! -f "$limine_defaults" ]]; then
+        sudo install -m 0644 /etc/limine-entry-tool.conf "$limine_defaults"
+    else
+        sudo touch "$limine_defaults"
+    fi
     
     esp_target="$(detect_esp_mountpoint)" || fatal "Could not detect a mounted ESP."
     current_esp="$(grep -E '^[[:space:]]*ESP_PATH=' "$limine_defaults" 2>/dev/null | cut -d= -f2 | tr -d '"' || true)"
@@ -394,6 +426,7 @@ deploy_limine() {
     if [[ ! -f "${esp_target}/EFI/limine/limine_x64.efi" ]] || ! has_loader_entry_on_esp '\EFI\limine\limine_x64.efi' "$esp_partuuid"; then
         info "Installing Limine EFI entry."
         sudo limine-install
+        CACHE_EFIBOOTMGR_OUTPUT=""
         NEEDS_LIMINE_UPDATE=true
     fi
 
