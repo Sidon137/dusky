@@ -10,12 +10,11 @@ from __future__ import annotations
 import logging
 import os
 import re
-import secrets
 import shlex
 import shutil
-import stat
 import subprocess
 import sys
+import tempfile
 import threading
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
@@ -104,34 +103,6 @@ class _ResolvedDirectoryCache:
             return self._resolved
 
 
-class _DirectoryFdCache:
-    """
-    Thread-safe cache for an open directory file descriptor.
-    Callers receive dup()'d descriptors they can safely close.
-    """
-
-    __slots__ = ("_directory_cache", "_fd", "_lock")
-
-    def __init__(self, directory_cache: _ResolvedDirectoryCache) -> None:
-        self._directory_cache: Final[_ResolvedDirectoryCache] = directory_cache
-        self._lock: Final[threading.Lock] = threading.Lock()
-        self._fd: int | None = None
-
-    def dup(self) -> int:
-        """Return a duplicated directory fd for the cached directory."""
-        fd = self._fd
-        if fd is not None:
-            return os.dup(fd)
-
-        with self._lock:
-            if self._fd is None:
-                self._fd = os.open(
-                    self._directory_cache.get(),
-                    os.O_RDONLY | os.O_DIRECTORY,
-                )
-            return os.dup(self._fd)
-
-
 class _ComputeOnceCache:
     """
     Thread-safe compute-once cache with coalesced concurrent requests.
@@ -177,7 +148,6 @@ class _ComputeOnceCache:
 
 
 _settings_dir_cache: Final = _ResolvedDirectoryCache(SETTINGS_DIR)
-_settings_dir_fd_cache: Final = _DirectoryFdCache(_settings_dir_cache)
 _cache_dir_cache: Final = _ResolvedDirectoryCache(CACHE_DIR)
 _system_info_cache: Final = _ComputeOnceCache()
 
@@ -236,15 +206,9 @@ def execute_command(cmd_string: str, title: str, run_in_terminal: bool) -> bool:
             log.error("Executable not found: %r", executable)
             return False
 
-    # Local import is MANDATORY here. utility.py is parsed before gi.require_version
-    # is called in the main executable. Importing globally would trigger a fatal GTK crash.
     from gi.repository import GLib
 
     try:
-        # GLib.spawn_async bypasses Python's fork() locks and automatically
-        # attaches a child watch to reap the process immediately upon exit.
-        # We discard the return value (PID tuple) because success is indicated
-        # by the lack of a GLib.Error exception.
         GLib.spawn_async(
             full_cmd,
             flags=GLib.SpawnFlags.SEARCH_PATH,
@@ -401,13 +365,10 @@ def preflight_check() -> None:
         sys.exit(1)
 
     try:
-        settings_fd = _settings_dir_fd_cache.dup()
-        try:
-            test_fd, test_name = _create_temp_file(settings_fd, "write_test")
-            os.close(test_fd)
-            os.unlink(test_name, dir_fd=settings_fd)
-        finally:
-            os.close(settings_fd)
+        SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+        test_file = SETTINGS_DIR / ".write_test"
+        test_file.touch()
+        test_file.unlink()
     except OSError as e:
         log.warning("Settings directory %s is not writable: %s", SETTINGS_DIR, e)
 
@@ -528,98 +489,68 @@ def _get_gpu_model() -> str:
 # =============================================================================
 # SETTINGS PERSISTENCE (Atomic File I/O)
 # =============================================================================
-def _validate_settings_key(key: str) -> tuple[str, ...] | None:
-    """Validate a settings key as a relative path beneath the settings directory."""
-    if not key or not isinstance(key, str):
-        return None
-    if "\0" in key:
+def _validate_settings_path(key: str) -> Path | None:
+    """
+    Validate the path to prevent directory traversal while natively resolving symlinks.
+    This ensures atomic writes target the dotfile repo instead of clobbering the symlink.
+    """
+    if not key or not isinstance(key, str) or "\0" in key:
         return None
 
     pure = PurePosixPath(key)
-    if pure.is_absolute():
-        log.warning("Invalid settings path key: %r", key)
+    if pure.is_absolute() or any(part in {"", ".."} for part in pure.parts):
+        log.warning("Invalid settings path key (traversal attempt detected): %r", key)
         return None
 
-    parts = pure.parts
-    if not parts or any(part in {"", ".", ".."} for part in parts):
-        log.warning("Invalid settings path key: %r", key)
-        return None
-
-    return parts
-
-
-def _open_relative_directory(parent_fd: int, name: str, *, create: bool) -> int:
-    """Open a child directory relative to parent_fd without following symlinks."""
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    base = _settings_dir_cache.get()
+    target = base / key
 
     try:
-        return os.open(name, flags, dir_fd=parent_fd)
-    except FileNotFoundError:
-        if not create:
-            raise
-        try:
-            os.mkdir(name, 0o777, dir_fd=parent_fd)
-        except FileExistsError:
-            pass
-        return os.open(name, flags, dir_fd=parent_fd)
-
-
-def _open_settings_parent_dir(
-    parts: tuple[str, ...], *, create: bool
-) -> tuple[int, str]:
-    """Open the parent directory for a setting key and return (dir_fd, filename)."""
-    current_fd = _settings_dir_fd_cache.dup()
-    try:
-        for part in parts[:-1]:
-            next_fd = _open_relative_directory(current_fd, part, create=create)
-            os.close(current_fd)
-            current_fd = next_fd
-        return current_fd, parts[-1]
-    except Exception:
-        os.close(current_fd)
-        raise
-
-
-def _create_temp_file(dir_fd: int, stem: str) -> tuple[int, str]:
-    """Create a unique temporary file in dir_fd without following symlinks."""
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-
-    for _ in range(32):
-        name = f".{stem}.{secrets.token_hex(8)}.tmp"
-        try:
-            fd = os.open(name, flags, 0o600, dir_fd=dir_fd)
-        except FileExistsError:
-            continue
-        return fd, name
-
-    raise FileExistsError(f"Unable to allocate temporary file for {stem!r}")
+        # Resolve strictly to follow symlinks to their ultimate destination
+        if target.exists():
+            return target.resolve(strict=True)
+        # If it doesn't exist yet, resolve the parent
+        return target.parent.resolve(strict=True) / target.name
+    except OSError:
+        return target
 
 
 def save_setting(key: str, value: bool | int | float | str) -> bool:
-    """Atomically save a setting beneath the settings directory."""
-    parts = _validate_settings_key(key)
-    if parts is None:
+    """Atomic write to disk (Temp File -> Fsync -> Rename)."""
+    target = _validate_settings_path(key)
+    if target is None:
         return False
 
     content = str(value)
-
-    parent_fd: int | None = None
     temp_fd: int | None = None
-    temp_name: str | None = None
+    temp_path: Path | None = None
 
     try:
-        parent_fd, filename = _open_settings_parent_dir(parts, create=True)
-        temp_fd, temp_name = _create_temp_file(parent_fd, filename)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # We create the temp file in the resolved parent directory so that
+        # when we rename it over the target, we don't break the symlink 
+        # sitting in ~/.config. It safely overwrites the file in the git repo.
+        temp_fd, temp_path_str = tempfile.mkstemp(
+            dir=target.parent, prefix=f".{target.name}.", suffix=".tmp"
+        )
+        temp_path = Path(temp_path_str)
 
         with os.fdopen(temp_fd, "w", encoding="utf-8") as f:
-            temp_fd = None
+            temp_fd = None  # Transferred to file object
             f.write(content)
             f.flush()
             os.fsync(f.fileno())
 
-        os.replace(temp_name, filename, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-        temp_name = None
-        os.fsync(parent_fd)
+        temp_path.rename(target)
+        temp_path = None  # Prevent deletion of success file
+
+        # Sync parent directory
+        dir_fd = os.open(target.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+        
         return True
 
     except OSError as e:
@@ -628,66 +559,38 @@ def save_setting(key: str, value: bool | int | float | str) -> bool:
     finally:
         if temp_fd is not None:
             os.close(temp_fd)
-        if temp_name is not None and parent_fd is not None:
-            try:
-                os.unlink(temp_name, dir_fd=parent_fd)
-            except FileNotFoundError:
-                pass
-            except OSError:
-                pass
-        if parent_fd is not None:
-            os.close(parent_fd)
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 @overload
 def load_setting(key: str, default: bool) -> bool: ...
 
-
 @overload
 def load_setting(key: str, default: int) -> int: ...
-
 
 @overload
 def load_setting(key: str, default: float) -> float: ...
 
-
 @overload
 def load_setting(key: str, default: str) -> str: ...
 
-
 @overload
 def load_setting(key: str, default: None = None) -> str | None: ...
-
 
 def load_setting(
     key: str,
     default: bool | int | float | str | None = None,
 ) -> bool | int | float | str | None:
     """Load setting with automatic type coercion based on default value."""
-    parts = _validate_settings_key(key)
-    if parts is None:
+    target = _validate_settings_path(key)
+    if target is None:
         return default
-
-    parent_fd: int | None = None
-    file_fd: int | None = None
 
     try:
-        parent_fd, filename = _open_settings_parent_dir(parts, create=False)
-        file_fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
-
-        if not stat.S_ISREG(os.fstat(file_fd).st_mode):
-            raise OSError("Setting target is not a regular file")
-
-        with os.fdopen(file_fd, "r", encoding="utf-8") as f:
-            file_fd = None
-            raw = f.read()
+        raw = target.read_text(encoding="utf-8").strip()
     except (FileNotFoundError, OSError):
         return default
-    finally:
-        if file_fd is not None:
-            os.close(file_fd)
-        if parent_fd is not None:
-            os.close(parent_fd)
 
     try:
         match default:
