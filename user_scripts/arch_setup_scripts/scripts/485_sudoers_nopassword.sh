@@ -20,7 +20,6 @@ declare -ar DEFAULT_BINARIES=(
     "~/user_scripts/btrfs_snapshots/cc/04_dusky_snapshot_manager.py"
     "~/user_scripts/btrfs_snapshots/cc/bash_wrapper_for_cc.sh"
 )
-)
 
 declare -r SCRIPT_PATH="${BASH_SOURCE[0]}"
 declare -r SCRIPT_NAME="${SCRIPT_PATH##*/}"
