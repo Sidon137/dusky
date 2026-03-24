@@ -91,7 +91,8 @@ def get_subvol_from_fstab(mountpoint: str) -> str:
 def get_target_mount_from_snapper_config(config: str) -> str:
     result = run_cmd(["snapper", "-c", config, "get-config"])
     for line in result.stdout.splitlines():
-        key, sep, value = line.partition("|")
+        sanitized_line = line.replace("│", "|")
+        key, sep, value = sanitized_line.partition("|")
         if sep and key.strip() == "SUBVOLUME":
             target_mnt = value.strip()
             if target_mnt:
