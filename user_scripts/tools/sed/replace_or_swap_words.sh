@@ -80,6 +80,20 @@ choose_delimiter() {
     die "Unable to safely construct a substitution command. All delimiter candidates collide." 1
 }
 
+choose_vim_delimiter() {
+    local combined="${1}${2}"
+    local delim
+    local candidates=('/' ':' '#' '%' '@' '!' '+' ',' ';' '=' '^' '~' '_')
+
+    for delim in "${candidates[@]}"; do
+        if [[ "${combined}" != *"${delim}"* ]]; then
+            printf '%s' "${delim}"
+            return 0
+        fi
+    done
+    die "Unable to safely construct a Vim substitution command. All Vim-safe delimiter candidates collide." 1
+}
+
 escape_delimiter() {
     local value="$1"
     local delim="$2"
@@ -160,7 +174,7 @@ main() {
 
             local vim_delim filelist rc
 
-            vim_delim="$(choose_delimiter "${search}" "${replace}")"
+            vim_delim="$(choose_vim_delimiter "${search}" "${replace}")"
             make_temp_file filelist
 
             if rg -l -0 -- "${search}" "${target_dir}" > "${filelist}"; then
@@ -190,7 +204,7 @@ main() {
                SMART_REPLACE_FILELIST="${filelist}" \
                nvim \
                    -c 'lua local f = assert(io.open(vim.env.SMART_REPLACE_FILELIST, "rb")); local data = assert(f:read("*a")); f:close(); local paths = {}; for path in data:gmatch("([^%z]+)%z") do paths[#paths + 1] = path end; assert(#paths > 0, "no files to edit"); vim.api.nvim_cmd({ cmd = "args", args = paths }, {}); vim.cmd("first")' \
-                   -c 'execute "argdo %s" . $SMART_REPLACE_DELIM . escape($SMART_REPLACE_SEARCH, $SMART_REPLACE_DELIM) . $SMART_REPLACE_DELIM . escape($SMART_REPLACE_REPLACE, "\\" . $SMART_REPLACE_DELIM . "&~") . $SMART_REPLACE_DELIM . "gc | update"'; then
+                   -c 'execute "argdo %s" . $SMART_REPLACE_DELIM . escape($SMART_REPLACE_SEARCH, $SMART_REPLACE_DELIM) . $SMART_REPLACE_DELIM . escape($SMART_REPLACE_REPLACE, "\\" . $SMART_REPLACE_DELIM . "&~") . $SMART_REPLACE_DELIM . "gce | update"'; then
                 printf "%s[✔] Neovim session completed.%s\n" "${GREEN}" "${RESET}"
             else
                 rc=$?
