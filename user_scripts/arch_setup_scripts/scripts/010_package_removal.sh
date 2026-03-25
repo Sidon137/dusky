@@ -22,6 +22,7 @@ readonly -a REPO_TARGETS=(
   polkit-kde-agent
   power-profiles-daemon
   fluent-icon-theme-git
+  acpi_call
 )
 
 # AUR Packages (yay/paru, no sudo)
