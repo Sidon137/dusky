@@ -114,7 +114,7 @@ show_help() {
     printf "%s%sSmart Replace Tool%s\n\n" "${BOLD}" "${CYAN}" "${RESET}"
     printf "A high-performance, stateless text replacement tool for Arch/Hyprland ecosystems.\n"
     printf "It executes bulk edits while teaching you the raw terminal commands.\n\n"
-    printf "%sUsage:%s %s [OPTIONS] <SEARCH_TERM> <REPLACE_TERM> <TARGET_DIR>\n\n" "${YELLOW}" "${RESET}" "$0"
+    printf "%sUsage:%s %s [OPTIONS] <'SEARCH_TERM'> <'REPLACE_TERM'> <TARGET_DIR>\n\n" "${YELLOW}" "${RESET}" "$0"
     printf "%sArguments:%s\n" "${YELLOW}" "${RESET}"
     printf "  %s<SEARCH_TERM>%s   The text or regex to find. Syntax depends on the selected mode.\n" "${CYAN}" "${RESET}"
     printf "  %s<REPLACE_TERM>%s  The literal text to replace matches with.\n" "${CYAN}" "${RESET}"
