@@ -51,6 +51,8 @@ declare -ar pkgs_misc=(
     "satty"
 
     "matugen"
+
+    "awww"
 )
 
 

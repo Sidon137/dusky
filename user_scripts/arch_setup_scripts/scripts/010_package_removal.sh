@@ -23,6 +23,7 @@ readonly -a REPO_TARGETS=(
   power-profiles-daemon
   fluent-icon-theme-git
   acpi_call
+  swww
 )
 
 # AUR Packages (yay/paru, no sudo)
