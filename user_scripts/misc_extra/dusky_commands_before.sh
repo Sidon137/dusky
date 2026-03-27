@@ -26,6 +26,7 @@ declare -ra FLEET_COMMANDS=(
     "U | gsettings set org.cinnamon.desktop.default-applications.terminal exec 'kitty'"
     "U | rm -f ~/.config/hypr/edit_here/source/workspace_rules.conf || true"
     "U | sed -i 's/^zen$/zen-browser/' ~/.config/dusky/settings/browser_switch.smart || true"
+    "S | ln -nfs /usr/bin/awww /usr/bin/swww || true"
     # --- System Services ---
 #    "U | systemctl --user disable dusky.service || true"
 #    "S | systemctl enable --now tlp.service || true"
