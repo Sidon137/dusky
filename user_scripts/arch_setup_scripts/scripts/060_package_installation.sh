@@ -19,7 +19,7 @@ declare -ar pkgs_hyprland=(
 
 # Group 3: GUI, Toolkits & Fonts
 declare -ar pkgs_appearance=(
-  "qt5-wayland" "qt6-wayland" "gtk3" "gtk4" "nwg-look" "qt5ct" "qt6ct" "qt6-svg" "qt6-multimedia-ffmpeg" "adw-gtk-theme" "upower" "plocate" "matugen" "ttf-font-awesome" "ttf-jetbrains-mono-nerd" "noto-fonts-emoji" "sassc" "python-packaging" "python"
+  "qt5-wayland" "qt6-wayland" "gtk3" "gtk4" "nwg-look" "qt5ct" "qt6ct" "qt6-svg" "qt6-multimedia-ffmpeg" "adw-gtk-theme" "upower" "plocate" "matugen" "ttf-font-awesome" "ttf-jetbrains-mono-nerd" "noto-fonts-emoji" "sassc" "python-packaging" "python" "fontconfig"
 )
 
 # Group 4: Desktop Experience
@@ -34,7 +34,7 @@ declare -ar pkgs_audio=(
 
 # Group 6: Filesystem & Archives
 declare -ar pkgs_filesystem=(
-  "btrfs-progs" "compsize" "zram-generator" "udisks2" "udiskie" "dosfstools" "ntfs-3g" "xdg-user-dirs" "usbutils" "gnome-disk-utility" "unzip" "zip" "unrar" "7zip" "cpio" "file-roller" "rsync" "nfs-utils" "nilfs-utils" "smartmontools" "dmraid" "hdparm" "hwdetect" "lsscsi" "sg3_utils" "cpupower"
+  "btrfs-progs" "compsize" "zram-generator" "udisks2" "udiskie" "dosfstools" "ntfs-3g" "xdg-user-dirs" "usbutils" "gnome-disk-utility" "unzip" "zip" "unrar" "7zip" "cpio" "file-roller" "rsync" "nfs-utils" "nilfs-utils" "smartmontools" "dmraid" "hdparm" "hwdetect" "lsscsi" "sg3_utils" "cpupower" "dust" "fcitx5" "fcitx5-gtk" "fcitx5-qt" "dkms"
 
   # thunar
   # "thunar" "thunar-archive-plugin" "thunar-volman" "tumbler" "ffmpegthumbnailer" "webp-pixbuf-loader" "poppler-glib" "gvfs" "gvfs-mtp" "gvfs-nfs" "gvfs-smb"
@@ -50,12 +50,12 @@ declare -ar pkgs_network=(
 
 # Group 8: Terminal & Shell
 declare -ar pkgs_terminal=(
-  "kitty" "foot" "zsh" "zsh-syntax-highlighting" "starship" "fastfetch" "bat" "eza" "fd" "yazi" "gum" "tree" "fzf" "less" "ripgrep" "expac" "zsh-autosuggestions" "iperf3" "pkgstats" "libqalculate" "moreutils"
+  "kitty" "foot" "zsh" "zsh-syntax-highlighting" "starship" "fastfetch" "bat" "eza" "fd" "yazi" "gum" "tree" "fzf" "less" "ripgrep" "expac" "zsh-autosuggestions" "iperf3" "pkgstats" "libqalculate" "moreutils" "zoxide"
 )
 
 # Group 9: Development
 declare -ar pkgs_dev=(
-  "neovim" "git" "git-delta" "lazygit" "meson" "cmake" "clang" "uv" "rq" "jq" "pv" "bc" "viu" "chafa" "ueberzugpp" "ccache" "mold" "shellcheck" "fd" "ripgrep" "fzf" "shfmt" "stylua" "prettier" "tree-sitter-cli" "nano"
+  "neovim" "git" "git-delta" "lazygit" "meson" "cmake" "clang" "uv" "rq" "jq" "pv" "bc" "viu" "chafa" "ueberzugpp" "ccache" "mold" "shellcheck" "fd" "ripgrep" "fzf" "shfmt" "stylua" "prettier" "tree-sitter-cli" "nano" "luarocks"
 )
 
 # Group 10: Multimedia

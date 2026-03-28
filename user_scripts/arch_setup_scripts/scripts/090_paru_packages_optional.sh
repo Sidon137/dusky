@@ -30,12 +30,14 @@ Tools       | grsync                | GUI rsync frontend for backups
 Tools       | caligula              | User-friendly, lightweight disk imager
 Tools       | collision             | Verifies file hashes (MD5, SHA, etc.)
 Tools       | impression            | Tool to create bootable drives from ISOs
-Tools       | xembed-sni-proxy-standalone-git            | Fix proton/wine apps tray icons
+Tools       | xembed-sni-proxy-standalone-git | Fix proton/wine apps tray icons
 Tools       | showmethekey          | Screen keystroke visualizer for screencasts
 Tools       | identity              | Compare images and videos side-by-side
 Tools       | zellij                | Modern terminal workspace/multiplexer (Rust)
 Tools       | tealdeer              | Fast tldr client (simplified man pages)
 Tools       | man-db                | The standard manual pager suite
+Tools       | avahi                 | Service Discovery using mDNS/DNS-SD (compatible with Bonjour)
+Tools       | evince                | Document viewer (PDF, PostScript, XPS, djvu, dvi, tiff, cbr, cbz, cb7, cbt)
 Tools       | aria2                 | High-speed download utility (Pair with uget)
 Tools       | uget                  | Download Manager GUI (Pair with aria2)
 Tools       | libdvdcss             | Portable abstraction library for DVD decryption
@@ -52,6 +54,7 @@ Productivity| calcurse              | Text-based calendar and scheduling applica
 Productivity| blanket               | Ambient noise player for focus and productivity
 Productivity| errands               | Simple to-do list application
 Productivity| obsidian              | Markdown-based knowledge base and note taking
+Productivity| xournalpp             | Handwriting notetaking software with PDF annotation support
 Docs        | arch-wiki-lite        | Compressed Wiki reader (Pair with arch-wiki-docs)
 Docs        | arch-wiki-docs        | Arch Wiki data pages (Pair with arch-wiki-lite)
 Media       | pear-desktop-bin      | Youtube Music GUI
@@ -63,6 +66,7 @@ Media       | ttf-bitstream-vera    | Bitstream Vera fonts
 Media       | ttf-dejavu            | Font based on Bitstream Vera (wider range of characters)
 Media       | ttf-liberation        | Font family metric compatibility with Arial, Times New Roman, and Courier New
 Media       | ttf-font-awesome      | Iconic font designed for Bootstrap - woff2 format
+Media       | woff2-font-awesome    | Iconic font designed for Bootstrap - woff2 format
 Media       | ttf-jetbrains-mono-nerd | Patched font JetBrains Mono from nerd fonts library
 Media       | awesome-terminal-fonts| fonts/icons for powerlines
 Media       | ttf-opensans          | Sans-serif typeface commissioned by Google
@@ -90,6 +94,8 @@ Drivers     | usbmuxd               | Socket daemon to multiplex connections to 
 Drivers     | cuda                  | NVIDIA's parallel computing architecture toolkit
 Drivers     | cudnn                 | NVIDIA CUDA Deep Neural Network library
 Hardware    | asusctl               | ASUS ROG/TUF control
+Hardware    | broadcom-wl-dkms      | Broadcom 802.11 Linux STA wireless driver
+Hardware    | macbook12-spi-driver-dkms | Driver for the keyboard, touchpad and touchbar found in newer MacBook (Pro) models
 "
 
 # Dimensions & Layout
