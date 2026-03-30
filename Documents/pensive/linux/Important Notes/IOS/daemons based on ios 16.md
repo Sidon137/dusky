@@ -10,7 +10,7 @@ Conservative legend:
 |#|daemon|description|safe_to_disable_for_most_users|
 |---|---|---|---|
 |1|ABDatabaseDoctor|Contacts database repair helper|yes|
-|2|abm-helper|Baseband/modem-related helper|NO|
+|2|abm-helper|Apple Business Manager|yes|
 |3|absd|Address Book Source Daemon for Contacts accounts and sync|no|
 |4|accessibility.axassetsd|Accessibility asset downloads, such as voices|if-unused|
 |5|accessibility.axremoted|Remote accessibility services|if-unused|
@@ -20,7 +20,7 @@ Conservative legend:
 |9|accountsd|System accounts database and access management|NO|
 |10|activityawardsd|Fitness/Activity awards processing|if-unused|
 |11|adid|Advertising identifier service|yes|
-|12|AdminLite|Private Apple administrative helper, unclear public role|no|
+|12|AdminLite|system watchdog daemon|NO|
 |13|afcd|Apple File Conduit for USB file access and Finder/iTunes file sharing|yes|
 |14|aggregated|System analytics aggregation|yes|
 |15|aggregated.addaily|Advertising-related daily aggregation task|yes|
@@ -30,7 +30,7 @@ Conservative legend:
 |19|analyticsd|System analytics and diagnostics collection|yes|
 |20|and|Private Apple daemon, unclear public role|no|
 |21|announced|Announce Notifications / Announce Messages support|if-unused|
-|22|anomalydetectiond|System anomaly detection and reporting|yes|
+|22|anomalydetectiond|celerometer and gyroscope data for Crash Detection and Fall Detection|yes|
 |23|ap.adprivacyd|Advertising privacy policy enforcement|yes|
 |24|ap.promotedcontentd|Promoted content and App Store recommendations/ads|yes|
 |25|appleaccountd|Apple Account management and sync|NO|
@@ -263,7 +263,7 @@ Conservative legend:
 |252|mobile.cache_delete..backup|Cache cleanup related to device backups|yes|
 |253|mobile.heartbeat|System heartbeat/watchdog-related service|no|
 |254|mobile.house_arrest|USB file-sharing service for app containers|yes|
-|255|mobile.insecure_notificatio..|Legacy lockdown notification proxy for host communication|if-unused|
+|255|mobile.insecure_notificatio..|USB communication with a computer|if-unused|
 |256|mobile.installd|Core app installation daemon|no|
 |257|mobile.keybagd|Keybag and data-protection key management|NO|
 |258|mobile.lockdown|Lockdown pairing, trust, and host communication|if-unused|
@@ -358,7 +358,7 @@ Conservative legend:
 |347|reversetemplated|Private Apple daemon, unclear public role|no|
 |348|revisiond|Document revision/versioning support service|if-unused|
 |349|routined|Significant locations and routine-learning daemon|yes|
-|350|rtcreportingd|Real-time communication analytics/reporting|yes|
+|350|rtcreportingd|SIP servers for FaceTime and Wi-Fi Calling|yes|
 |351|runningboardd|Process lifecycle and resource-management daemon|NO|
 |352|Safari.History|Safari history support service|if-unused|
 |353|Safari.passwordbreachd|Safari password-breach checking service|yes|
@@ -420,7 +420,7 @@ Conservative legend:
 |409|sysdiagnose|System diagnostics collection task|yes|
 |410|sysdiagnose.darwinos|Low-level Darwin OS diagnostics task|yes|
 |411|sysdiagnose_helper|Helper for system diagnostics collection|yes|
-|412|systemstats.microstackshot..|Periodic microstackshot task for performance/power stats|yes|
+|412|systemstats.microstackshot..|Periodic microstackshot task for performance/power stats|NO|
 |413|tailspind|Collects performance-degradation diagnostics|yes|
 |414|tccd|Privacy permissions daemon|NO|
 |415|telephonyutilities..|Call services daemon for CallKit, phone calls, and VoIP|NO|
