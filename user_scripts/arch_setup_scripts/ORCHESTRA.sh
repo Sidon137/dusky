@@ -299,47 +299,47 @@ parse_install_entry() {
     local -n _script_ref="$3"
     local -n _argv_ref="$4"
     local -n _base_state_key_ref="$5"
-    local -a fields=()
-    local -a parts=()
-    local mode=""
-    local command_part=""
+    local -a _fields=()
+    local -a _parts=()
+    local _parsed_mode=""
+    local _command_part=""
 
-    IFS='|' read -r -a fields <<< "$entry"
-    if (( ${#fields[@]} != 2 )); then
+    IFS='|' read -r -a _fields <<< "$entry"
+    if (( ${#_fields[@]} != 2 )); then
         printf 'CRITICAL ERROR: Malformed INSTALL_SEQUENCE entry: %s\n' "$entry" >&2
         exit 1
     fi
 
-    mode="$(trim "${fields[0]}")"
-    command_part="$(trim "${fields[1]}")"
+    _parsed_mode="$(trim "${_fields[0]}")"
+    _command_part="$(trim "${_fields[1]}")"
 
-    if [[ "$mode" != "U" && "$mode" != "S" ]]; then
+    if [[ "$_parsed_mode" != "U" && "$_parsed_mode" != "S" ]]; then
         printf 'CRITICAL ERROR: Invalid mode in INSTALL_SEQUENCE entry: %s\n' "$entry" >&2
         exit 1
     fi
 
-    if [[ -z "$command_part" ]]; then
+    if [[ -z "$_command_part" ]]; then
         printf 'CRITICAL ERROR: Missing script in INSTALL_SEQUENCE entry: %s\n' "$entry" >&2
         exit 1
     fi
 
-    case "$command_part" in
+    case "$_command_part" in
         *\'*|*\"*|*\\*)
             printf 'CRITICAL ERROR: INSTALL_SEQUENCE command field does not support quotes or backslash escapes: %s\n' "$entry" >&2
             exit 1
             ;;
     esac
 
-    read -r -a parts <<< "$command_part"
-    if (( ${#parts[@]} == 0 )); then
+    read -r -a _parts <<< "$_command_part"
+    if (( ${#_parts[@]} == 0 )); then
         printf 'CRITICAL ERROR: Missing script in INSTALL_SEQUENCE entry: %s\n' "$entry" >&2
         exit 1
     fi
 
-    _mode_ref="$mode"
-    _script_ref="${parts[0]}"
-    _argv_ref=("${parts[@]:1}")
-    _base_state_key_ref="${mode}|${command_part}"
+    _mode_ref="$_parsed_mode"
+    _script_ref="${_parts[0]}"
+    _argv_ref=("${_parts[@]:1}")
+    _base_state_key_ref="${_parsed_mode}|${_command_part}"
 }
 
 make_state_key() {
