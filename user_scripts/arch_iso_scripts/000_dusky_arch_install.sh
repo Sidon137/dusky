@@ -395,7 +395,7 @@ main() {
         printf "\n"
     fi
 
-# --- SESSION RECOVERY (From ORCHESTRA.sh) ---
+    # --- SESSION RECOVERY ---
     local total_scripts=${#INSTALL_SEQUENCE[@]}
     local completed_scripts=0
     declare -A temp_seen_keys=()
@@ -473,6 +473,19 @@ main() {
             fi
             printf "\n"
         fi
+    fi
+
+    # --- EXECUTION MODE SELECTION ---
+    if (( AUTO_MODE == 0 && DRY_RUN == 0 && IN_CHROOT == 0 )); then
+        printf "%s>>> EXECUTION MODE <<<%s\n" "$Y" "$RS"
+        read -r -p "Do you want to run interactively (prompt before every script)? [y/N]: " _mode_choice
+        if [[ "${_mode_choice,,}" != "y" && "${_mode_choice,,}" != "yes" ]]; then
+            AUTO_MODE=1
+            log INFO "Autonomous mode selected. Running all scripts without confirmation."
+        else
+            log INFO "Interactive mode selected. You will be asked before each script."
+        fi
+        printf "\n"
     fi
 
     # --- COMPREHENSIVE PRE-FLIGHT AUDIT ---
