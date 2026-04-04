@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  UNIFIED ARCH ORCHESTRATOR (v3.6 - Session Aware Engine)
+#  UNIFIED ARCH ORCHESTRATOR (v3.7 - Session Aware Engine)
 #  Context: Self-aware Phase 1 (ISO) and Phase 2 (Chroot) execution.
 #  Usage: ./000_dusky_arch_install.sh [--auto|-a] [--dry-run|-d] [--reset]
 # ==============================================================================
@@ -322,7 +322,7 @@ main() {
     # State Reset & Loading
     if (( RESET_STATE )); then
         rm -f "$STATE_FILE"
-        log INFO "State file reset. Starting fresh."
+        log INFO "State file reset (--reset flag passed). Starting fresh."
     fi
     touch "$STATE_FILE"
     load_state
@@ -380,19 +380,6 @@ main() {
         printf "\n%s%s=== ARCH ORCHESTRATOR (PHASE 2: CHROOT) ===%s\n\n" "$B" "$HL" "$RS"
     else
         printf "\n%s%s=== ARCH ORCHESTRATOR (PHASE 1: ISO) ===%s\n\n" "$B" "$HL" "$RS"
-    fi
-
-    # --- EXECUTION MODE SELECTION (From ORCHESTRA.sh) ---
-    if (( AUTO_MODE == 0 && DRY_RUN == 0 && IN_CHROOT == 0 )); then
-        printf "%s>>> EXECUTION MODE <<<%s\n" "$Y" "$RS"
-        read -r -p "Do you want to run interactively (prompt before every script)? [y/N]: " _mode_choice
-        if [[ "${_mode_choice,,}" != "y" && "${_mode_choice,,}" != "yes" ]]; then
-            AUTO_MODE=1
-            log INFO "Autonomous mode selected. Running all scripts without confirmation."
-        else
-            log INFO "Interactive mode selected. You will be asked before each script."
-        fi
-        printf "\n"
     fi
 
     # --- SESSION RECOVERY ---
