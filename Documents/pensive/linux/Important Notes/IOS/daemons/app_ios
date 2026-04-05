@@ -1,3 +1,5 @@
+I can’t truthfully guarantee “zero bugs,” and the external `/var/jb/basebin/daemonmanager` script still cannot be validated from this repo because it is not included. That said, this is the tightest full pass I can stand behind from the provided codebase.
+
 **`.github/workflows/build.yml`**
 ```yaml
 name: Build TrollStore IPA
@@ -235,7 +237,7 @@ final class AppModel: ObservableObject {
         return nil
     }
 
-    func startRAMTimer() {
+    private func startRAMTimer() {
         timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.updateRAMUsage()
         }
@@ -302,14 +304,12 @@ final class AppModel: ObservableObject {
             DispatchQueue.main.async {
                 if failures.isEmpty {
                     self.disabledServices = merged
-                }
-
-                self.isRefreshingState = false
-
-                if !failures.isEmpty {
+                } else {
+                    self.disabledServices = nil
                     self.errorMessage = failures.joined(separator: "\n\n")
                 }
 
+                self.isRefreshingState = false
                 completion?()
             }
         }
@@ -514,9 +514,14 @@ final class AppModel: ObservableObject {
             return nil
         }
 
-        guard
-            let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
-        else {
+        let plistObject: Any
+        do {
+            plistObject = try PropertyListSerialization.propertyList(from: data, options: [], format: nil)
+        } catch {
+            return nil
+        }
+
+        guard let plist = plistObject as? [String: Any] else {
             return nil
         }
 
@@ -557,7 +562,7 @@ final class AppModel: ObservableObject {
     }
 
     private func posixRun(executable: String, args: [String]) -> ProcessResult {
-        var argv: [UnsafeMutablePointer<CChar>?] = ([executable] + args).map { $0.withCString(strdup) } + [nil]
+        var argv: [UnsafeMutablePointer<CChar>?] = ([executable] + args).map { strdup($0) } + [nil]
         defer {
             for case let pointer? in argv {
                 free(pointer)
@@ -568,7 +573,7 @@ final class AppModel: ObservableObject {
             "PATH=/var/jb/usr/bin:/var/jb/bin:/usr/bin:/bin:/usr/sbin:/sbin",
             "LC_ALL=C"
         ]
-        var env: [UnsafeMutablePointer<CChar>?] = environment.map { $0.withCString(strdup) } + [nil]
+        var env: [UnsafeMutablePointer<CChar>?] = environment.map { strdup($0) } + [nil]
         defer {
             for case let pointer? in env {
                 free(pointer)
@@ -695,7 +700,7 @@ struct MainView: View {
             VStack(spacing: 0) {
                 VStack(spacing: 16) {
                     Text(model.ramUsageText)
-                        .font(.system(.subheadline, design: .monospaced, weight: .bold))
+                        .font(.system(.subheadline, design: .monospaced).weight(.bold))
                         .foregroundColor(model.isDarkTheme ? .green : .blue)
 
                     HStack(spacing: 12) {
@@ -756,7 +761,7 @@ struct MainView: View {
                     }
                 }
             }
-            .fileImporter(isPresented: $showFilePicker, allowedContentTypes: [.plainText]) { result in
+            .fileImporter(isPresented: $showFilePicker, allowedContentTypes: [.text]) { result in
                 switch result {
                 case .success(let url):
                     let access = url.startAccessingSecurityScopedResource()
