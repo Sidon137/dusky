@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 011_build_aur_packages.sh  —  v1.3  (AUR Factory Builder)
+# 011_build_aur_packages.sh  —  v1.4  (AUR Factory Builder w/ Smart Deduplication)
 #
 # Factory script: Builds AUR packages into an offline pacman repository for
 # use in an offline Arch Linux ISO. Does NOT install the built packages onto
@@ -16,7 +16,7 @@
 #   6. repo-add  →  update local pacman repository database
 #
 # Usage:
-#   ./011_build_aur_packages.sh [--auto | --current | --path <dir>]
+#   ./011_build_aur_packages.sh [--auto | --current | --path <dir> | --official-path <dir>]
 #
 # Requirements:
 #   • Run as NON-ROOT user with sudo access
@@ -70,6 +70,7 @@ declare -ir MAX_ATTEMPTS=6
 declare -ir TIMEOUT_SEC=5
 
 declare -g  OFFLINE_REPO_DIR=''
+declare -g  OFFICIAL_REPO_DIR='/srv/offline-repo/official'
 declare -g  INTERACTIVE_MODE=1
 declare -g  CLONE_BASE_DIR=''
 
@@ -156,6 +157,7 @@ _parse_args() {
         case "$1" in
             --auto)
                 OFFLINE_REPO_DIR='/srv/offline-repo/aur'
+                OFFICIAL_REPO_DIR='/srv/offline-repo/official'
                 INTERACTIVE_MODE=0
                 shift
                 ;;
@@ -170,8 +172,13 @@ _parse_args() {
                 INTERACTIVE_MODE=0
                 shift 2
                 ;;
+            --official-path)
+                [[ -z "${2-}" ]] && die "--official-path requires a directory argument."
+                OFFICIAL_REPO_DIR="$2"
+                shift 2
+                ;;
             *)
-                die "Unknown argument: '$1'"$'\n'"Usage: $0 [--auto | --current | --path <dir>]"
+                die "Unknown argument: '$1'"$'\n'"Usage: $0 [--auto | --current | --path <dir> | --official-path <dir>]"
                 ;;
         esac
     done
@@ -442,14 +449,21 @@ _download_official_deps() {
         return 0
     fi
 
-    log_step "Downloading ${#official_deps[@]} official dep(s) + full closure for '${pkg}' → ${OFFLINE_REPO_DIR}..."
+    log_step "Downloading ${#official_deps[@]} official dep(s) + full closure for '${pkg}'..."
+
+    # Build cache arguments dynamically for native deduplication
+    local -a cache_args=( "--cachedir" "${OFFLINE_REPO_DIR}" )
+    
+    if [[ -d "${OFFICIAL_REPO_DIR}" ]]; then
+        cache_args+=( "--cachedir" "${OFFICIAL_REPO_DIR}" )
+    fi
 
     local -i attempt
     for (( attempt = 1; attempt <= MAX_ATTEMPTS; attempt++ )); do
         if _pacman_isolated \
-            -Sw --cachedir "${OFFLINE_REPO_DIR}" \
+            -Sw "${cache_args[@]}" \
             -- "${official_deps[@]}"; then
-            log_ok "Runtime deps downloaded for '${pkg}'."
+            log_ok "Runtime deps downloaded/verified for '${pkg}'."
             return 0
         fi
 
