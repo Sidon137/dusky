@@ -13,6 +13,7 @@ declare -ra ISO_SEQUENCE=(
   "020_environment_prep.sh --auto"
   "030_partitioning.sh --auto"
   "040_disk_mount.sh --auto"
+  "045_repo_bind_mount.sh"
   "051_pacman_repo_switch.sh --offline"
   "060_console_fix.sh"
   "070_pacstrap.sh --auto"
