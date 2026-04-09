@@ -504,7 +504,7 @@ _build_aur_package() {
     rm -rf -- "$pkg_clone_root"
     mkdir -p -- "$pkg_clone_root"
 
-# ── Step D: Fetch PKGBUILD with paru -G ───────────────────────────────────
+    # ── Step D: Fetch PKGBUILD with paru -G ───────────────────────────────────
     log_step "Fetching PKGBUILD for '${pkg}'..."
 
     local -i attempt
@@ -550,23 +550,30 @@ _build_aur_package() {
     fi
     log_step "PKGBUILD located at: ${pkgbuild_dir}"
 
-# ── Step E: Neutralize Gradle Daemon (Bypass makepkg env scrub) ───────────
-    # makepkg aggressively strips environment variables (like GRADLE_OPTS) before
-    # running. To prevent Java packages from hanging the build process forever, 
-    # we must forcefully inject --no-daemon directly into the PKGBUILD.
+    # ── Step E: Neutralize Gradle Daemon Deadlocks ────────────────────────────
+    # Even with --no-daemon, Gradle >= 3.0 forks a "single-use daemon" if JVM args
+    # mismatch. This daemon inherits stdout/stderr pipes, causing paru's PTY to
+    # hang forever at "> IDLE". We must force plain console and explicitly order
+    # the daemon to suicide before the build() function exits.
     if grep -qiE 'gradle|gradlew' "${pkgbuild_dir}/PKGBUILD"; then
-        log_step "Patching PKGBUILD to force --no-daemon for Gradle/GraalVM..."
+        log_step "Patching PKGBUILD to prevent Gradle/Java deadlocks..."
         
-        # 1. Inject environment override directly into the makepkg sandbox
-        sed -i '1s/^/export GRADLE_OPTS="-Dorg.gradle.daemon=false"\n/' "${pkgbuild_dir}/PKGBUILD"
+        # 1. Force plain console (disables the rich UI that deadlocks)
+        sed -i '1i export GRADLE_OPTS="-Dorg.gradle.daemon=false -Dorg.gradle.console=plain"' "${pkgbuild_dir}/PKGBUILD"
         
-        # 2. Target explicit gradle/gradlew execution lines (avoids corrupting depends arrays)
-        sed -i 's|^\([[:space:]]*\)gradle |\1gradle --no-daemon |g' "${pkgbuild_dir}/PKGBUILD"
-        sed -i 's|^\([[:space:]]*\)\./gradlew |\1./gradlew --no-daemon |g' "${pkgbuild_dir}/PKGBUILD"
-        sed -i 's|/usr/bin/gradle |/usr/bin/gradle --no-daemon |g' "${pkgbuild_dir}/PKGBUILD"
+        # 2. Inject daemon assassination commands at the end of the build() function
+        awk '
+        /^build\(\)/ { in_build=1 }
+        in_build && /^}/ {
+            print "    /usr/bin/gradle --stop 2>/dev/null || true"
+            print "    ./gradlew --stop 2>/dev/null || true"
+            in_build=0
+        }
+        { print }
+        ' "${pkgbuild_dir}/PKGBUILD" > "${pkgbuild_dir}/PKGBUILD.tmp" && mv "${pkgbuild_dir}/PKGBUILD.tmp" "${pkgbuild_dir}/PKGBUILD"
     fi
 
-# ── Step F: Snapshot repo contents before build ───────────────────────────
+    # ── Step F: Snapshot repo contents before build ───────────────────────────
     local -a pre_build_pkgs=()
     mapfile -t pre_build_pkgs < <(
         find "$OFFLINE_REPO_DIR" -maxdepth 1 \
@@ -574,7 +581,7 @@ _build_aur_package() {
             -type f 2>/dev/null | sort
     )
 
-# ── Step G: Build — paru -B (no install) ─────────────────────────────────
+    # ── Step G: Build — paru -B (no install) ─────────────────────────────────
     # PKGDEST  → temporary dir to prevent paru panics on root-owned directories 
     #            like lost+found in the target repo. Moved after success.
     # BUILDDIR → makepkg src/pkg work tree (inside our temp dir, auto-cleaned).
@@ -604,7 +611,7 @@ _build_aur_package() {
             --sudoloop                  \
             --mflags "--nocheck"        \
             --mflags "--skippgpcheck"   \
-            2>&1 || build_rc=$?
+            < /dev/null 2>&1 || build_rc=$?
 
         if (( build_rc == 0 )); then
             # Move built packages to the final destination so Step G detects them.
@@ -626,7 +633,7 @@ _build_aur_package() {
         sleep "${TIMEOUT_SEC}"
     done
 
-# ── Step H: Identify newly produced package file(s) ───────────────────────
+    # ── Step H: Identify newly produced package file(s) ───────────────────────
     local -a post_build_pkgs=()
     mapfile -t post_build_pkgs < <(
         find "$OFFLINE_REPO_DIR" -maxdepth 1 \
@@ -670,7 +677,7 @@ _build_aur_package() {
         log_ok "Built: ${nf##*/}"
     done
 
-# ── Step I: Extract runtime deps & download official ones ─────────────────
+    # ── Step I: Extract runtime deps & download official ones ─────────────────
     log_step "Extracting runtime dependencies from ${#new_pkg_files[@]} built package(s)..."
 
     local -A seen_deps=()
@@ -698,7 +705,7 @@ _build_aur_package() {
         }
     fi
 
-# ── Step J: Clean up per-package build and clone directories ──────────────
+    # ── Step J: Clean up per-package build and clone directories ──────────────
     rm -rf -- "${pkg_clone_root}" "${build_work_dir}" 2>/dev/null || true
 
     log_ok "Package '${pkg}' successfully processed."
