@@ -59,5 +59,25 @@ _log "Copying '${SRC_DIR}' repository to ${MNT_POINT}..."
 cp -Rfp -- "${SRC_DIR}" "${MNT_POINT}/"
 _success "Environment '${SRC_DIR}' copied successfully."
 
+# TASK 3: Inject Live ISO Skel Payload
+# We must bridge the chroot boundary. useradd inside the chroot pulls from
+# /mnt/etc/skel, so we must inject our Live ISO /etc/skel payload there.
+_log "Injecting custom skel payload into target system..."
+if [[ -d "/etc/skel" ]]; then
+    # Ensure target exists to prevent cp from failing if pacstrap hasn't run
+    mkdir -p "${MNT_POINT}/etc/skel"
+    
+    # -a: archive mode (preserves permissions, ownership, symlinks)
+    # -T: no target directory (prevents nesting /mnt/etc/skel/skel)
+    # We wrap in 'if' so strict mode (-e) doesn't kill the script on minor cp warnings
+    if cp -aT "/etc/skel/" "${MNT_POINT}/etc/skel/"; then
+        _success "Skel payload successfully merged."
+    else
+        _log "Warning: Skel copy encountered minor issues, but execution is continuing."
+    fi
+else
+    _log "Warning: Source /etc/skel not found in Live ISO. Skipping skel injection."
+fi
+
 # --- 6. Completion ---
 _success "File propagation complete. Ready for 'arch-chroot /mnt'."
