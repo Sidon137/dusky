@@ -17,6 +17,7 @@ declare -ra ISO_SEQUENCE=(
   "051_pacman_repo_switch.sh --offline"
   "060_console_fix.sh"
   "070_pacstrap.sh --auto"
+  "080_script_directories_population_in_chroot.sh"
   "090_fstab.sh --auto"
 )
 
