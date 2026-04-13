@@ -239,14 +239,18 @@ set_shell_var() {
     escaped_value="${escaped_value//&/\\&}"
     escaped_value="${escaped_value//|/\\|}"
     touch "$file"
-    # CHROOT FIX: We intentionally REMOVE the hardcoded quotes around ${escaped_value}.
-    # Naive AUR parsers (like limine-update) fail directory validation if the 
-    # value is surrounded by literal quotes (e.g. "/boot"), which triggers a fallback 
-    # to bootctl, which crashes the script in an arch-chroot environment. 
+    
+    # CHROOT FIX: Remove hardcoded quotes and correctly handle commented defaults
+    # or missing EOF newlines which cause fatal regex/append failures.
     if grep -qE "^[[:space:]]*${key}=" "$file"; then
         sed -i -E "s|^[[:space:]]*${key}=.*|${key}=${escaped_value}|" "$file"
+    elif grep -qE "^[[:space:]]*#[[:space:]]*${key}=" "$file"; then
+        # Cleanly uncomment the template line rather than appending
+        sed -i -E "s|^[[:space:]]*#[[:space:]]*${key}=.*|${key}=${escaped_value}|" "$file"
     else
-        printf '%s=%s\n' "$key" "$value" | tee -a "$file" >/dev/null
+        # Fallback: enforce trailing newline before appending
+        [[ -s "$file" ]] && [[ "$(tail -c1 "$file" | wc -l)" -eq 0 ]] && echo "" >> "$file"
+        printf '%s=%s\n' "$key" "$value" >> "$file"
     fi
 }
 

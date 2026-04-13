@@ -220,7 +220,7 @@ detect_esp_mountpoint() {
         if mountpoint -q "$candidate"; then
             fstype="$(findmnt -M "$candidate" -no FSTYPE 2>/dev/null || true)"
             case "$fstype" in
-                vfat|fat|msdos)
+                vfat|fat|msdos|fat32)
                     CACHE_ESP_PATH="$candidate"
                     printf '%s\n' "$CACHE_ESP_PATH"
                     return 0
@@ -248,9 +248,13 @@ set_shell_var() {
     escaped_value="${escaped_value//&/\\&}"
     escaped_value="${escaped_value//|/\\|}"
     sudo touch "$file"
+    
     if sudo grep -qE "^[[:space:]]*${key}=" "$file"; then
         sudo sed -i -E "s|^[[:space:]]*${key}=.*|${key}=${escaped_value}|" "$file"
+    elif sudo grep -qE "^[[:space:]]*#[[:space:]]*${key}=" "$file"; then
+        sudo sed -i -E "s|^[[:space:]]*#[[:space:]]*${key}=.*|${key}=${escaped_value}|" "$file"
     else
+        sudo bash -c "[[ -s \"$file\" ]] && [[ \"\$(tail -c1 \"$file\" | wc -l)\" -eq 0 ]] && echo \"\" >> \"$file\""
         printf '%s=%s\n' "$key" "$value" | sudo tee -a "$file" >/dev/null
     fi
 }
@@ -647,10 +651,6 @@ configure_limine_defaults() {
 
     esp_target="$(detect_esp_mountpoint)" || fatal "Could not detect a mounted ESP."
 
-    # Do NOT force-add ESP_PATH when absent.
-    # Evidence from your Arch logs shows it does not persist there and causes
-    # needless rewrites + limine-update on every rerun.
-    # Only correct it if an explicit key already exists but is wrong.
     if shell_var_key_present "$limine_defaults" ESP_PATH; then
         current_esp="$(read_shell_var_from_file "$limine_defaults" ESP_PATH)"
         if [[ "$current_esp" != "$esp_target" ]]; then
