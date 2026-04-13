@@ -244,7 +244,11 @@ EOF
     info "Configured dynamic ${target_hook} injection in ${managed_file}"
 }
 
-rebuild_initramfs() { sudo limine-update; }
+rebuild_initramfs() { 
+    info "Recompiling early boot images to inject overlayfs hooks..."
+    sudo mkinitcpio -P
+    sudo limine-update || true
+}
 
 configure_sync_daemon() {
     local conf_file="/etc/limine-snapper-sync.conf" root_subvol root_subvol_path tmp
