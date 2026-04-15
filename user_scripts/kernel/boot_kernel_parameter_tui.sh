@@ -38,22 +38,38 @@ declare -ra TABS=("Performance" "Hardware" "Debug" "Misc")
 # Selecting 'unset' cleanly removes the parameter from the file.
 register_items() {
     # Tab 0: Performance
-    register 0 "Mitigations"         'mitigations|cycle||unset,auto,off||'         "unset"
-    register 0 "ZSwap Enabled"       'zswap.enabled|cycle||unset,0,1||'            "unset"
+    register 0 "Mitigations"         'mitigations|cycle||unset,auto,off||'           "unset"
+    register 0 "ZSwap Enabled"       'zswap.enabled|cycle||unset,0,1||'              "unset"
+    register 0 "Intel P-State"       'intel_pstate|cycle||unset,disable,passive,force||' "unset"
+    register 0 "Trans. Hugepages"    'transparent_hugepage|cycle||unset,always,madvise,never||' "unset"
+    register 0 "NUMA Balancing"      'numa_balancing|cycle||unset,enable,disable||'  "unset"
+    register 0 "Disable Watchdog"    'nowatchdog|bool||||'                           "false"
+    register 0 "Thread IRQs"         'threadirqs|bool||||'                           "false"
 
     # Tab 1: Hardware
-    register 1 "Intel IOMMU"         'intel_iommu|cycle||unset,on,off||'           "unset"
-    register 1 "IOMMU"               'iommu|cycle||unset,pt,off,force||'           "unset"
-    register 1 "PCIE ASPM"           'pcie_aspm|cycle||unset,default,force,off||'  "unset"
-    register 1 "USB Autosuspend"     'usbcore.autosuspend|cycle||unset,-1,1||'     "unset"
-    register 1 "Mem Limit"           'mem|cycle||unset,4G,8G,16G,32G||'            "unset"
+    register 1 "Intel IOMMU"         'intel_iommu|cycle||unset,on,off||'             "unset"
+    register 1 "AMD IOMMU"           'amd_iommu|cycle||unset,off,fullflush,force_isolation||' "unset"
+    register 1 "IOMMU"               'iommu|cycle||unset,pt,off,force||'             "unset"
+    register 1 "PCIE ASPM"           'pcie_aspm|cycle||unset,default,force,off||'    "unset"
+    register 1 "USB Autosuspend"     'usbcore.autosuspend|cycle||unset,-1,1||'       "unset"
+    register 1 "Mem Limit"           'mem|cycle||unset,4G,8G,16G,32G||'              "unset"
+    register 1 "Clock Source"        'clocksource|cycle||unset,tsc,hpet,acpi_pm||'   "unset"
+    register 1 "ACPI Backlight"      'acpi_backlight|cycle||unset,video,vendor,native||' "unset"
 
     # Tab 2: Debug
-    register 2 "Log Level"           'loglevel|int||0|7|1'                         "3"
-    register 2 "Quiet Boot"          'quiet|bool||||'                              "false"
+    register 2 "Log Level"           'loglevel|int||0|7|1'                           "3"
+    register 2 "Quiet Boot"          'quiet|bool||||'                                "false"
+    register 2 "Initcall Debug"      'initcall_debug|bool||||'                       "false"
+    register 2 "Always Enable SysRq" 'sysrq_always_enabled|bool||||'                 "false"
+    register 2 "Ignore Loglevel"     'ignore_loglevel|bool||||'                      "false"
+    register 2 "Panic Timeout (s)"   'panic|int||-1|60|1'                            "0"
 
     # Tab 3: Misc
-    register 3 "FSCK Mode"           'fsck.mode|cycle||unset,auto,skip||'          "unset"
+    register 3 "FSCK Mode"           'fsck.mode|cycle||unset,auto,skip||'            "unset"
+    register 3 "AppArmor"            'apparmor|cycle||unset,0,1||'                   "unset"
+    register 3 "SELinux"             'selinux|cycle||unset,0,1||'                    "unset"
+    register 3 "Audit Subsystem"     'audit|cycle||unset,0,1||'                      "unset"
+    register 3 "Console Blank (s)"   'consoleblank|int||0|3600|60'                   "600"
 }
 
 # =============================================================================
