@@ -56,6 +56,7 @@ declare -ra USER_SERVICE_DEFS=(
     "dusky_sliders.service|Dusky Sliders Service"
     "update_checker.timer|Automatic Update Checker"
     "hypridle.service|Hyprland Idle Daemon"
+    "hyprsunset.service|Night Light/BlueLight Filter"
 )
 
 declare -ra SYSTEM_SERVICE_DEFS=(
