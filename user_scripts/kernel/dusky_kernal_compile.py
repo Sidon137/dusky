@@ -3456,7 +3456,7 @@ def _ops_security(mx: Matrix, p: KernelProfile, d: Derived) -> None:
         mx.s("MODULE_SIG_HASH", "sha512", optional=True)
     else:
         mx.n("MODULE_SIG_FORCE", optional=True)
-        mx.flag("MODULE_SIG", hardened)
+        mx.flag("MODULE_SIG", hardened, optional=True)
 
 
 def _ops_gaming(mx: Matrix, p: KernelProfile, d: Derived) -> None:
@@ -3553,8 +3553,8 @@ def _ops_power(mx: Matrix, p: KernelProfile, d: Derived) -> None:
         mx.y("ACPI_BATTERY", optional=True)
         mx.y("ACPI_AC", optional=True)
     mx.y("POWERCAP")
-    mx.y("CPU_THERMAL")
-    mx.y("THERMAL_GOV_STEP_WISE")
+    mx.y("CPU_THERMAL", optional=True)
+    mx.y("THERMAL_GOV_STEP_WISE", optional=True)
 
 
 def _ops_network(mx: Matrix, p: KernelProfile, d: Derived) -> None:
