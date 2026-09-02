@@ -968,6 +968,100 @@ def split_phonemes(phonemes: str, limit: int) -> list[str]:
     return pieces
 
 
+def extract_text_from_file(file_path: Path | str) -> str:
+    """
+    Extracts readable text from documents, books, and code files.
+    Supports:
+      - Plain text, Markdown, RST, Org, CSV, JSON, and source code files
+      - PDF files (via system pdftotext or pypdf fallback)
+      - EPUB ebooks (native zipfile extraction of XHTML/HTML chapters)
+      - HTML/XML documents (tag stripping and entity decoding)
+    """
+    path = Path(file_path).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+    if not path.is_file():
+        raise IsADirectoryError(f"Target is a directory, not a file: {path}")
+    if not os.access(path, os.R_OK):
+        raise PermissionError(f"Permission denied reading: {path}")
+
+    suffix = path.suffix.lower()
+
+    # 1. PDF Documents
+    if suffix == ".pdf":
+        if shutil.which("pdftotext"):
+            try:
+                res = subprocess.run(
+                    ["pdftotext", str(path), "-"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    errors="replace",
+                )
+                text = res.stdout.strip()
+                if text:
+                    return text
+            except Exception as exc:
+                log.warning("pdftotext failed (%s), attempting fallback", exc)
+        try:
+            import pypdf  # type: ignore
+            reader = pypdf.PdfReader(str(path))
+            pages = [page.extract_text() or "" for page in reader.pages]
+            text = "\n\n".join(p.strip() for p in pages if p.strip())
+            if text:
+                return text
+        except Exception:
+            pass
+        raise ValueError(f"Could not extract text from PDF: {path.name} (ensure pdftotext/poppler is installed)")
+
+    # 2. EPUB Ebooks (zero-dependency native zipfile extraction)
+    if suffix == ".epub":
+        import zipfile
+        import html
+        try:
+            with zipfile.ZipFile(path, "r") as z:
+                candidates = [
+                    n for n in z.namelist()
+                    if n.lower().endswith((".xhtml", ".html", ".htm"))
+                ]
+                chapters = [c for c in candidates if not any(x in c.lower() for x in ("toc", "nav", "cover"))]
+                files_to_read = chapters if chapters else candidates
+
+                parts: list[str] = []
+                for name in files_to_read:
+                    try:
+                        raw = z.read(name).decode("utf-8", "replace")
+                        cleaned = re.sub(r"<style[\s\S]*?</style>", " ", raw, flags=re.IGNORECASE)
+                        cleaned = re.sub(r"<script[\s\S]*?</script>", " ", cleaned, flags=re.IGNORECASE)
+                        cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+                        cleaned = html.unescape(cleaned)
+                        cleaned = re.sub(r"[ \t]+", " ", cleaned)
+                        cleaned = re.sub(r"\n\s*\n", "\n\n", cleaned).strip()
+                        if cleaned:
+                            parts.append(cleaned)
+                    except Exception:
+                        continue
+                text = "\n\n".join(parts).strip()
+                if text:
+                    return text
+        except Exception as exc:
+            raise ValueError(f"Could not read EPUB {path.name}: {exc}") from exc
+
+    # 3. HTML Documents
+    if suffix in (".html", ".htm", ".xhtml"):
+        import html
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        cleaned = re.sub(r"<style[\s\S]*?</style>", " ", raw, flags=re.IGNORECASE)
+        cleaned = re.sub(r"<script[\s\S]*?</script>", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+        cleaned = html.unescape(cleaned)
+        cleaned = re.sub(r"[ \t]+", " ", cleaned)
+        return re.sub(r"\n\s*\n", "\n\n", cleaned).strip()
+
+    # 4. Standard text, Markdown, RST, Org, and source code files
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
 # =============================================================================
 #  Voices (voices-v1.0.bin is an NPZ: name -> float32[510, 1, 256])
 # =============================================================================
@@ -2299,6 +2393,8 @@ def client_request(socket_path: Path, payload: dict[str, Any], *, timeout: float
                         raise ClientError(f"malformed reply from daemon: {exc}", 3) from exc
                     on_message(message)
                     last = message
+                    if stream:
+                        sock.settimeout(None)
                     if not stream or message.get("event") in TERMINAL_EVENTS or not message.get("ok", True):
                         break
             if last is None:
@@ -2343,14 +2439,32 @@ def run_client(args: argparse.Namespace) -> int:
     match args.command:
         case "speak":
             if args.file:
-                text = Path(args.file).read_text(encoding="utf-8", errors="replace")
+                try:
+                    text = extract_text_from_file(args.file)
+                except Exception as exc:
+                    print(f"speak: error reading {args.file}: {exc}", file=sys.stderr)
+                    return 66
             elif (args.text is not None or getattr(args, "text_flag", None) is not None) and not args.stdin:
-                text = args.text if args.text is not None else args.text_flag
+                candidate = args.text if args.text is not None else args.text_flag
+                cand_path = Path(candidate).expanduser() if candidate else None
+                if cand_path and cand_path.is_file():
+                    try:
+                        text = extract_text_from_file(cand_path)
+                    except Exception as exc:
+                        print(f"speak: error reading {candidate}: {exc}", file=sys.stderr)
+                        return 66
+                else:
+                    text = candidate
             else:
                 if sys.stdin.isatty() and not args.stdin:
-                    print("speak: provide TEXT, --file or --stdin", file=sys.stderr)
+                    print("speak: provide TEXT, [FILE], --file PATH or --stdin", file=sys.stderr)
                     return 64
                 text = sys.stdin.buffer.read().decode("utf-8", "replace")
+
+            if not text or not text.strip():
+                print("speak: text/file is empty (nothing to speak)", file=sys.stderr)
+                return 0
+
             payload.update({
                 "text": text, "mode": args.mode, "voice": args.voice, "speed": args.speed, "lang": args.lang,
                 "wait": "done" if args.wait else "accepted",
@@ -2603,14 +2717,14 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--timeout", type=float, default=90.0, help="seconds to wait for the reply (covers cold start)")
         return p
 
-    s = client_parser("speak", "send text to be spoken")
-    s.add_argument("text", nargs="?")
+    s = client_parser("speak", "send text or a book/document to be spoken aloud")
+    s.add_argument("text", nargs="?", help="text to speak, or path to a file (txt, md, pdf, epub)")
     s.add_argument("--text", dest="text_flag", help="text to speak (alternative to positional text)")
-    s.add_argument("--stdin", action="store_true")
-    s.add_argument("--file")
-    s.add_argument("--mode", choices=("interrupt", "enqueue"))
+    s.add_argument("--stdin", action="store_true", help="read text from standard input")
+    s.add_argument("--file", help="path to a text, markdown, epub, or pdf file to speak")
+    s.add_argument("--mode", choices=("interrupt", "enqueue"), help="interrupt playback or queue behind existing jobs")
     s.add_argument("--voice", help="voice spec, e.g. af_heart or af_heart:0.4,af_bella:0.6")
-    s.add_argument("--speed", type=float)
+    s.add_argument("--speed", type=float, help="Kokoro generation speed (0.5 to 2.0)")
     s.add_argument("--lang", help="espeak-ng language code (default: derived from the voice prefix)")
     s.add_argument("--wait", action="store_true", help="stream started/finished/cancelled/error events")
     s.add_argument("--client", default="cli")
