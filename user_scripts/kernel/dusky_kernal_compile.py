@@ -2050,15 +2050,22 @@ def _bootloaders() -> tuple[tuple[str, ...], str, str]:
     found: list[str] = []
     esp = xbootldr = ""
     if have("bootctl"):
+        esp_out = (run(["bootctl", "-p"], check=False, timeout=20).stdout or "").strip()
+        xbootldr_out = (run(["bootctl", "-x"], check=False, timeout=20).stdout or "").strip()
+        if esp_out.startswith("/"):
+            esp = esp_out
+        if xbootldr_out.startswith("/"):
+            xbootldr = xbootldr_out
         cp = run(["bootctl", "is-installed"], check=False, timeout=20)
-        if cp.returncode == 0:
+        has_sdboot_efivars = False
+        try:
+            efivars = Path("/sys/firmware/efi/efivars")
+            if efivars.is_dir():
+                has_sdboot_efivars = any(efivars.glob("LoaderInfo-*")) or any(efivars.glob("LoaderEntry*"))
+        except Exception:
+            pass
+        if cp.returncode == 0 or has_sdboot_efivars or esp:
             found.append("systemd-boot")
-        esp = (run(["bootctl", "-p"], check=False, timeout=20).stdout or "").strip()
-        xbootldr = (run(["bootctl", "-x"], check=False, timeout=20).stdout or "").strip()
-        if not esp.startswith("/"):
-            esp = ""
-        if not xbootldr.startswith("/"):
-            xbootldr = ""
     if "systemd-boot" not in found:
         for cand in ("/boot/loader/entries", "/efi/loader/entries", "/boot/efi/loader/entries"):
             if Path(cand).is_dir():
@@ -2703,7 +2710,7 @@ def ensure_modprobed_db(p: KernelProfile) -> Path | None:
             warn("modprobed.db is small; use the system for a few days (USB devices, VPN, printers...) before trusting strict mode")
         return db
     if not custom:
-        warn("modprobed.db missing (pacman -S modprobed-db; modprobed-db store)")
+        warn("modprobed.db missing (install from AUR: paru -S modprobed-db; modprobed-db store)")
     else:
         warn(f"modprobed.db not found at {db}")
     return None
@@ -4553,13 +4560,42 @@ def do_doctor(args: argparse.Namespace) -> int:
         ["amd_pstate", _read("/sys/devices/system/cpu/amd_pstate/status").strip() or "n/a"], ["THP", _read("/sys/kernel/mm/transparent_hugepage/enabled").strip() or "n/a"],
         ["zram", ", ".join(p.name for p in Path("/sys/block").glob("zram*")) or "none"],
     ])
-    rule("Toolchain")
+    rule("Toolchain & Systems Integration")
     rows = []
-    for name in ("clang", "ld.lld", "llvm-ar", "gcc", "rustc", "bindgen", "pahole", "make", "makepkg", "mkinitcpio", "perf", "create_llvm_prof", "gpg", "curl", "aria2c",
-                 "modprobed-db", "scx_loader", "scx_lavd", "scx_bpfland", "zram-generator", "dkms", "kernel-install", "grub-mkconfig", "bootctl", "limine-update"):
+    # (tool, category, is_required)
+    tool_defs = [
+        ("clang", "compiler (LLVM)", True),
+        ("ld.lld", "linker (LLD)", True),
+        ("llvm-ar", "archiver (LLVM)", True),
+        ("rustc", "Rust-for-Linux", True),
+        ("bindgen", "Rust-for-Linux", True),
+        ("pahole", "BTF generation", True),
+        ("make", "build automation", True),
+        ("makepkg", "Arch packaging", True),
+        ("mkinitcpio", "initramfs generator", True),
+        ("modprobed-db", "hardware module profiler", True),
+        ("zram-generator", "ZRAM RAM swap generator", True),
+        ("perf", "kernel telemetry / AutoFDO", False),
+        ("scx_lavd", "sched_ext gaming/latency", False),
+        ("scx_bpfland", "sched_ext low-latency", False),
+        ("dkms", "out-of-tree dynamic modules", False),
+        ("bootctl", "systemd-boot management", "systemd-boot" in facts.bootloaders),
+        ("kernel-install", "kernel install framework", False),
+        ("grub-mkconfig", "GRUB bootloader", "grub" in facts.bootloaders),
+        ("limine-update", "Limine bootloader", "limine" in facts.bootloaders),
+        ("create_llvm_prof", "Google AutoFDO (optional)", False),
+        ("aria2c", "multi-stream downloader (optional)", False),
+    ]
+    for name, cat, required in tool_defs:
         v = facts.tools.get(name, "")
-        rows.append([name, f"{C.GREEN}{v}{C.RESET}" if v else f"{C.RED}missing{C.RESET}"])
-    table(["tool", "version"], rows)
+        if v:
+            status = f"{C.GREEN}{v}{C.RESET}"
+        elif required:
+            status = f"{C.RED}missing (required){C.RESET}"
+        else:
+            status = f"{C.DIM}not installed (optional){C.RESET}"
+        rows.append([name, cat, status])
+    table(["tool", "subsystem", "status"], rows)
     rule("Paths")
     free = shutil.disk_usage(BUILD_DIR if BUILD_DIR.exists() else Path.home()).free
     table(["path", "value"], [["profiles", ", ".join(str(d) for d in profile_dirs())], ["build dir", f"{BUILD_DIR} ({fmt_bytes(free)} free)"],
@@ -4680,7 +4716,7 @@ DEFAULT_PROFILES: Final[tuple[tuple[str, str, str, int, dict[str, dict[str, Any]
         "rseq": {"slice_extension": True, "slice_ext_nsec": 10000},
         "cpu": {"arch": "native", "governor": "schedutil", "amd_pstate": "active", "epp": "balance_performance", "mitigations": "off", "prefcore": True},
         "timing": {"hz": 1000, "tickless": "idle", "preempt": "lazy", "preempt_dynamic": True},
-        "memory": {"footprint": "standard", "thp": "madvise", "thp_defrag": "defer+madvise", "swap_backend": "zram", "zram_algo": "lz4", "zram_recomp_algo": "zstd",
+        "memory": {"footprint": "standard", "thp": "madvise", "thp_defrag": "defer+madvise", "swap_backend": "zram", "zram_algo": "zstd", "zram_recomp_algo": "zstd",
                    "zram_size_pct": 50, "ksm": False, "tracing": "full"},
         "compiler": {"toolchain": "llvm", "optimize": "o2", "lto": "full", "kcfi": False, "debug_info": "reduced", "rust": False, "headers": "auto"},
         "security": {"profile": "extreme", "acknowledge_risk": True},
@@ -4696,7 +4732,7 @@ DEFAULT_PROFILES: Final[tuple[tuple[str, str, str, int, dict[str, dict[str, Any]
         "cache": {"sched_cache": True, "llc_aggr_tolerance": 0},
         "cpu": {"arch": "native", "governor": "performance", "amd_pstate": "active", "epp": "performance", "mitigations": "off"},
         "timing": {"hz": 1000, "tickless": "idle", "preempt": "full", "preempt_dynamic": True},
-        "memory": {"thp": "always", "thp_defrag": "defer+madvise", "swap_backend": "zram", "zram_algo": "lz4", "zram_recomp_algo": "zstd", "zram_size_pct": 50},
+        "memory": {"thp": "always", "thp_defrag": "defer+madvise", "swap_backend": "zram", "zram_algo": "zstd", "zram_recomp_algo": "zstd", "zram_size_pct": 50},
         "compiler": {"toolchain": "llvm", "lto": "thin", "debug_info": "reduced", "rust": False},
         "security": {"profile": "extreme", "acknowledge_risk": True},
         "gaming": {"ntsync": True, "uclamp": True, "max_map_count": 2147483642, "split_lock_mitigate": False, "controllers": True},
@@ -4709,7 +4745,7 @@ DEFAULT_PROFILES: Final[tuple[tuple[str, str, str, int, dict[str, dict[str, Any]
         "scheduler": {"type": "eevdf", "scx": "none", "scx_enable_class": False},
         "cpu": {"arch": "native", "governor": "schedutil", "mitigations": "on"},
         "timing": {"hz": 500, "tickless": "idle", "preempt": "lazy", "preempt_dynamic": True},
-        "memory": {"footprint": "lean", "thp": "madvise", "thp_defrag": "defer", "mglru": True, "mglru_min_ttl_ms": 1000, "swap_backend": "zram", "zram_algo": "lz4",
+        "memory": {"footprint": "lean", "thp": "madvise", "thp_defrag": "defer", "mglru": True, "mglru_min_ttl_ms": 1000, "swap_backend": "zram", "zram_algo": "zstd",
                    "zram_recomp_algo": "zstd", "zram_size_pct": 100, "zram_multi_comp": True, "swappiness": 180, "vfs_cache_pressure": 120, "watermark_scale_factor": 125,
                    "dirty_bytes_mb": 128, "slub_tiny": False, "numa": False, "ksm": True, "damon": False, "kallsyms_all": False, "tracing": "minimal", "kexec": False,
                    "systemd_oomd": True, "hugetlbfs": False},
@@ -4761,7 +4797,7 @@ DEFAULT_PROFILES: Final[tuple[tuple[str, str, str, int, dict[str, dict[str, Any]
         "cache": {"sched_cache": True, "llc_aggr_tolerance": 1, "persist": True},
         "cpu": {"arch": "znver4", "governor": "schedutil", "amd_pstate": "active", "epp": "balance_performance", "prefcore": True, "mitigations": "on"},
         "timing": {"hz": 1000, "tickless": "idle", "preempt": "lazy", "preempt_dynamic": True},
-        "memory": {"thp": "madvise", "mglru": True, "swap_backend": "zram", "zram_algo": "lz4", "zram_recomp_algo": "zstd", "zram_size_pct": 50},
+        "memory": {"thp": "madvise", "mglru": True, "swap_backend": "zram", "zram_algo": "zstd", "zram_recomp_algo": "zstd", "zram_size_pct": 50},
         "compiler": {"toolchain": "llvm", "optimize": "o2", "lto": "none", "kcfi": False, "debug_info": "reduced", "rust": True},
         "security": {"profile": "balanced"},
         "modules": {"mode": "strict", "modprobed_db": True},
@@ -4787,7 +4823,7 @@ DEFAULT_PROFILES: Final[tuple[tuple[str, str, str, int, dict[str, dict[str, Any]
         "cache": {"sched_cache": True},
         "cpu": {"arch": "native", "governor": "powersave", "epp": "balance_power", "amd_pstate": "active", "mitigations": "on"},
         "timing": {"hz": 300, "tickless": "idle", "preempt": "lazy", "preempt_dynamic": True},
-        "memory": {"footprint": "lean", "thp": "madvise", "swap_backend": "zram", "zram_algo": "lz4", "zram_recomp_algo": "zstd", "zram_size_pct": 50, "tracing": "minimal"},
+        "memory": {"footprint": "lean", "thp": "madvise", "swap_backend": "zram", "zram_algo": "zstd", "zram_recomp_algo": "zstd", "zram_size_pct": 50, "tracing": "minimal"},
         "power": {"wq_power_efficient": True, "cpu_idle_governor": "teo", "rcu_lazy": True, "energy_model": True, "pcie_aspm": "powersupersave", "hda_power_save": 10},
         "compiler": {"toolchain": "llvm", "optimize": "o2", "lto": "thin", "debug_info": "none", "rust": False},
         "security": {"profile": "balanced"},
@@ -4801,7 +4837,7 @@ DEFAULT_PROFILES: Final[tuple[tuple[str, str, str, int, dict[str, dict[str, Any]
         "cache": {"sched_cache": False},
         "cpu": {"arch": "generic_v3", "governor": "schedutil", "amd_pstate": "undefined", "mitigations": "on", "nr_cpus": 64},
         "timing": {"hz": 250, "tickless": "idle", "preempt": "lazy", "preempt_dynamic": True},
-        "memory": {"footprint": "lean", "thp": "madvise", "swap_backend": "zram", "zram_algo": "lz4", "zram_size_pct": 50, "page_reporting": True, "numa": False, "tracing": "minimal"},
+        "memory": {"footprint": "lean", "thp": "madvise", "swap_backend": "zram", "zram_algo": "zstd", "zram_size_pct": 50, "page_reporting": True, "numa": False, "tracing": "minimal"},
         "power": {"cpu_idle_governor": "haltpoll", "hibernation": False},
         "compiler": {"toolchain": "llvm", "optimize": "o2", "lto": "thin", "debug_info": "none", "rust": False, "headers": "auto"},
         "security": {"profile": "balanced"},
@@ -4897,11 +4933,33 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------------------------------
 # Interactive menu
 # ---------------------------------------------------------------------------------------------------
+def install_aur_package(pkg: str) -> bool:
+    """Install an AUR package using paru, yay, or direct makepkg without sudo."""
+    if have("paru"):
+        return run(["paru", "-S", "--needed", pkg], capture=False).returncode == 0
+    if have("yay"):
+        return run(["yay", "-S", "--needed", pkg], capture=False).returncode == 0
+    info(f"No AUR helper detected; building {pkg} directly from AUR via makepkg...")
+    with tempfile.TemporaryDirectory(prefix=f"aur-{pkg}-") as tmp:
+        clone = run(["git", "clone", f"https://aur.archlinux.org/{pkg}.git", str(tmp)], capture=False)
+        if clone.returncode != 0:
+            return False
+        return run(["makepkg", "-si", "--noconfirm", "--needed"], cwd=Path(tmp), capture=False).returncode == 0
+
+
 def initialize_toolchains() -> None:
     rule("Toolchains & hardware profiler")
-    pkgs = ["base-devel", "clang", "lld", "llvm", "rust", "rust-bindgen", "bc", "cpio", "kmod", "pahole", "modprobed-db", "zram-generator", "scx-scheds", "perf", "curl", "gnupg"]
-    if ask_yes(f"pacman -S --needed {' '.join(pkgs)} ?", True):
-        PRIV.run(["pacman", "-S", "--needed", *pkgs], capture=False)
+    official_pkgs = ["base-devel", "clang", "lld", "llvm", "rust", "rust-bindgen", "bc", "cpio", "kmod", "pahole", "zram-generator", "scx-scheds", "perf", "curl", "gnupg"]
+    if ask_yes(f"Install official packages (pacman -S --needed {' '.join(official_pkgs)}) ?", True):
+        PRIV.run(["pacman", "-S", "--needed", *official_pkgs], capture=False)
+    
+    if not have("modprobed-db"):
+        if ask_yes("modprobed-db is an AUR package (tracks loaded modules for localmodconfig); install from AUR now?", True):
+            if install_aur_package("modprobed-db"):
+                ok("modprobed-db installed successfully from AUR")
+            else:
+                warn("Could not install modprobed-db automatically; install manually with: paru -S modprobed-db")
+
     if have("modprobed-db"):
         run(["modprobed-db", "store"], check=False)
         run(["systemctl", "--user", "enable", "--now", "modprobed-db.service"], check=False)

@@ -134,7 +134,7 @@ mglru_min_ttl_ms = 1000
 # Compressed swap backend | choices: zram | zswap | none
 swap_backend = "zram"
 # Primary ZRAM compressor | choices: zstd | lz4 | lz4hc | lzo-rle
-zram_algo = "lz4"
+zram_algo = "zstd"
 # ZRAM recompression algorithm for idle pages (multi-comp) | choices: zstd | lz4 | lz4hc | lzo-rle
 zram_recomp_algo = "zstd"
 # ZRAM size as percent of RAM
