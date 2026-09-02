@@ -4300,6 +4300,9 @@ def write_bls_entries(p: KernelProfile, facts: HostFacts, d: Derived) -> None:
         files[entries_dir / f"{p.pkgbase}{suffix}.conf"] = ("\n".join(body) + "\n", "0644")
     PRIV.write_files(files)
     ok(f"systemd-boot entries written: {', '.join(f.name for f in files)}")
+    if have("bootctl"):
+        PRIV.run(["bootctl", "set-default", f"{p.pkgbase}.conf"], check=False)
+        ok(f"systemd-boot default entry set to {p.pkgbase}.conf")
 
 
 def refresh_boot(p: KernelProfile, facts: HostFacts, d: Derived, *, kernel_install: bool) -> None:
