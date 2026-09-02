@@ -2724,6 +2724,76 @@ def merge_repos_for_iso(
     ok(f"ISO staging repo ready ({n} packages + DB)")
 
 
+def sanitize_and_validate_iso_packages(cfg: ISOConfig, staging_repo: Path) -> None:
+    pkg_file = cfg.profile_dir / "packages.x86_64"
+    if not pkg_file.is_file():
+        return
+
+    info("Sanitizing and validating ISO live environment packages (packages.x86_64)")
+
+    # 1. Available in staging repo
+    staging_pkgs: set[str] = set()
+    for p in staging_repo.glob("*.pkg.tar.*"):
+        if p.name.endswith(".sig") or ".part" in p.name:
+            continue
+        parsed = parse_pkg_filename(p.name)
+        if parsed:
+            staging_pkgs.add(parsed[0])
+
+    # 2. Available in official sync DBs
+    sync_pkgs: set[str] = set()
+    try:
+        pr = subprocess.run(
+            ["pacman", "-Slq"],
+            capture_output=True,
+            text=True,
+            shell=False,
+            check=False,
+        )
+        if pr.returncode == 0:
+            sync_pkgs = {ln.strip() for ln in pr.stdout.splitlines() if ln.strip()}
+    except Exception as exc:
+        warn(f"Query sync DB failed: {exc}")
+
+    available_universe = staging_pkgs | sync_pkgs
+
+    ALIASES = {
+        "broadcom-wl": "broadcom-wl-dkms",
+    }
+
+    lines = pkg_file.read_text(encoding="utf-8").splitlines()
+    sanitized: List[str] = []
+    seen: set[str] = set()
+
+    for line in lines:
+        pkg = line.strip()
+        if not pkg or pkg.startswith("#"):
+            continue
+
+        if pkg in ALIASES:
+            target = ALIASES[pkg]
+            if target in available_universe or not available_universe:
+                step(f"Auto-mapped obsolete live package: '{pkg}' -> '{target}'")
+                pkg = target
+
+        if available_universe and pkg not in available_universe:
+            warn(
+                f"Excluding unavailable package '{pkg}' from packages.x86_64 "
+                f"to prevent mkarchiso resolution failure"
+            )
+            continue
+
+        if pkg not in seen:
+            seen.add(pkg)
+            sanitized.append(pkg)
+
+    if not sanitized:
+        die("Sanitization resulted in empty packages.x86_64")
+
+    pkg_file.write_text("\n".join(sanitized) + "\n", encoding="utf-8")
+    ok(f"ISO live packages sanitized ({len(sanitized)} packages)")
+
+
 def build_iso_image(cfg: ISOConfig) -> Path:
     info("Building ISO")
     final_name = f"dusky_{datetime.now().strftime('%m_%y')}.iso"
@@ -2750,6 +2820,7 @@ def build_iso_image(cfg: ISOConfig) -> Path:
         cfg.aur_repo if cfg.aur_repo is not None and cfg.aur_repo.exists() else None,
         staging,
     )
+    sanitize_and_validate_iso_packages(cfg, staging)
     stage_q = shlex.quote(str(staging.resolve()))
 
     inj_lines = [
