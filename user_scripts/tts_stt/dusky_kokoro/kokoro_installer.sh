@@ -555,6 +555,11 @@ install_trigger() {
     if [[ -d "$HOME/.local/bin" ]]; then
         ln -sfn "$TRIGGER_DIR/trigger.sh" "$HOME/.local/bin/dusky-kokoro"
         ok "symlinked ~/.local/bin/dusky-kokoro"
+        if [[ -f "$SCRIPT_DIR/tui/kokoro_tui.sh" ]]; then
+            chmod 755 "$SCRIPT_DIR/tui/kokoro_tui.sh"
+            ln -sfn "$SCRIPT_DIR/tui/kokoro_tui.sh" "$HOME/.local/bin/dusky-kokoro-tui"
+            ok "symlinked ~/.local/bin/dusky-kokoro-tui"
+        fi
     fi
 }
 

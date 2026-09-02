@@ -224,6 +224,13 @@ class VoiceConfig:
     spec: str = "af_heart:0.4,af_bella:0.6"
     lang: str = "auto"
     speed: float = 1.0
+    blend: bool = True
+    voice_1: str = "af_heart"
+    weight_1: float = 0.5
+    voice_2: str = "af_bella"
+    weight_2: float = 0.5
+    voice_3: str = "none"
+    weight_3: float = 0.0
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -354,6 +361,13 @@ profiling = false          # write ONNX Runtime JSON profiles to the cache dir
 
 [voice]
 spec = "af_heart:0.4,af_bella:0.6"   # "name" or "name:weight,name:weight" (weights are normalised)
+blend = true                         # true | false
+voice_1 = "af_heart"
+weight_1 = 0.4
+voice_2 = "af_bella"
+weight_2 = 0.6
+voice_3 = "none"
+weight_3 = 0.0
 lang = "auto"                        # auto = from the first voice prefix (a en-us, b en-gb, j ja, z cmn, e es, f fr-fr, h hi, i it, p pt-br)
 speed = 1.0                          # Kokoro duration-model speed, 0.5 - 2.0
 
