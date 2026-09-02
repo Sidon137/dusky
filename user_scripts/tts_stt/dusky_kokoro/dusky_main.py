@@ -1210,11 +1210,14 @@ def choose_model(precision: str, kind: str, models_dir: Path) -> tuple[str, Path
 
 
 class Engine:
-    def __init__(self, cfg: Config, paths: Paths, voices: VoiceBank) -> None:
+    def __init__(self, cfg: Config, paths: Paths, voices: VoiceBank, is_worker: bool = False) -> None:
         self.cfg = cfg
         self.paths = paths
         self.voices = voices
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="engine")
+        self.is_worker = is_worker
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="engine") if is_worker else None
+        self._worker_proc: asyncio.subprocess.Process | None = None
+        self._loaded = False
         self._kokoro: Any = None
         self._session: Any = None
         self._run_options: Any = None
@@ -1234,35 +1237,120 @@ class Engine:
     # ---- async facade -------------------------------------------------------
     @property
     def loaded(self) -> bool:
-        return self._kokoro is not None
+        if self.is_worker:
+            return self._kokoro is not None
+        return self._loaded and self._worker_proc is not None and self._worker_proc.returncode is None
 
     def touch(self) -> None:
         self.last_used = time.monotonic()
 
     async def run(self, fn: Callable[..., Any], *args: Any) -> Any:
-        return await asyncio.get_running_loop().run_in_executor(self._executor, fn, *args)
+        if self._executor is not None:
+            return await asyncio.get_running_loop().run_in_executor(self._executor, fn, *args)
+        return await asyncio.to_thread(fn, *args)
 
     async def ensure_loaded(self) -> None:
         async with self._load_lock:
-            if self.reload_pending and self.loaded:
-                await self.run(self._unload_sync, "configuration reload")
-            self.reload_pending = False
-            if not self.loaded:
-                await self.run(self._load_sync)
+            if self.is_worker:
+                if self.reload_pending and self.loaded:
+                    await self.run(self._unload_sync, "configuration reload")
+                self.reload_pending = False
+                if not self.loaded:
+                    await self.run(self._load_sync)
+            else:
+                if self.reload_pending and self.loaded:
+                    await self.unload("configuration reload")
+                self.reload_pending = False
+                if not self.loaded:
+                    script_path = str(Path(__file__).resolve())
+                    self._worker_proc = await asyncio.create_subprocess_exec(
+                        sys.executable, "-u", script_path, "synth-worker",
+                        "--config", str(self.paths.config_file),
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=None,
+                    )
+                    assert self._worker_proc.stdout is not None
+                    line = await self._worker_proc.stdout.readline()
+                    if not line:
+                        raise EngineError("synthesis worker failed to start")
+                    try:
+                        ready = json.loads(line.decode("utf-8"))
+                    except Exception as exc:
+                        raise EngineError(f"malformed ready signal from synthesis worker: {exc}") from exc
+                    if not ready.get("ok"):
+                        raise EngineError(f"synthesis worker error: {ready.get('error')}")
+                    self.active_providers = ready.get("providers", [])
+                    self.active_kind = ready.get("kind", "none")
+                    self.model_precision = ready.get("precision", "none")
+                    self.model_path = Path(ready["model"]) if ready.get("model") else None
+                    self._loaded = True
+                    log.info("Synthesis worker ready (pid %d); engine=%s; providers=%s",
+                             self._worker_proc.pid, self.active_kind, self.active_providers)
         self.touch()
 
     async def unload(self, reason: str) -> None:
         async with self._load_lock:
-            if self.loaded:
-                await self.run(self._unload_sync, reason)
+            if self.is_worker:
+                if self._kokoro is not None:
+                    await self.run(self._unload_sync, reason)
+            else:
+                if self._worker_proc is not None:
+                    proc = self._worker_proc
+                    self._worker_proc = None
+                    if proc.returncode is None:
+                        try:
+                            if proc.stdin and not proc.stdin.is_closing():
+                                proc.stdin.write(b'{"cmd": "quit"}\n')
+                                await proc.stdin.drain()
+                            await asyncio.wait_for(proc.wait(), timeout=2.0)
+                        except Exception:
+                            proc.kill()
+                            with contextlib.suppress(Exception):
+                                await proc.wait()
+                    self._loaded = False
+                    self.active_kind = "none"
+                    self.active_providers = []
+                    log.info("Synthesis worker process exited (%s). Discrete GPU resources fully freed by kernel.", reason)
 
-    async def synthesize(self, text: str, voice_vec: Any, speed: float, lang: str, pause_ms: int) -> bytes:
-        return await self.run(self._synth_sync, text, voice_vec, speed, lang, pause_ms)
+    async def synthesize(self, text: str, voice_spec: Any, speed: float, lang: str, pause_ms: int) -> bytes:
+        if self.is_worker:
+            vec = self.voices.resolve(voice_spec) if isinstance(voice_spec, str) else voice_spec
+            return await self.run(self._synth_sync, text, vec, speed, lang, pause_ms)
+
+        if not self.loaded:
+            await self.ensure_loaded()
+        assert self._worker_proc is not None and self._worker_proc.stdin is not None and self._worker_proc.stdout is not None
+        vspec = voice_spec if isinstance(voice_spec, str) else self.cfg.voice.spec
+        req = json.dumps({
+            "cmd": "synth", "text": text, "voice": vspec, "speed": speed, "lang": lang, "pause_ms": pause_ms
+        }) + "\n"
+        t0 = time.perf_counter()
+        self._worker_proc.stdin.write(req.encode("utf-8"))
+        await self._worker_proc.stdin.drain()
+
+        header = await self._worker_proc.stdout.readexactly(4)
+        (length,) = struct.unpack("<I", header)
+        if length == 0:
+            raise EngineError("synthesis worker failed to produce audio segment")
+        pcm = await self._worker_proc.stdout.readexactly(length)
+        elapsed = time.perf_counter() - t0
+        self.stats.segments += 1
+        self.stats.synth_s += elapsed
+        self.stats.audio_s += len(pcm) / (BYTES_PER_SAMPLE * SAMPLE_RATE)
+        self.touch()
+        return pcm
 
     def interrupt(self) -> None:
-        """Abort the in-flight ONNX run (thread-safe flag read between kernels)."""
-        if self._run_options is not None:
-            self._run_options.terminate = True
+        """Abort the in-flight ONNX run."""
+        if self.is_worker:
+            if self._run_options is not None:
+                self._run_options.terminate = True
+        else:
+            if self._worker_proc is not None and self._worker_proc.returncode is None:
+                self._worker_proc.terminate()
+                self._worker_proc = None
+                self._loaded = False
 
     def pop_warnings(self) -> list[str]:
         out, self.warnings = self.warnings, []
@@ -1561,6 +1649,10 @@ class MpvPlayer:
         if c.window:
             cmd += ["--force-window=yes", f"--geometry={c.window_geometry}", f"--title={c.window_title}: {self.title}",
                     "--x11-name=kokoro", "--wayland-app-id=kokoro", "--osd-level=1"]
+            if "WAYLAND_DISPLAY" in self.env:
+                cmd.append("--gpu-context=wayland")
+            elif "DISPLAY" in self.env:
+                cmd.append("--gpu-context=x11egl")
         else:
             cmd += ["--force-window=no", "--vo=null"]
         if c.audio_device:
@@ -1847,6 +1939,7 @@ class Daemon:
         self._last_digest_at = 0.0
         self._notified_degraded = False
         self._job_counter = 0
+        self.is_synthesizing = False
 
     # ---- lifecycle ------------------------------------------------------------
     async def serve(self) -> int:
@@ -1955,6 +2048,12 @@ class Daemon:
     def _player_env(self, job_env: dict[str, str]) -> dict[str, str]:
         env = os.environ.copy()
         env.update({k: v for k, v in job_env.items() if k in CLIENT_ENV_KEYS and isinstance(v, str)})
+        # Force mpv to render on the integrated GPU (Mesa/Intel/AMD) rather than the discrete NVIDIA GPU.
+        # This prevents mpv from holding open /dev/nvidia* and locking the discrete GPU in D0 power state!
+        if Path("/usr/share/glvnd/egl_vendor.d/50_mesa.json").exists():
+            env["__EGL_VENDOR_LIBRARY_FILENAMES"] = "/usr/share/glvnd/egl_vendor.d/50_mesa.json"
+        env["DRI_PRIME"] = "0"
+        env["CUDA_VISIBLE_DEVICES"] = ""
         return env
 
     # ---- control connections ---------------------------------------------------
@@ -1963,7 +2062,6 @@ class Daemon:
         if task is not None:
             self._client_tasks.add(task)
         self.clients += 1
-        self.last_activity = time.monotonic()
         try:
             sock = writer.get_extra_info("socket")
             if sock is None or not peer_is_self(sock):
@@ -1992,7 +2090,6 @@ class Daemon:
             pass
         finally:
             self.clients -= 1
-            self.last_activity = time.monotonic()
             if task is not None:
                 self._client_tasks.discard(task)
             writer.close()
@@ -2006,6 +2103,8 @@ class Daemon:
 
     async def _dispatch(self, req: dict[str, Any], writer: asyncio.StreamWriter) -> None:
         cmd = req.get("cmd")
+        if cmd not in ("ping", "status"):
+            self.last_activity = time.monotonic()
         match cmd:
             case "ping":
                 await self._send(writer, {"ok": True, "event": "pong", "version": VERSION, "protocol": PROTOCOL, "pid": os.getpid()})
@@ -2237,13 +2336,13 @@ class Daemon:
                 self.last_activity = time.monotonic()
                 self._set_status("Idle (model loaded)" if self.engine.loaded else "Idle (model not loaded)")
 
-    async def _produce(self, job: Job, voice_vec: Any, chunks: asyncio.Queue[bytes | None]) -> None:
+    async def _produce(self, job: Job, voice_spec: Any, chunks: asyncio.Queue[bytes | None]) -> None:
         """Synthesis producer. End-of-stream handoff rules:
         * normal / error paths: the consumer is alive and draining, so a blocking put(None) always completes;
         * cancellation: the consumer may already be gone, so never block - a lost sentinel is harmless then."""
         try:
             for index, segment in enumerate(job.segments):
-                pcm = await self.engine.synthesize(segment.text, voice_vec, job.speed, job.lang, segment.pause_ms)
+                pcm = await self.engine.synthesize(segment.text, job.voice_spec, job.speed, job.lang, segment.pause_ms)
                 job.segments_done = index + 1
                 job.audio_s += len(pcm) / (BYTES_PER_SAMPLE * SAMPLE_RATE)
                 await chunks.put(pcm)
@@ -2273,7 +2372,6 @@ class Daemon:
                 if not self._notified_degraded:
                     self._notified_degraded = True
                     self.notify("Kokoro TTS: running degraded", warning, "normal", job.env)
-            voice_vec = await self.engine.run(self.voices.resolve, job.voice_spec)
             job.state = "synthesizing"
             player = MpvPlayer(cfg.playback, self._player_env(job.env), job.title)
             job.player = player
@@ -2284,22 +2382,32 @@ class Daemon:
                 except OSError as exc:
                     log.warning("archive disabled for this job: %s", exc)
             chunks: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=cfg.playback.prefetch_segments)
-            producer = asyncio.create_task(self._produce(job, voice_vec, chunks), name=f"synth-{job.id}")
+            self.is_synthesizing = True
+            producer = asyncio.create_task(self._produce(job, job.voice_spec, chunks), name=f"synth-{job.id}")
             first = True
-            while (pcm := await chunks.get()) is not None:
-                if first:
-                    first = False
-                    job.started_at = time.monotonic()
-                    job.state = "playing"
-                    self._emit(job, "started", ttfa_ms=job.ttfa_ms, engine=self.engine.active_kind)
-                    self._set_status(f"Speaking ({job.id}, {len(job.segments)} segments)")
-                    log.info("job %s first audio after %d ms", job.id, job.ttfa_ms or 0)
-                await player.write(pcm)
-                if archive is not None:
-                    archive.write(pcm)
-            await producer
+            try:
+                while (pcm := await chunks.get()) is not None:
+                    if first:
+                        first = False
+                        job.started_at = time.monotonic()
+                        job.state = "playing"
+                        self._emit(job, "started", ttfa_ms=job.ttfa_ms, engine=self.engine.active_kind)
+                        self._set_status(f"Speaking ({job.id}, {len(job.segments)} segments)")
+                        log.info("job %s first audio after %d ms", job.id, job.ttfa_ms or 0)
+                    await player.write(pcm)
+                    if archive is not None:
+                        archive.write(pcm)
+                await producer
+            finally:
+                self.is_synthesizing = False
+                self.engine.touch()
+
             if first:
                 raise EngineError("no audio produced")
+
+            if self.jobs.empty() and self.cfg.engine.model_idle_timeout_s == 0.0:
+                await self.engine.unload("synthesis complete (model_idle_timeout_s = 0)")
+
             await player.end_input()
             await player.wait()
             if player.end_reason == "quit":
@@ -2350,12 +2458,18 @@ class Daemon:
         while True:
             await asyncio.sleep(1.0)
             now = time.monotonic()
+            engine_busy = self.is_synthesizing or not self.jobs.empty()
+            if self.engine.loaded and not engine_busy and now - self.engine.last_used > self.cfg.engine.model_idle_timeout_s:
+                await self.engine.unload(f"idle for {self.cfg.engine.model_idle_timeout_s:.0f}s")
+                if self.current is not None:
+                    self._set_status(f"Speaking (model unloaded: {self.current.id})")
+                else:
+                    self._set_status("Idle (model not loaded)")
+
             busy = self.current is not None or not self.jobs.empty()
             if busy:
                 continue
-            if self.engine.loaded and now - self.engine.last_used > self.cfg.engine.model_idle_timeout_s:
-                await self.engine.unload(f"idle for {self.cfg.engine.model_idle_timeout_s:.0f}s")
-                self._set_status("Idle (model not loaded)")
+
             if (self.cfg.daemon.exit_when_idle and not self.engine.loaded and self.clients == 0
                     and now - self.last_activity > self.cfg.daemon.process_idle_timeout_s):
                 log.info("Process idle for %.0fs - exiting; socket activation / trigger.sh relaunches on demand",
@@ -2751,7 +2865,64 @@ def build_parser() -> argparse.ArgumentParser:
     c = sub.add_parser("config", help="print effective configuration or write the default template")
     c.add_argument("--write", metavar="PATH")
     c.add_argument("--force", action="store_true")
+    w = sub.add_parser("synth-worker", help="internal synthesis worker subprocess")
+    w.add_argument("--config", help="path to config.toml")
     return parser
+
+
+def run_synth_worker(args: argparse.Namespace) -> int:
+    cfg, config_file = _cli_config(args)
+    _apply_engine_env(cfg)
+    paths = resolve_paths(cfg, config_file)
+    voices = VoiceBank(paths.voices_file)
+    engine = Engine(cfg, paths, voices, is_worker=True)
+    try:
+        engine._load_sync()
+    except Exception as exc:
+        sys.stdout.buffer.write(json.dumps({"ok": False, "error": str(exc)}).encode("utf-8") + b"\n")
+        sys.stdout.buffer.flush()
+        return 1
+
+    ready = {
+        "ok": True,
+        "providers": engine.active_providers,
+        "kind": engine.active_kind,
+        "precision": engine.model_precision,
+        "model": engine.model_path.name if engine.model_path else "",
+    }
+    sys.stdout.buffer.write(json.dumps(ready).encode("utf-8") + b"\n")
+    sys.stdout.buffer.flush()
+
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            break
+        try:
+            req = json.loads(line.decode("utf-8"))
+        except ValueError:
+            continue
+        cmd = req.get("cmd")
+        if cmd == "synth":
+            text = req["text"]
+            voice_spec = req.get("voice", cfg.voice.spec)
+            speed = float(req.get("speed", 1.0))
+            lang = req.get("lang", "en-us")
+            pause_ms = int(req.get("pause_ms", 0))
+            try:
+                vec = voices.resolve(voice_spec)
+                pcm = engine._synth_sync(text, vec, speed, lang, pause_ms)
+                header = struct.pack("<I", len(pcm))
+                sys.stdout.buffer.write(header + pcm)
+                sys.stdout.buffer.flush()
+            except Exception as exc:
+                log.error("worker synth error: %s", exc)
+                sys.stdout.buffer.write(struct.pack("<I", 0))
+                sys.stdout.buffer.flush()
+        elif cmd in ("quit", "unload"):
+            break
+
+    engine._unload_sync("worker shutdown")
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -2760,6 +2931,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         match args.command:
             case "daemon":
                 return run_daemon(args)
+            case "synth-worker":
+                return run_synth_worker(args)
             case "doctor":
                 return run_doctor(args)
             case "synth":
