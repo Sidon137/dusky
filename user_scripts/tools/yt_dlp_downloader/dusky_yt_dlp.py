@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """
-Dusky Stream Downloader — Open Video Downloader (OVD v3.2.1) Engine Port
+Dusky Universal Media Downloader
+Architecture: Open Video Downloader (OVD v3.2.1) Engine Port
 Platform: Arch Linux | Python 3.14+ | yt-dlp 2026+ | FFmpeg 9+
 
-Directly ports:
-- yt-dlp argument compilation and safe logging summaries (ytdlp_runner.rs)
-- Custom RAW progress template and stage state-machine (ytdlp_progress.rs)
-- Process-group lifecycle management & tree killing (ytdlp_download.rs)
-- Format approximation & sorting (formats.ts)
-- Zero SSD wear: /mnt/zram1 buffering with /dev/shm fallback
-- Atomic metadata tag cleansing to strictly episode numbers
+Key Features:
+- General-purpose media extractor for all yt-dlp supported sites (YouTube, Rumble, Twitch, etc.).
+- Native media titles preserved; sanitized against illegal phone/FAT32 characters.
+- Zero drive wear: Buffers directly in /mnt/zram1/dusky_ytdlp with /dev/shm fallback.
+- Process group isolation (os.killpg) to terminate orphan FFmpeg workers on interrupt.
+- Streaming RAW progress parser with multi-stage lifecycle tracking.
 """
 
 from __future__ import annotations
 
 import importlib.util
-import json
 import os
 from pathlib import Path
 import re
@@ -101,38 +100,25 @@ from rich.progress import (
     TimeRemainingColumn,
     TransferSpeedColumn,
 )
-from rich.prompt import Confirm, IntPrompt, Prompt
+from rich.prompt import Confirm, Prompt
 from rich.table import Table
 
 console: Final[Console] = Console()
 
-PRIMARY_ZRAM_TARGET: Final[Path] = Path("/mnt/zram1")
-APP_NAMESPACE: Final[str] = "dusky_ytdlp"
-RAM_TMPFS_FALLBACK: Final[Path] = Path("/dev/shm") / APP_NAMESPACE
+PRIMARY_ZRAM_TARGET: Final[Path] = Path("/mnt/zram1/dusky_ytdlp")
+RAM_TMPFS_FALLBACK: Final[Path] = Path("/dev/shm/dusky_ytdlp")
 
 ACTIVE_PROCESS_GROUPS: set[int] = set()
-ACTIVE_SCRATCH_PATHS: set[Path] = set()
 
 
 def global_signal_handler(signum: int, frame: object) -> None:
-    """
-    Kills the entire process group (yt-dlp + FFmpeg children) and purges RAM buffers.
-    Mirrors kill_tree in ytdlp_download.rs and ytdlp_runner.rs.
-    """
+    """Kills the entire process group (yt-dlp + FFmpeg children) on SIGINT/SIGTERM."""
     console.print("\n\n[bold red][!] Interrupted: Reaping process tree & cleaning memory buffers...[/]")
     for pgid in list(ACTIVE_PROCESS_GROUPS):
         try:
             os.killpg(pgid, signal.SIGTERM)
         except OSError:
             pass
-
-    for scratch in list(ACTIVE_SCRATCH_PATHS):
-        try:
-            if scratch.exists():
-                scratch.unlink()
-        except OSError:
-            pass
-
     sys.exit(130)
 
 
@@ -140,14 +126,15 @@ signal.signal(signal.SIGINT, global_signal_handler)
 signal.signal(signal.SIGTERM, global_signal_handler)
 
 # ==============================================================================
-# PHASE 3: CORE DATA MODELS (Ported from media.ts & config_models.rs)
+# PHASE 3: CORE DATA MODELS
 # ==============================================================================
 
 
-class TrackType(StrEnum):
-    AUDIO = "audio"
+class TargetFormat(StrEnum):
+    AUDIO_OPUS = "audio-opus"
+    AUDIO_MP3 = "audio-mp3"
+    AUDIO_BEST = "audio-best"
     VIDEO = "video"
-    BOTH = "both"
 
 
 class ProgressStage(StrEnum):
@@ -159,30 +146,19 @@ class ProgressStage(StrEnum):
     FINALIZING = "Finalizing"
 
 
-class ProgressCategory(StrEnum):
-    VIDEO = "Video"
-    AUDIO = "Audio"
-    SUBTITLES = "Subtitles"
-    THUMBNAIL = "Thumbnail"
-    METADATA = "Metadata"
-    OTHER = "Other"
-
-
 @dataclass(slots=True)
 class MediaProgress:
     percentage: float | None = None
     speed_bps: float | None = None
     eta_secs: int | None = None
-    category: ProgressCategory = ProgressCategory.OTHER
     stage: ProgressStage = ProgressStage.INITIALIZING
-    destination: str | None = None
+    destination_file: str | None = None
 
 
 # ==============================================================================
-# PHASE 4: PROGRESS PARSER (Ported verbatim from ytdlp_progress.rs)
+# PHASE 4: OVD STREAMING PROGRESS PARSER (Ported from ytdlp_progress.rs)
 # ==============================================================================
 
-# Exact RAW progress template from ytdlp_runner.rs
 RAW_PROGRESS_TEMPLATE: Final[str] = (
     "RAW|"
     "%(progress.percent|)s|"
@@ -198,19 +174,14 @@ RAW_PROGRESS_TEMPLATE: Final[str] = (
 
 
 class YtdlpProgressParser:
-    """
-    Port of YtdlpProgressParser from ytdlp_progress.rs.
-    Parses yt-dlp stdout lines, updates stages, and extracts transfer metrics.
-    """
+    """Parses yt-dlp stdout lines to extract progress metrics and stages in real time."""
 
-    def __init__(self, initial_category: ProgressCategory):
-        self.current_category = initial_category
+    def __init__(self) -> None:
         self.current_stage = ProgressStage.INITIALIZING
 
     def parse_line(self, line: str, progress_state: MediaProgress) -> None:
         line_clean = line.strip()
 
-        # 1. Postprocess stages
         if line_clean.startswith("[VideoRemuxer]"):
             self.current_stage = ProgressStage.REMUXING
             progress_state.stage = self.current_stage
@@ -220,33 +191,25 @@ class YtdlpProgressParser:
             progress_state.stage = self.current_stage
             return
 
-        # 2. Download stage & category detection from file extension
         if "[download] Destination:" in line_clean:
-            dest = line_clean.split("Destination:", 1)[1].strip()
-            ext = Path(dest).suffix.lower().lstrip(".")
-            if ext in {"mp4", "mkv", "webm", "flv", "mov", "avi", "ts"}:
-                self.current_category = ProgressCategory.VIDEO
-            elif ext in {"mp3", "m4a", "wav", "flac", "ogg", "opus", "aac"}:
-                self.current_category = ProgressCategory.AUDIO
-            elif ext in {"vtt", "srt", "ass", "lrc"}:
-                self.current_category = ProgressCategory.SUBTITLES
-            else:
-                self.current_category = ProgressCategory.OTHER
-
             self.current_stage = ProgressStage.DOWNLOADING
             progress_state.stage = self.current_stage
-            progress_state.category = self.current_category
+            dest = line_clean.split("Destination:", 1)[1].strip()
+            progress_state.destination_file = Path(dest).name
             return
 
-        # 3. Merger destination & stage
         if line_clean.startswith("[Merger] Merging formats into"):
             self.current_stage = ProgressStage.MERGING
             progress_state.stage = self.current_stage
             target = line_clean.replace("[Merger] Merging formats into", "").strip().strip('"')
-            progress_state.destination = target
+            progress_state.destination_file = Path(target).name
             return
 
-        # 4. Finalizing triggers
+        if line_clean.startswith("[ExtractAudio] Destination:"):
+            dest = line_clean.replace("[ExtractAudio] Destination:", "").strip().strip('"')
+            progress_state.destination_file = Path(dest).name
+            return
+
         finalizing_triggers = ("[ffmpeg]", "[Fixup]", "Deleting original file")
         if any(t in line_clean for t in finalizing_triggers):
             if self.current_stage != ProgressStage.FINALIZING:
@@ -254,14 +217,13 @@ class YtdlpProgressParser:
                 progress_state.stage = self.current_stage
             return
 
-        # 5. RAW progress tokens
         if line_clean.startswith("RAW|"):
             raw_content = line_clean[4:]
             parts = raw_content.split("|")
             while len(parts) < 9:
                 parts.append("")
 
-            def parse_opt_pct(s: str) -> float | None:
+            def parse_pct(s: str) -> float | None:
                 t = s.strip().rstrip("%").strip()
                 if not t or t.lower() == "na":
                     return None
@@ -270,7 +232,7 @@ class YtdlpProgressParser:
                 except ValueError:
                     return None
 
-            def parse_opt_float(s: str) -> float | None:
+            def parse_float(s: str) -> float | None:
                 t = s.strip()
                 if not t or t.lower() == "na":
                     return None
@@ -279,7 +241,7 @@ class YtdlpProgressParser:
                 except ValueError:
                     return None
 
-            def parse_opt_int(s: str) -> int | None:
+            def parse_int(s: str) -> int | None:
                 t = s.strip()
                 if not t or t.lower() == "na":
                     return None
@@ -288,14 +250,14 @@ class YtdlpProgressParser:
                 except ValueError:
                     return None
 
-            pct_num = parse_opt_pct(parts[0])
-            pct_str = parse_opt_pct(parts[1])
-            speed_bps = parse_opt_float(parts[2])
-            eta_secs = parse_opt_int(parts[3])
-            dl_bytes = parse_opt_int(parts[4])
-            total_bytes = parse_opt_int(parts[5]) or parse_opt_int(parts[6])
-            frag_i = parse_opt_int(parts[7])
-            frag_n = parse_opt_int(parts[8])
+            pct_num = parse_pct(parts[0])
+            pct_str = parse_pct(parts[1])
+            speed_bps = parse_float(parts[2])
+            eta_secs = parse_int(parts[3])
+            dl_bytes = parse_int(parts[4])
+            total_bytes = parse_int(parts[5]) or parse_int(parts[6])
+            frag_i = parse_int(parts[7])
+            frag_n = parse_int(parts[8])
 
             pct = pct_num if pct_num is not None else pct_str
             if pct is None and dl_bytes is not None and total_bytes and total_bytes > 0:
@@ -312,20 +274,47 @@ class YtdlpProgressParser:
 
 
 # ==============================================================================
-# PHASE 5: RUNNER & ARGUMENT COMPILER (Ported from ytdlp_runner.rs)
+# PHASE 5: GENERAL-PURPOSE RUNNER & STORAGE MANAGEMENT
 # ==============================================================================
 
 
-class YtdlpRunner:
+def resolve_storage_pool(custom_path: Path | None = None) -> Path:
     """
-    Port of YtdlpRunner from ytdlp_runner.rs.
-    Assembles CLI flags and manages process group execution.
+    Ensures media writes occur strictly in memory (ZRAM or /dev/shm).
+    Eliminates directory-nesting bugs.
     """
+    candidates = [custom_path] if custom_path else [PRIMARY_ZRAM_TARGET, RAM_TMPFS_FALLBACK]
 
-    def __init__(self, mode: TrackType, output_template: str, url: str):
+    for path in candidates:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / f".probe_{uuid.uuid4().hex[:6]}"
+            probe.touch()
+            probe.unlink()
+
+            stats = shutil.disk_usage(path)
+            if (stats.free / (1024 * 1024)) < 500:
+                console.print(f"[bold yellow]![/] Low storage pool warning on {path}")
+            return path
+        except (OSError, PermissionError):
+            continue
+
+    fallback = Path.cwd() / "dusky_downloads"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+class YtdlpRunner:
+    """Compiles yt-dlp arguments and manages isolated process execution."""
+
+    def __init__(self, mode: TargetFormat, output_dir: Path, url: str):
         self.mode = mode
-        self.output_template = output_template
+        self.output_dir = output_dir
         self.url = url
+
+        # Output template: keeps original title while ensuring safe Android/phone filenames
+        output_template = str(output_dir / "%(title).180B [%(id)s].%(ext)s")
+
         self.args: list[str] = [
             "--encoding", "utf-8",
             "--newline",
@@ -333,61 +322,53 @@ class YtdlpRunner:
             "--no-color",
             "--progress-template", RAW_PROGRESS_TEMPLATE,
             "--progress-delta", "0.5",
-            # Live stream and fault tolerance
-            "--live-from-start",
-            "--wait-for-video", "5-60",
-            "--retries", "50",
-            "--fragment-retries", "50",
-            "--extractor-retries", "10",
+            # Multi-connection & Frag recovery (Correct CLI flag)
+            "--concurrent-fragments", "4",
+            "--retries", "30",
+            "--fragment-retries", "30",
             "--file-access-retries", "10",
-            "--concurrent-fragment-downloads", "4",
-            "--skip-unavailable-fragments",
             "--socket-timeout", "30",
-            # Isolation & privacy
-            "--no-write-thumbnail",
-            "--no-write-info-json",
-            "--no-write-description",
-            "--no-add-metadata",
+            # Strip invalid FAT32/Android characters for direct phone transfer
+            "--windows-filenames",
+            # Metadata retention
+            "--add-metadata",
         ]
-        self._compile_format_and_output()
+        self._compile_format(output_template)
 
-    def _compile_format_and_output(self) -> None:
-        if self.mode == TrackType.AUDIO:
-            # YouTube Opus Format 251 priority cascade
-            self.args.extend([
-                "-f", "bestaudio[ext=opus]/bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio/best",
-                "-x",
-                "--audio-format", "opus",
-                "--audio-quality", "0",
-            ])
-        else:
-            self.args.extend([
-                "-f", "bestvideo*+bestaudio/best",
-                "--merge-output-format", "mp4",
-            ])
+    def _compile_format(self, output_template: str) -> None:
+        match self.mode:
+            case TargetFormat.AUDIO_OPUS:
+                self.args.extend([
+                    "-f", "bestaudio[ext=opus]/bestaudio[acodec=opus]/bestaudio/best",
+                    "-x", "--audio-format", "opus", "--audio-quality", "0",
+                ])
+            case TargetFormat.AUDIO_MP3:
+                self.args.extend([
+                    "-f", "bestaudio/best",
+                    "-x", "--audio-format", "mp3", "--audio-quality", "0",
+                ])
+            case TargetFormat.AUDIO_BEST:
+                self.args.extend([
+                    "-f", "bestaudio/best",
+                    "-x", "--audio-format", "best",
+                ])
+            case TargetFormat.VIDEO:
+                self.args.extend([
+                    "-f", "bestvideo*+bestaudio/best",
+                    "--merge-output-format", "mp4",
+                ])
 
-        self.args.extend(["-o", self.output_template, self.url])
-
-    def summarize_for_log(self) -> dict[str, object]:
-        """Port of summarize_args_for_log from ytdlp_runner.rs."""
-        return {
-            "arg_count": len(self.args),
-            "has_proxy": any(a == "--proxy" or a.startswith("--proxy=") for a in self.args),
-            "has_cookies": any(a == "--cookies" or a.startswith("--cookies=") for a in self.args),
-            "has_auth": any(a in {"--username", "--password", "--video-password"} for a in self.args),
-        }
+        self.args.extend(["-o", output_template, self.url])
 
     def spawn(self) -> tuple[subprocess.Popen, int]:
-        """Spawns yt-dlp in a dedicated process group to eliminate orphan FFmpeg processes."""
-        summary = self.summarize_for_log()
-        # Diagnostic summary matching tracing::info! in ytdlp_runner.rs
+        """Spawns yt-dlp in a distinct process group (POSIX process_group=0)."""
         cmd = ["yt-dlp"] + self.args
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             stdin=subprocess.PIPE,
-            preexec_fn=os.setsid,  # Create distinct process group
+            process_group=0,  # Isolate process tree
         )
         pgid = os.getpgid(proc.pid)
         ACTIVE_PROCESS_GROUPS.add(pgid)
@@ -395,124 +376,34 @@ class YtdlpRunner:
 
 
 # ==============================================================================
-# PHASE 6: STORAGE ALLOCATION & ATOMIC TAG STRIPPING
-# ==============================================================================
-
-
-def resolve_zero_wear_directory(custom_path: Path | None = None) -> Path:
-    """Ensures writes occur exclusively in RAM/ZRAM."""
-    candidates: list[Path] = []
-    if custom_path:
-        candidates.append(custom_path / APP_NAMESPACE)
-    candidates.extend([PRIMARY_ZRAM_TARGET / APP_NAMESPACE, RAM_TMPFS_FALLBACK])
-
-    for path in candidates:
-        try:
-            path.mkdir(parents=True, exist_ok=True)
-            probe = path / f".write_test_{uuid.uuid4().hex[:6]}"
-            probe.touch()
-            probe.unlink()
-
-            stats = shutil.disk_usage(path)
-            if (stats.free / (1024 * 1024)) < 500:
-                console.print(f"[bold yellow]![/] Low memory warning on {path}")
-            return path
-        except (OSError, PermissionError):
-            continue
-
-    fallback = Path.cwd() / APP_NAMESPACE
-    fallback.mkdir(parents=True, exist_ok=True)
-    return fallback
-
-
-def sanitize_episode_id(token: str) -> str:
-    cleaned = re.sub(r'[\\/*?:"<>|\x00-\x1f]', "", token.strip())
-    if not cleaned:
-        raise ValueError(f"Invalid episode ID: {token}")
-    return cleaned
-
-
-def scrub_tags_atomic(scratch_path: Path, final_path: Path, ep_id: str) -> None:
-    """
-    Atomic FFmpeg stream copy pass:
-    - Nukes all global and container metadata tags (-map_metadata -1)
-    - Stretches title and track strictly to the episode ID
-    """
-    temp_clean = scratch_path.with_name(f".clean_{uuid.uuid4().hex[:6]}_{scratch_path.name}")
-    ACTIVE_SCRATCH_PATHS.add(temp_clean)
-
-    cmd = [
-        "ffmpeg",
-        "-nostdin",
-        "-loglevel", "error",
-        "-y",
-        "-i", str(scratch_path),
-        "-map", "0",
-        "-c", "copy",
-        "-map_metadata", "-1",
-        "-metadata", f"title={ep_id}",
-        "-metadata", f"track={ep_id}",
-        "-metadata", "artist=",
-        "-metadata", "album=",
-        "-metadata", "comment=",
-        "-metadata", "description=",
-        "-metadata", "synopsis=",
-        str(temp_clean),
-    ]
-
-    res = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if res.returncode == 0 and temp_clean.exists():
-        if scratch_path.exists():
-            scratch_path.unlink()
-            ACTIVE_SCRATCH_PATHS.discard(scratch_path)
-        temp_clean.replace(final_path)
-        ACTIVE_SCRATCH_PATHS.discard(temp_clean)
-    else:
-        if temp_clean.exists():
-            temp_clean.unlink()
-            ACTIVE_SCRATCH_PATHS.discard(temp_clean)
-        scratch_path.replace(final_path)
-        ACTIVE_SCRATCH_PATHS.discard(scratch_path)
-
-
-# ==============================================================================
-# PHASE 7: DOWNLOAD PIPELINE (Ported from ytdlp_download.rs)
+# PHASE 6: EXECUTION PIPELINE
 # ==============================================================================
 
 
 @dataclass(slots=True)
-class DownloadJob:
-    episode_tag: str
+class MediaJob:
+    title: str
     url: str
-    mode: TrackType
+    mode: TargetFormat
 
 
 @dataclass(slots=True)
-class JobOutcome:
-    episode_tag: str
+class JobReport:
+    title: str
     status: str
-    saved_path: Path | None = None
+    saved_file: str = "--"
     size_mb: float = 0.0
     error: str | None = None
 
 
-def execute_download_job(job: DownloadJob, storage_dir: Path) -> JobOutcome:
-    ext = "opus" if job.mode == TrackType.AUDIO else "mp4"
-    final_artifact = storage_dir / f"{job.episode_tag}.{ext}"
-
-    scratch_token = f".scratch_{job.episode_tag}_{uuid.uuid4().hex[:6]}"
-    scratch_template = str(storage_dir / f"{scratch_token}.%(ext)s")
-
-    runner = YtdlpRunner(job.mode, scratch_template, job.url)
-    parser = YtdlpProgressParser(
-        ProgressCategory.AUDIO if job.mode == TrackType.AUDIO else ProgressCategory.VIDEO
-    )
+def execute_download(job: MediaJob, output_dir: Path) -> JobReport:
+    runner = YtdlpRunner(job.mode, output_dir, job.url)
+    parser = YtdlpProgressParser()
     progress_state = MediaProgress()
 
     proc, pgid = runner.spawn()
 
-    # Streaming thread to capture and parse stdout in real time
-    def read_stream(stream: Iterator[bytes]) -> None:
+    def stdout_reader(stream: Iterator[bytes]) -> None:
         for raw_line in stream:
             try:
                 line_str = raw_line.decode("utf-8", errors="replace")
@@ -520,13 +411,15 @@ def execute_download_job(job: DownloadJob, storage_dir: Path) -> JobOutcome:
             except Exception:
                 pass
 
-    reader_thread = threading.Thread(target=read_stream, args=(proc.stdout,), daemon=True)
-    reader_thread.start()
+    t = threading.Thread(target=stdout_reader, args=(proc.stdout,), daemon=True)
+    t.start()
+
+    display_title = (job.title[:36] + "..") if len(job.title) > 38 else job.title
 
     with Progress(
         SpinnerColumn(),
-        TextColumn("[bold yellow]Ep {task.fields[ep]}[/]"),
-        BarColumn(bar_width=32),
+        TextColumn("[bold yellow]{task.fields[title]}[/]"),
+        BarColumn(bar_width=30),
         DownloadColumn(),
         TransferSpeedColumn(),
         TimeRemainingColumn(),
@@ -534,7 +427,7 @@ def execute_download_job(job: DownloadJob, storage_dir: Path) -> JobOutcome:
         console=console,
         transient=True,
     ) as progress_ui:
-        task_id = progress_ui.add_task("Initializing", total=100.0, ep=job.episode_tag)
+        task_id = progress_ui.add_task("Queueing", total=100.0, title=display_title)
 
         while proc.poll() is None:
             time.sleep(0.1)
@@ -545,42 +438,38 @@ def execute_download_job(job: DownloadJob, storage_dir: Path) -> JobOutcome:
                 if progress_state.speed_bps
                 else "--B/s"
             )
-
             desc = f"[cyan]{progress_state.stage} ({speed_str} | ETA: {eta_str})[/]"
             progress_ui.update(task_id, completed=pct, description=desc)
 
-    reader_thread.join(timeout=1.0)
+    t.join(timeout=1.0)
     ACTIVE_PROCESS_GROUPS.discard(pgid)
 
     exit_code = proc.returncode
     if exit_code != 0:
-        stderr_err = proc.stderr.read().decode("utf-8", errors="replace").strip()
-        return JobOutcome(
-            job.episode_tag,
-            status="Failed",
-            error=stderr_err.split("\n")[-1] or f"Exit code {exit_code}",
-        )
+        err_msg = proc.stderr.read().decode("utf-8", errors="replace").strip()
+        last_line = err_msg.split("\n")[-1] if err_msg else f"yt-dlp error code {exit_code}"
+        return JobReport(title=job.title, status="Failed", error=last_line)
 
-    matches = list(storage_dir.glob(f"{scratch_token}.*"))
-    if not matches:
-        return JobOutcome(job.episode_tag, status="Failed", error="Scratch buffer missing from ZRAM")
+    dest_file = progress_state.destination_file or "--"
+    size_mb = 0.0
+    if dest_file != "--":
+        actual_path = output_dir / dest_file
+        if actual_path.exists():
+            size_mb = actual_path.stat().st_size / (1024 * 1024)
 
-    scratch_file = matches[0]
-    ACTIVE_SCRATCH_PATHS.add(scratch_file)
-
-    scrub_tags_atomic(scratch_file, final_artifact, job.episode_tag)
-
-    size_mb = final_artifact.stat().st_size / (1024 * 1024)
-    return JobOutcome(job.episode_tag, status="Success", saved_path=final_artifact, size_mb=size_mb)
+    return JobReport(title=job.title, status="Success", saved_file=dest_file, size_mb=size_mb)
 
 
 # ==============================================================================
-# PHASE 8: INTERACTIVE TUI & WORKFLOW ORCHESTRATION
+# PHASE 7: TARGET PROBING & INTERACTIVE TUI WIZARD
 # ==============================================================================
 
 
-def probe_remote_target(url: str) -> tuple[list[str], bool, str]:
-    """Inspects target metadata using flat extraction."""
+def probe_media_target(url: str) -> tuple[list[tuple[str, str]], bool, str]:
+    """
+    Universal flat extraction probe across any media host.
+    Returns: (list_of_tuples(title, url), is_collection, collection_label)
+    """
     opts = {
         "extract_flat": "in_playlist",
         "skip_download": True,
@@ -588,94 +477,88 @@ def probe_remote_target(url: str) -> tuple[list[str], bool, str]:
         "no_warnings": True,
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
-        meta = ydl.extract_info(url, download=False)
+        info = ydl.extract_info(url, download=False)
 
-    if not meta:
-        raise ValueError("No metadata returned from target URL.")
+    if not info:
+        raise ValueError("No metadata returned by extractor.")
 
-    if meta.get("live_status") == "is_upcoming":
-        raise ValueError("Live stream is scheduled and has not started broadcasting.")
-
-    if "entries" in meta and meta["entries"]:
-        urls: list[str] = []
-        for e in meta["entries"]:
+    if "entries" in info and info["entries"]:
+        items: list[tuple[str, str]] = []
+        for e in info["entries"]:
             if not e:
                 continue
-            u = e.get("url") or e.get("webpage_url")
-            if not u and e.get("id"):
-                u = f"https://www.youtube.com/watch?v={e['id']}"
-            if u:
-                urls.append(u)
-        return urls, True, meta.get("title") or "Collection"
+            item_url = e.get("url") or e.get("webpage_url")
+            if not item_url and e.get("id"):
+                item_url = e["id"]
+            if item_url:
+                items.append((e.get("title") or item_url, item_url))
+        return items, True, info.get("title") or "Collection / Feed"
 
-    single = meta.get("webpage_url") or meta.get("original_url") or url
-    return [single], False, meta.get("title") or "Single Stream"
+    single_url = info.get("webpage_url") or info.get("original_url") or url
+    single_title = info.get("title") or single_url
+    return [(single_title, single_url)], False, single_title
 
 
-def run_interactive_wizard() -> tuple[list[DownloadJob], Path]:
+def run_interactive_wizard() -> tuple[list[MediaJob], Path]:
     console.print(
         Panel.fit(
-            "[bold cyan]Dusky Stream Downloader (OVD v3.2.1 Architecture)[/]\n"
-            "[dim]Zero-wear ZRAM streaming engine for Arch Linux[/]",
+            "[bold cyan]Dusky Universal Downloader (OVD v3.2.1 Architecture)[/]\n"
+            "[dim]General-purpose memory stream engine for Arch Linux[/]",
             border_style="cyan",
             box=box.DOUBLE,
         )
     )
 
-    format_choice = Prompt.ask(
-        "\n[bold green]?[/] Delivery format",
-        choices=["audio", "video"],
-        default="audio",
+    fmt_choice = Prompt.ask(
+        "\n[bold green]?[/] Select delivery format",
+        choices=["video", "audio-opus", "audio-mp3", "audio-best"],
+        default="video",
     )
-    mode = TrackType.AUDIO if format_choice == "audio" else TrackType.VIDEO
+    mode = TargetFormat(fmt_choice)
 
-    jobs: list[DownloadJob] = []
+    jobs: list[MediaJob] = []
 
     while True:
-        raw = Prompt.ask("\n[bold green]?[/] Enter webpage link, playlist URL, or batch file path").strip()
-        if not raw:
+        raw_target = Prompt.ask("\n[bold green]?[/] Enter media link, playlist URL, or batch file path").strip()
+        if not raw_target:
             continue
 
-        possible_file = Path(raw)
-        if possible_file.is_file():
-            with possible_file.open("r", encoding="utf-8") as f:
-                for line in f:
+        local_file = Path(raw_target)
+        if local_file.is_file():
+            with local_file.open("r", encoding="utf-8") as f:
+                for idx, line in enumerate(f, start=1):
                     clean = line.strip()
                     if not clean or clean.startswith(("#", "//")):
                         continue
-                    parts = re.split(r"[\s,;]+", clean, maxsplit=1)
-                    if len(parts) == 2 and parts[1].startswith("http"):
-                        jobs.append(DownloadJob(sanitize_episode_id(parts[0]), parts[1].strip(), mode))
+                    jobs.append(MediaJob(title=f"Batch Item {idx}", url=clean, mode=mode))
             if jobs:
                 break
-            console.print("[bold red]Batch file contained no valid jobs.[/]")
+            console.print("[bold red]Batch file contained no valid URLs.[/]")
             continue
 
         try:
-            with console.status("[bold cyan]Probing remote stream target...[/]", spinner="dots"):
-                discovered, is_collection, title = probe_remote_target(raw)
+            with console.status("[bold cyan]Probing remote endpoint...[/]", spinner="dots"):
+                discovered, is_collection, label = probe_media_target(raw_target)
             break
-        except Exception as e:
-            console.print(Panel(f"[bold red]Probe failed:[/] {e}", border_style="red"))
+        except Exception as err:
+            console.print(Panel(f"[bold red]Probe failed:[/] {err}", border_style="red"))
 
     if not jobs:
         if not is_collection:
-            console.print(f"[green]✓[/] Single stream detected: [dim]{title}[/]")
-            ep = Prompt.ask("[bold green]?[/] Assign Episode Number", default="01")
-            jobs = [DownloadJob(sanitize_episode_id(ep), discovered[0], mode)]
+            title, link = discovered[0]
+            console.print(f"[green]✓[/] Discovered: [bold yellow]{title}[/]")
+            jobs = [MediaJob(title=title, url=link, mode=mode)]
         else:
             total = len(discovered)
-            console.print(f"[green]✓[/] Collection detected: [yellow]{total}[/] items ([dim]{title}[/])")
-            start = IntPrompt.ask("[bold green]?[/] Starting Episode Number", default=1)
-            pad = max(2, len(str(start + total - 1)))
+            console.print(f"[green]✓[/] Collection detected: [yellow]{total}[/] items ([dim]{label}[/])")
 
-            # Chronological inversion for channel streams
             if Confirm.ask("[bold green]?[/] Invert order? (Oldest ➔ Newest)", default=False):
                 discovered.reverse()
 
             range_val = Prompt.ask(
                 f"[bold green]?[/] Range to extract ('all' or '1-{min(10, total)}')", default="all"
             ).strip()
+
             if range_val.lower() != "all" and "-" in range_val:
                 try:
                     s_str, e_str = range_val.split("-", 1)
@@ -683,66 +566,60 @@ def run_interactive_wizard() -> tuple[list[DownloadJob], Path]:
                 except ValueError:
                     pass
 
-            jobs = [DownloadJob(f"{i:0{pad}d}", u, mode) for i, u in enumerate(discovered, start=start)]
+            jobs = [MediaJob(title=item[0], url=item[1], mode=mode) for item in discovered]
 
-    suggested = resolve_zero_wear_directory()
-    custom_dir = Prompt.ask("[bold green]?[/] Destination directory (ZRAM)", default=str(suggested))
-    final_storage = resolve_zero_wear_directory(Path(custom_dir))
+    default_dir = resolve_storage_pool()
+    custom_dir = Prompt.ask("[bold green]?[/] Target directory (ZRAM)", default=str(default_dir))
+    destination = resolve_storage_pool(Path(custom_dir))
 
-    return jobs, final_storage
+    return jobs, destination
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Dusky Stream Downloader — Open Video Downloader Engine Port."
-    )
-    parser.add_argument("target", nargs="?", help="URL (stream, playlist) or batch file path")
-    parser.add_argument("-e", "--episode", type=str, help="Episode identifier")
+    parser = argparse.ArgumentParser(description="Dusky Universal Media Downloader.")
+    parser.add_argument("target", nargs="?", help="URL (video, playlist, stream) or batch file")
     parser.add_argument(
-        "-m", "--mode", choices=["audio", "video"], default="audio", help="Delivery format"
+        "-f",
+        "--format",
+        choices=["video", "audio-opus", "audio-mp3", "audio-best"],
+        default="video",
+        help="Delivery format",
     )
-    parser.add_argument("-o", "--output-dir", type=Path, help="Target storage directory")
+    parser.add_argument("-o", "--output-dir", type=Path, help="Storage directory override")
 
     args = parser.parse_args()
 
     if not args.target:
         jobs, destination = run_interactive_wizard()
     else:
-        destination = resolve_zero_wear_directory(args.output_dir)
-        mode = TrackType.AUDIO if args.mode == "audio" else TrackType.VIDEO
+        destination = resolve_storage_pool(args.output_dir)
+        mode = TargetFormat(args.format)
         target_path = Path(args.target)
 
         if target_path.is_file():
             jobs = []
             with target_path.open("r", encoding="utf-8") as f:
-                for line in f:
+                for idx, line in enumerate(f, start=1):
                     clean = line.strip()
                     if clean and not clean.startswith(("#", "//")):
-                        parts = re.split(r"[\s,;]+", clean, maxsplit=1)
-                        if len(parts) == 2 and parts[1].startswith("http"):
-                            jobs.append(DownloadJob(sanitize_episode_id(parts[0]), parts[1].strip(), mode))
+                        jobs.append(MediaJob(title=f"Item {idx}", url=clean, mode=mode))
         else:
-            urls, is_collection, _ = probe_remote_target(args.target)
-            if not is_collection:
-                ep = sanitize_episode_id(args.episode) if args.episode else "01"
-                jobs = [DownloadJob(ep, urls[0], mode)]
-            else:
-                pad = max(2, len(str(len(urls))))
-                jobs = [DownloadJob(f"{i:0{pad}d}", u, mode) for i, u in enumerate(urls, start=1)]
+            discovered, is_collection, _ = probe_media_target(args.target)
+            jobs = [MediaJob(title=item[0], url=item[1], mode=mode) for item in discovered]
 
     if not jobs:
-        console.print("[bold red]No jobs queued.[/]")
+        console.print("[bold red]No download targets queued.[/]")
         sys.exit(1)
 
     console.print(
         f"\n[bold green]➜[/] Storage Pool: [cyan]{destination}[/] | Queue: [yellow]{len(jobs)}[/] | Format: [magenta]{jobs[0].mode.upper()}[/]\n"
     )
 
-    outcomes: list[JobOutcome] = []
+    reports: list[JobReport] = []
     for job in jobs:
-        console.print(f"[bold blue]•[/] Extracting Episode [bold yellow]{job.episode_tag}[/]")
-        res = execute_download_job(job, destination)
-        outcomes.append(res)
+        console.print(f"[bold blue]•[/] Processing: [bold yellow]{job.title}[/]")
+        res = execute_download(job, destination)
+        reports.append(res)
 
     table = Table(
         title="Extraction Log",
@@ -750,24 +627,22 @@ def main() -> None:
         header_style="bold cyan",
         title_style="bold green",
     )
-    table.add_column("Episode", justify="center", style="bold yellow")
+    table.add_column("Title", style="yellow")
     table.add_column("Status", justify="center")
     table.add_column("Size", justify="right")
-    table.add_column("Disk Artifact", style="dim")
+    table.add_column("Filename", style="dim")
 
-    for o in outcomes:
-        status_render = "[bold green]Success[/]" if o.status == "Success" else f"[bold red]{o.error}[/]"
-        size_render = f"{o.size_mb:.2f} MB" if o.status == "Success" else "--"
-        out_name = o.saved_path.name if o.saved_path else "--"
-        table.add_row(o.episode_tag, status_render, size_render, out_name)
+    for r in reports:
+        status_str = "[bold green]Success[/]" if r.status == "Success" else f"[bold red]{r.error}[/]"
+        size_str = f"{r.size_mb:.2f} MB" if r.status == "Success" else "--"
+        table.add_row(r.title[:45], status_str, size_str, r.saved_file)
 
     console.print("\n")
     console.print(table)
     console.print(
         Panel(
-            f"[bold green]Artifact Storage:[/] [cyan]{destination}[/]\n"
-            f"[dim]All original titles scrubbed from disk and metadata tags.\n"
-            f"Artifacts reside exclusively in RAM/ZRAM. Move to target phone before shutdown.[/]",
+            f"[bold green]Location:[/] [cyan]{destination}[/]\n"
+            f"[dim]Media downloaded with native titles directly into RAM/ZRAM.[/]",
             border_style="green",
         )
     )
