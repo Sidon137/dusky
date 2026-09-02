@@ -77,14 +77,40 @@ XDG_STATE: Final = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".loca
 PROFILES_DIR: Final = Path(os.environ.get("DUSKY_PROFILES_DIR") or SCRIPT_DIR / "kernel_profiles")
 USER_PROFILES_DIR: Final = XDG_CONFIG / "dusky-kernel" / "kernel_profiles"
 CONFIG_SNAPSHOT_DIR: Final = XDG_CONFIG / "dusky-kernel" / "configs"
-BUILD_DIR: Final = Path(os.environ.get("DUSKY_BUILD_DIR") or XDG_CACHE / "dusky-kernel")
-SRC_DIR: Final = BUILD_DIR / "src"
-TARBALL_DIR: Final = BUILD_DIR / "tarballs"
-PATCH_CACHE: Final = Path(os.environ.get("DUSKY_PATCH_CACHE") or BUILD_DIR / "patches")
-THINLTO_CACHE_DIR: Final = Path(os.environ.get("DUSKY_THINLTO_CACHE") or BUILD_DIR / "thinlto-cache")
-PKGDEST_DIR: Final = Path(os.environ.get("DUSKY_PKGDEST") or BUILD_DIR / "packages")
-IMPORT_DIR: Final = BUILD_DIR / "imports"
 STATE_DIR: Final = XDG_STATE / "dusky-kernel"
+
+
+def _detect_default_build_dir() -> Path:
+    env = os.environ.get("DUSKY_BUILD_DIR")
+    if env:
+        return Path(env).expanduser()
+    zram = Path("/mnt/zram1/dusky_kernel")
+    if Path("/mnt/zram1").is_dir():
+        return zram
+    return XDG_CACHE / "dusky-kernel"
+
+
+BUILD_DIR: Path = _detect_default_build_dir()
+SRC_DIR: Path = BUILD_DIR / "src"
+TARBALL_DIR: Path = BUILD_DIR / "tarballs"
+PATCH_CACHE: Path = Path(os.environ.get("DUSKY_PATCH_CACHE") or BUILD_DIR / "patches")
+THINLTO_CACHE_DIR: Path = Path(os.environ.get("DUSKY_THINLTO_CACHE") or BUILD_DIR / "thinlto-cache")
+PKGDEST_DIR: Path = Path(os.environ.get("DUSKY_PKGDEST") or BUILD_DIR / "packages")
+IMPORT_DIR: Path = BUILD_DIR / "imports"
+
+
+def set_build_dir(new_path: Path | str) -> None:
+    global BUILD_DIR, SRC_DIR, TARBALL_DIR, PATCH_CACHE, THINLTO_CACHE_DIR, PKGDEST_DIR, IMPORT_DIR
+    BUILD_DIR = Path(new_path).expanduser()
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    SRC_DIR = BUILD_DIR / "src"
+    TARBALL_DIR = BUILD_DIR / "tarballs"
+    PATCH_CACHE = Path(os.environ.get("DUSKY_PATCH_CACHE") or BUILD_DIR / "patches")
+    THINLTO_CACHE_DIR = Path(os.environ.get("DUSKY_THINLTO_CACHE") or BUILD_DIR / "thinlto-cache")
+    PKGDEST_DIR = Path(os.environ.get("DUSKY_PKGDEST") or BUILD_DIR / "packages")
+    IMPORT_DIR = BUILD_DIR / "imports"
+    for d in (SRC_DIR, TARBALL_DIR, PATCH_CACHE, THINLTO_CACHE_DIR, PKGDEST_DIR, IMPORT_DIR, BUILD_DIR / "seeds"):
+        d.mkdir(parents=True, exist_ok=True)
 LOG_DIR: Final = STATE_DIR / "logs"
 HISTORY_FILE: Final = STATE_DIR / "history.json"
 MODPROBED_DB_PATH: Final = XDG_CONFIG / "modprobed.db"
@@ -4421,6 +4447,15 @@ def do_build(args: argparse.Namespace) -> int:
     profile = select_profile(profiles, args.profile, facts).clone()
     diff = configure_profile_interactively(profile, facts, args)
     show_configuration(profile, diff)
+
+    if getattr(args, "build_dir", None):
+        set_build_dir(args.build_dir)
+    elif interactive() and not ASSUME_YES and not getattr(args, "no_prompt", False):
+        chosen_dir = ask("Build directory (RAM/ZRAM disk recommended for speed)", str(BUILD_DIR))
+        set_build_dir(chosen_dir)
+    else:
+        set_build_dir(BUILD_DIR)
+
     if not ask_yes("Proceed with this configuration?", True):
         info("Aborted by user")
         return 0
@@ -4914,6 +4949,7 @@ def build_parser() -> argparse.ArgumentParser:
     ov.add_argument("-j", "--jobs", type=int)
     ov.add_argument("--no-rust", action="store_true")
     bh = ap.add_argument_group("build behaviour")
+    bh.add_argument("--build-dir", type=Path, metavar="DIR", help="build directory (default: /mnt/zram1/dusky_kernel or ~/.cache/dusky-kernel)")
     bh.add_argument("--wizard", action="store_true", help="always enter the granular configuration wizard")
     bh.add_argument("--no-prompt", action="store_true", help="never ask the wizard question (use profile defaults)")
     bh.add_argument("--fresh", action="store_true", help="re-extract the source tree")
@@ -5074,6 +5110,8 @@ def interactive_menu() -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     global _VERBOSE, ASSUME_YES
     args = build_parser().parse_args(argv)
+    if getattr(args, "build_dir", None):
+        set_build_dir(args.build_dir)
     _VERBOSE, ASSUME_YES = bool(args.verbose), bool(args.yes)
     if args.no_color or not sys.stdout.isatty() or os.environ.get("NO_COLOR") or os.environ.get("TERM") == "dumb":
         C.disable()
