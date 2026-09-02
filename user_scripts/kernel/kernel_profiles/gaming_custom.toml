@@ -23,7 +23,7 @@ channel = "mainline"
 # Exact version pin (e.g. 7.2.3 or 7.3-rc2); empty = newest in channel
 pin = ""
 # Allow -rc snapshot tarballs (mainline)
-allow_rc = false
+allow_rc = true
 # Hard floor; anything older is rejected
 min_version = "7.2"
 # Require PGP or SHA256 verification of release tarballs

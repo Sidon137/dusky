@@ -611,7 +611,7 @@ PROFILE_SPEC: Final[dict[str, tuple[FieldSpec, ...]]] = {
     "release": (
         F("channel", "str", "stable", "Upstream release channel", CHANNEL_CHOICES),
         F("pin", "str", "", "Exact version pin (e.g. 7.2.3 or 7.3-rc2); empty = newest in channel"),
-        F("allow_rc", "bool", False, "Allow -rc snapshot tarballs (mainline)"),
+        F("allow_rc", "bool", True, "Allow -rc snapshot tarballs (mainline)"),
         F("min_version", "str", "7.2", "Hard floor; anything older is rejected", wizard=False),
         F("require_signature", "bool", True, "Require PGP or SHA256 verification of release tarballs"),
     ),
@@ -1037,8 +1037,6 @@ def cross_validate(p: KernelProfile, facts: "HostFacts | None" = None, *, force:
         raise ProfileError("portable_package=true forbids cpu.arch=native (use generic_v3/znver4/...)")
     if s["modules"]["mode"] == "strict" and not s["modules"]["modprobed_db"] and not s["modules"]["allow_lsmod_fallback"]:
         raise ProfileError("modules.mode=strict needs modprobed_db=true (or allow_lsmod_fallback=true)")
-    if s["release"]["allow_rc"] and s["release"]["channel"] != "mainline" and not s["release"]["pin"]:
-        raise ProfileError("allow_rc=true only makes sense with channel=mainline or an explicit -rc pin")
     if s["security"]["profile"] == "extreme" or s["cpu"]["mitigations"] == "off":
         if not s["security"]["acknowledge_risk"]:
             raise ProfileError("security.profile=extreme / cpu.mitigations=off require security.acknowledge_risk=true")
@@ -2265,9 +2263,10 @@ def fetch_releases() -> list[Release]:
 def candidates_for(releases: Sequence[Release], channel: str, allow_rc: bool, min_ver: str) -> list[Release]:
     floor = KVer.parse(min_ver) or KVer(*MIN_KERNEL)
     floor = max(floor, KVer(*MIN_KERNEL), key=lambda k: k.key())
+    effective_allow_rc = allow_rc or (channel == "mainline")
     cands: list[Release] = []
     for r in releases:
-        if r.is_rc and not allow_rc:
+        if r.is_rc and not effective_allow_rc:
             continue
         if r.kver.key() < floor.key():
             continue
@@ -4710,7 +4709,7 @@ def do_fdo_record(args: argparse.Namespace) -> int:
 DEFAULT_PROFILES: Final[tuple[tuple[str, str, str, int, dict[str, dict[str, Any]]], ...]] = (
     ("dusky_personal", "Dusky Personal: 64 GiB desktop, full LTO, native, EEVDF + CAS + scx_lavd, NTSync, lazy preemption, mitigations off", "dusky-personal", 10, {
         "meta": {"bare_metal_only": True},
-        "release": {"channel": "mainline", "allow_rc": False},
+        "release": {"channel": "mainline", "allow_rc": True},
         "scheduler": {"type": "eevdf", "scx": "scx_lavd", "scx_flags": "--autopilot", "scx_enable_class": True},
         "cache": {"sched_cache": True, "llc_aggr_tolerance": 1, "persist": True},
         "rseq": {"slice_extension": True, "slice_ext_nsec": 10000},
@@ -4727,7 +4726,7 @@ DEFAULT_PROFILES: Final[tuple[tuple[str, str, str, int, dict[str, dict[str, Any]
         "dusky": {"enhanced": True},
     }),
     ("gaming", "Gaming: BORE + scx_bpfland, 1000 Hz, full preemption, THP always, NTSync, cake, mitigations off", "dusky-gaming", 20, {
-        "release": {"channel": "stable"},
+        "release": {"channel": "stable", "allow_rc": True},
         "scheduler": {"type": "bore", "scx": "scx_bpfland", "scx_flags": "-m performance", "scx_enable_class": True, "allow_vanilla_fallback": True},
         "cache": {"sched_cache": True, "llc_aggr_tolerance": 0},
         "cpu": {"arch": "native", "governor": "performance", "amd_pstate": "active", "epp": "performance", "mitigations": "off"},
@@ -4741,7 +4740,7 @@ DEFAULT_PROFILES: Final[tuple[tuple[str, str, str, int, dict[str, dict[str, Any]
         "dusky": {"enhanced": True},
     }),
     ("low_ram", "Low RAM (<= 8 GiB): lean footprint, zram lz4+zstd multi-comp, MGLRU anti-thrash, ThinLTO, strict modules, systemd-oomd", "dusky-lowram", 30, {
-        "release": {"channel": "stable"},
+        "release": {"channel": "stable", "allow_rc": True},
         "scheduler": {"type": "eevdf", "scx": "none", "scx_enable_class": False},
         "cpu": {"arch": "native", "governor": "schedutil", "mitigations": "on"},
         "timing": {"hz": 500, "tickless": "idle", "preempt": "lazy", "preempt_dynamic": True},
@@ -4755,7 +4754,7 @@ DEFAULT_PROFILES: Final[tuple[tuple[str, str, str, int, dict[str, dict[str, Any]
         "modules": {"mode": "strict", "modprobed_db": True},
     }),
     ("minimal_strict", "Minimal strict (<= 4-8 GiB, sub-300 MiB idle target): SLUB_TINY, -Os, THP off, no BTF/tracing, DAMON reclaim, strict pruning", "dusky-minimal", 31, {
-        "release": {"channel": "stable"},
+        "release": {"channel": "stable", "allow_rc": True},
         "scheduler": {"type": "eevdf", "scx": "none", "scx_enable_class": False, "autogroup": True},
         "cpu": {"arch": "native", "governor": "schedutil", "mitigations": "on"},
         "timing": {"hz": 250, "tickless": "idle", "preempt": "lazy", "preempt_dynamic": False},
@@ -4773,7 +4772,7 @@ DEFAULT_PROFILES: Final[tuple[tuple[str, str, str, int, dict[str, dict[str, Any]
         "verify": {"require_ntsync": False, "require_btf": False},
     }),
     ("embedded_lowram", "Embedded / appliance (<= 4 GiB, headless): BASE_SMALL, SLUB_TINY, no 32-bit compat, no hibernation, NR_CPUS 8, -Os", "dusky-embedded", 32, {
-        "release": {"channel": "longterm"},
+        "release": {"channel": "longterm", "allow_rc": True},
         "scheduler": {"type": "eevdf", "scx": "none", "scx_enable_class": False, "autogroup": False},
         "cpu": {"arch": "generic_v3", "governor": "schedutil", "mitigations": "on", "nr_cpus": 8, "compat32": False},
         "timing": {"hz": 250, "tickless": "idle", "preempt": "lazy", "preempt_dynamic": False},
@@ -4792,7 +4791,7 @@ DEFAULT_PROFILES: Final[tuple[tuple[str, str, str, int, dict[str, dict[str, Any]
         "verify": {"require_ntsync": False, "require_btf": False},
     }),
     ("zen4_zen5", "AMD Zen 4 / Zen 5: znver4 codegen, P-State active EPP, EEVDF + CAS + scx_lavd, ThinLTO, Rust", "dusky-zen", 40, {
-        "release": {"channel": "stable"},
+        "release": {"channel": "stable", "allow_rc": True},
         "scheduler": {"type": "eevdf", "scx": "scx_lavd", "scx_flags": "--autopilot", "scx_enable_class": True},
         "cache": {"sched_cache": True, "llc_aggr_tolerance": 1, "persist": True},
         "cpu": {"arch": "znver4", "governor": "schedutil", "amd_pstate": "active", "epp": "balance_performance", "prefcore": True, "mitigations": "on"},
@@ -4803,7 +4802,7 @@ DEFAULT_PROFILES: Final[tuple[tuple[str, str, str, int, dict[str, dict[str, Any]
         "modules": {"mode": "strict", "modprobed_db": True},
     }),
     ("server_workstation", "Server / workstation: 250 Hz, NUMA balancing, iocost, scx_layered, full LTO, expanded drivers, headers always", "dusky-server", 50, {
-        "release": {"channel": "longterm"},
+        "release": {"channel": "longterm", "allow_rc": True},
         "scheduler": {"type": "eevdf", "scx": "scx_layered", "scx_enable_class": True, "sched_core": True},
         "cache": {"sched_cache": True, "llc_aggr_tolerance": 1},
         "cpu": {"arch": "generic_v3", "governor": "schedutil", "mitigations": "on"},
@@ -4818,7 +4817,7 @@ DEFAULT_PROFILES: Final[tuple[tuple[str, str, str, int, dict[str, dict[str, Any]
         "verify": {"require_ntsync": False},
     }),
     ("battery_efficiency", "Battery: powersave + EPP power, teo, RCU lazy, power-efficient workqueues, ASPM powersupersave, 300 Hz", "dusky-battery", 60, {
-        "release": {"channel": "stable"},
+        "release": {"channel": "stable", "allow_rc": True},
         "scheduler": {"type": "eevdf", "scx": "scx_lavd", "scx_flags": "--autopower", "scx_enable_class": True},
         "cache": {"sched_cache": True},
         "cpu": {"arch": "native", "governor": "powersave", "epp": "balance_power", "amd_pstate": "active", "mitigations": "on"},
@@ -4832,7 +4831,7 @@ DEFAULT_PROFILES: Final[tuple[tuple[str, str, str, int, dict[str, dict[str, Any]
     }),
     ("vm_guest", "VM guest (KVM/QEMU, Hyper-V, VMware): paravirt, virtio, free page reporting, haltpoll, memory hotplug, portable v3 codegen", "dusky-vm", 70, {
         "meta": {"portable_package": True},
-        "release": {"channel": "stable"},
+        "release": {"channel": "stable", "allow_rc": True},
         "scheduler": {"type": "eevdf", "scx": "none", "scx_enable_class": True},
         "cache": {"sched_cache": False},
         "cpu": {"arch": "generic_v3", "governor": "schedutil", "amd_pstate": "undefined", "mitigations": "on", "nr_cpus": 64},
@@ -4847,7 +4846,7 @@ DEFAULT_PROFILES: Final[tuple[tuple[str, str, str, int, dict[str, dict[str, Any]
         "verify": {"require_ntsync": False},
     }),
     ("hardened", "Hardened: KSPP-style hardening, kCFI + FineIBT, init_on_free, strict IOMMU, lockdown early, mitigations on, EEVDF + CAS", "dusky-hardened", 80, {
-        "release": {"channel": "stable"},
+        "release": {"channel": "stable", "allow_rc": True},
         "scheduler": {"type": "eevdf", "scx": "none", "scx_enable_class": True, "sched_core": True},
         "cache": {"sched_cache": True},
         "cpu": {"arch": "native", "governor": "schedutil", "mitigations": "on"},
