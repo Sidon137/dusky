@@ -1359,7 +1359,8 @@ class Engine:
     async def shutdown(self) -> None:
         with contextlib.suppress(Exception):
             await self.unload("shutdown")
-        self._executor.shutdown(wait=True, cancel_futures=True)
+        if self._executor is not None:
+            self._executor.shutdown(wait=True, cancel_futures=True)
 
     # ---- synchronous internals (engine thread) --------------------------------
     def _preload_cuda_libs(self, ort: Any) -> None:
@@ -2870,6 +2871,30 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _get_cuda_vram_used_mb() -> float | None:
+    try:
+        import ctypes
+        nvml = ctypes.CDLL("libnvidia-ml.so.1")
+        nvml.nvmlInit_v2()
+        handle = ctypes.c_void_p()
+        if nvml.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(handle)) == 0:
+            class nvmlMemory_t(ctypes.Structure):
+                _fields_ = [
+                    ("total", ctypes.c_ulonglong),
+                    ("free", ctypes.c_ulonglong),
+                    ("used", ctypes.c_ulonglong),
+                ]
+            mem = nvmlMemory_t()
+            if nvml.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(mem)) == 0:
+                used_mb = mem.used / (1024 * 1024)
+                nvml.nvmlShutdown()
+                return used_mb
+        nvml.nvmlShutdown()
+    except Exception:
+        pass
+    return None
+
+
 def run_synth_worker(args: argparse.Namespace) -> int:
     cfg, config_file = _cli_config(args)
     _apply_engine_env(cfg)
@@ -2893,6 +2918,7 @@ def run_synth_worker(args: argparse.Namespace) -> int:
     sys.stdout.buffer.write(json.dumps(ready).encode("utf-8") + b"\n")
     sys.stdout.buffer.flush()
 
+    consecutive_high_vram = 0
     while True:
         line = sys.stdin.buffer.readline()
         if not line:
@@ -2910,10 +2936,36 @@ def run_synth_worker(args: argparse.Namespace) -> int:
             pause_ms = int(req.get("pause_ms", 0))
             try:
                 vec = voices.resolve(voice_spec)
-                pcm = engine._synth_sync(text, vec, speed, lang, pause_ms)
+                try:
+                    pcm = engine._synth_sync(text, vec, speed, lang, pause_ms)
+                except Exception as exc:
+                    err_str = str(exc).lower()
+                    if "out of memory" in err_str or "cuda" in err_str or "allocation" in err_str:
+                        log.warning("CUDA memory pressure during synthesis (%s) - re-baselining session and retrying segment...", exc)
+                        engine._unload_sync("CUDA OOM recovery")
+                        engine._load_sync()
+                        pcm = engine._synth_sync(text, vec, speed, lang, pause_ms)
+                    else:
+                        raise
+
                 header = struct.pack("<I", len(pcm))
                 sys.stdout.buffer.write(header + pcm)
                 sys.stdout.buffer.flush()
+
+                # Intelligent VRAM hysteresis guard:
+                # Occasional spikes up to 1.95 GB are completely safe and allowed for long paragraphs.
+                # Only if memory is sustained above the limit across 3 consecutive segments do we re-baseline.
+                vram_limit = cfg.engine.gpu_mem_limit_mb if (0 < cfg.engine.gpu_mem_limit_mb < 1950) else 1950
+                vram_used = _get_cuda_vram_used_mb()
+                if vram_used is not None and vram_used >= vram_limit:
+                    consecutive_high_vram += 1
+                    if consecutive_high_vram >= 3:
+                        log.info("VRAM sustained high (%.1f MB >= %d MB across 3 segments) - re-baselining ONNX session", vram_used, vram_limit)
+                        engine._unload_sync("VRAM sustained high guard")
+                        engine._load_sync()
+                        consecutive_high_vram = 0
+                else:
+                    consecutive_high_vram = 0
             except Exception as exc:
                 log.error("worker synth error: %s", exc)
                 sys.stdout.buffer.write(struct.pack("<I", 0))
