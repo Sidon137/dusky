@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import atexit
+import concurrent.futures
 import fcntl
 import grp
 import hashlib
@@ -25,6 +26,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.error
@@ -1261,7 +1263,7 @@ def generate_whitelist(isolated: IsolatedDB, master: List[str]) -> List[str]:
 
 
 def _verify_pkg_archive(pkg: Path) -> bool:
-    if pkg.stat().st_size == 0:
+    if not pkg.is_file() or pkg.stat().st_size == 0:
         return False
     name = pkg.name
     if name.endswith(".zst"):
@@ -1269,7 +1271,7 @@ def _verify_pkg_archive(pkg: Path) -> bool:
     elif name.endswith(".xz"):
         cmd = ["xz", "-t", "-q", "--", str(pkg)]
     else:
-        cmd = ["bsdtar", "-tqf", str(pkg)]
+        cmd = ["bsdtar", "-tf", str(pkg)]
     return (
         subprocess.run(
             cmd,
@@ -1280,6 +1282,129 @@ def _verify_pkg_archive(pkg: Path) -> bool:
         ).returncode
         == 0
     )
+
+
+def verify_package_archives_parallel(
+    packages: Sequence[Path], max_workers: Optional[int] = None
+) -> List[Tuple[Path, str]]:
+    """
+    Validates physical package archives in parallel using multi-threaded stream decompression.
+    Returns a list of (Path, failure_reason) for any corrupted or invalid archives.
+    """
+    if not packages:
+        return []
+
+    workers = max_workers or min(32, (os.cpu_count() or 4) * 2)
+
+    def _check_one(p: Path) -> Tuple[Path, bool, str]:
+        if not p.is_file():
+            return (p, False, "File missing on disk")
+        try:
+            if p.stat().st_size == 0:
+                return (p, False, "Zero-byte file")
+        except OSError as e:
+            return (p, False, f"Stat failed: {e}")
+
+        if not _verify_pkg_archive(p):
+            return (p, False, "Archive decompression / checksum verification failed")
+        return (p, True, "OK")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(_check_one, packages))
+
+    return [(p, reason) for p, is_ok, reason in results if not is_ok]
+
+
+def audit_repo_database_integrity(
+    repo_dir: Path, db_path: Path, max_workers: Optional[int] = None
+) -> List[Tuple[str, str]]:
+    """
+    Full cryptographic audit of a generated pacman repo DB against packages on disk.
+    Extracts %FILENAME%, %SHA256SUM%, and %CSIZE% for every entry and verifies:
+      1. Physical file existence
+      2. Size match
+      3. SHA256 cryptographic match
+      4. Complete archive stream decompression
+    Returns a list of (filename, failure_reason) on any discrepancy.
+    """
+    if not db_path.is_file():
+        return [(db_path.name, "Database file does not exist on disk")]
+
+    db_entries: Dict[str, Dict[str, Any]] = {}
+    try:
+        with tarfile.open(db_path, "r:*") as tar:
+            for member in tar.getmembers():
+                if member.name.endswith("/desc"):
+                    f = tar.extractfile(member)
+                    if not f:
+                        continue
+                    content = f.read().decode("utf-8", errors="ignore")
+                    fn, csum, csize = None, None, None
+                    lines = content.splitlines()
+                    for idx, line in enumerate(lines):
+                        if line == "%FILENAME%":
+                            fn = lines[idx + 1].strip()
+                        elif line == "%SHA256SUM%":
+                            csum = lines[idx + 1].strip()
+                        elif line == "%CSIZE%":
+                            try:
+                                csize = int(lines[idx + 1].strip())
+                            except ValueError:
+                                pass
+                    if fn and csum:
+                        db_entries[fn] = {"sha256": csum, "csize": csize}
+    except Exception as exc:
+        return [(db_path.name, f"Failed to parse database tar archive: {exc}")]
+
+    if not db_entries:
+        return [(db_path.name, "Database contains zero valid package descriptors")]
+
+    workers = max_workers or min(32, (os.cpu_count() or 4) * 2)
+
+    def _verify_entry(fn: str, expected: Dict[str, Any]) -> Tuple[str, bool, str]:
+        pkg_file = repo_dir / fn
+        if not pkg_file.is_file():
+            return (fn, False, "Package referenced in DB does not exist on disk")
+        try:
+            st = pkg_file.stat()
+            if expected.get("csize") is not None and st.st_size != expected["csize"]:
+                return (
+                    fn,
+                    False,
+                    f"Size mismatch: DB={expected['csize']}, Disk={st.st_size}",
+                )
+        except OSError as e:
+            return (fn, False, f"Stat failed: {e}")
+
+        # Cryptographic SHA256 check
+        try:
+            hasher = hashlib.sha256()
+            with open(pkg_file, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    hasher.update(chunk)
+            actual_sha = hasher.hexdigest()
+            if actual_sha.lower() != expected["sha256"].lower():
+                return (
+                    fn,
+                    False,
+                    f"SHA256 mismatch: DB={expected['sha256']}, Disk={actual_sha}",
+                )
+        except Exception as e:
+            return (fn, False, f"Hashing failed: {e}")
+
+        # Stream decompression test
+        if not _verify_pkg_archive(pkg_file):
+            return (fn, False, "Decompression verification failed (zstd/xz/tar)")
+
+        return (fn, True, "OK")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(_verify_entry, fn, exp) for fn, exp in db_entries.items()
+        ]
+        results = [f.result() for f in futures]
+
+    return [(fn, reason) for fn, is_ok, reason in results if not is_ok]
 
 
 def _pkgnames_from_pkgfiles(repo_dir: Path) -> Dict[str, List[Path]]:
@@ -1406,15 +1531,17 @@ def download_packages(isolated: IsolatedDB, master: List[str], repo_dir: Path) -
             if r.returncode != 0:
                 any_fail = True
 
-        corrupt = 0
-        for pkg in list(repo_dir.glob("*.pkg.tar.*")):
-            if pkg.name.endswith(".sig") or ".part" in pkg.name:
-                continue
-            if not _verify_pkg_archive(pkg):
-                step(f"Corrupt removed: {pkg.name}")
-                pkg.unlink(missing_ok=True)
-                Path(str(pkg) + ".sig").unlink(missing_ok=True)
-                corrupt += 1
+        pkg_candidates = [
+            p
+            for p in repo_dir.glob("*.pkg.tar.*")
+            if not p.name.endswith(".sig") and ".part" not in p.name
+        ]
+        corrupted_list = verify_package_archives_parallel(pkg_candidates)
+        for bad_p, reason in corrupted_list:
+            step(f"Corrupt removed ({reason}): {bad_p.name}")
+            bad_p.unlink(missing_ok=True)
+            Path(str(bad_p) + ".sig").unlink(missing_ok=True)
+        corrupt = len(corrupted_list)
 
         # Fresh closure from *current* sync DB (avoids stale pre-download whitelist).
         try:
@@ -1481,6 +1608,12 @@ def generate_repo_db(repo_dir: Path) -> None:
     ]
     if not pkg_paths:
         die("No packages to index")
+
+    corrupted = verify_package_archives_parallel(pkg_paths)
+    if corrupted:
+        for cp, reason in corrupted:
+            err(f"Corrupt package archive detected in {repo_dir.name} ({reason}): {cp.name}")
+        die(f"Aborting repo DB generation due to {len(corrupted)} corrupt package(s).")
 
     try:
         pr = subprocess.run(
@@ -1549,7 +1682,15 @@ def generate_repo_db(repo_dir: Path) -> None:
         except OSError as exc:
             warn(f"symlink {link.name}: {exc}")
     fsync_dir(repo_dir)
-    ok("Database created")
+
+    # Cryptographic post-flight audit: guarantees DB recorded checksum matches every file on disk
+    info(f"Auditing cryptographic database integrity for {repo_dir.name}...")
+    db_audit_errors = audit_repo_database_integrity(repo_dir, final_db)
+    if db_audit_errors:
+        for fn, reason in db_audit_errors:
+            err(f"DB audit discrepancy ({fn}): {reason}")
+        die(f"Repository database audit failed with {len(db_audit_errors)} error(s).")
+    ok(f"Database created and cryptographically verified ({len(pkg_files)} packages indexed)")
 
 
 # ==============================================================================
@@ -2559,12 +2700,19 @@ def merge_repos_for_iso(
     if not pkgs:
         die("Merged ISO repo has zero packages")
 
+    corrupt_pkgs = verify_package_archives_parallel(pkgs)
+    if corrupt_pkgs:
+        for cp, reason in corrupt_pkgs:
+            err(f"Corrupt package archive in staging ({reason}): {cp.name}")
+        die(f"Aborting ISO build: {len(corrupt_pkgs)} corrupt package(s) found in staging repository.")
+
     keep_names: set[str] = set()
     for p in pkgs:
         parsed = parse_pkg_filename(p.name)
         if parsed:
             keep_names.add(parsed[0])
     prune_repo_keep_names(staging, keep_names)
+    fsync_dir(staging)
     generate_repo_db(staging)
     n = len(
         [
@@ -2616,6 +2764,7 @@ def build_iso_image(cfg: ISOConfig) -> Path:
         "        return 1",
         "      fi",
         "    fi",
+        "    sync",
         "    shopt -s nullglob",
         '    local pkgs=( "${repo_target}/"*.pkg.tar.* )',
         '    local dbs=( "${repo_target}/"*.db.tar.* )',
@@ -2627,6 +2776,16 @@ def build_iso_image(cfg: ISOConfig) -> Path:
         '      echo "[ERR] No repo database in offline repo" >&2',
         "      return 1",
         "    fi",
+        '    _msg_info ">>> VERIFYING INJECTED REPOSITORY ARCHIVES <<<"',
+        '    for _pkg in "${pkgs[@]}"; do',
+        '      [[ "${_pkg}" == *.sig ]] && continue',
+        '      if [[ "${_pkg}" == *.zst ]]; then',
+        '        zstd -t -q "${_pkg}" </dev/null &>/dev/null || { echo "[ERR] Corrupted ZST package detected inside ISO repo: ${_pkg##*/}" >&2; return 1; }',
+        '      elif [[ "${_pkg}" == *.xz ]]; then',
+        '        xz -t -q "${_pkg}" </dev/null &>/dev/null || { echo "[ERR] Corrupted XZ package detected inside ISO repo: ${_pkg##*/}" >&2; return 1; }',
+        '      fi',
+        '    done',
+        "    sync",
         "    shopt -u nullglob",
     ]
     injection = "\n".join(inj_lines)
