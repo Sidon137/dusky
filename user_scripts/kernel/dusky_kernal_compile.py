@@ -3027,7 +3027,7 @@ def _ops_core(mx: Matrix, p: KernelProfile, d: Derived) -> None:
                 "UNIX", "INET", "IPV6", "NETFILTER", "PACKET", "CRYPTO_USER_API_HASH", "CRYPTO_USER_API_SKCIPHER", "CRYPTO_USER_API_RNG", "CRYPTO_USER_API_AEAD",
                 "INTEGRITY"):
         mx.y(sym)
-    for sym in ("BINFMT_MISC", "BLK_DEV_LOOP", "FUSE_FS", "OVERLAY_FS", "DM_CRYPT", "X86_MSR", "X86_CPUID"):
+    for sym in ("BINFMT_MISC", "BLK_DEV_LOOP", "FUSE_FS", "OVERLAY_FS", "DM_CRYPT", "DM_INTEGRITY", "X86_MSR", "X86_CPUID"):
         mx.m(sym)
     comp = {"zstd": "RD_ZSTD", "xz": "RD_XZ", "lz4": "RD_LZ4", "gzip": "RD_GZIP", "lzma": "RD_LZMA", "bzip2": "RD_BZIP2", "lzo": "RD_LZO"}
     mx.y(comp.get(f.initrd_compression, "RD_ZSTD"), why=f"mkinitcpio COMPRESSION={f.initrd_compression}")
@@ -4275,7 +4275,10 @@ def write_bls_entries(p: KernelProfile, facts: HostFacts, d: Derived) -> None:
         note("mkinitcpio builds a UKI for this flavor; systemd-boot discovers it automatically (no entry written)")
         return
     root = facts.xbootldr or facts.esp
-    if not root or not Path(root, "loader").is_dir():
+    has_loader = Path(root, "loader").is_dir() if root else False
+    if not has_loader and root:
+        has_loader = PRIV.run(["test", "-d", f"{root}/loader"], check=False).returncode == 0
+    if not root or not has_loader:
         warn("systemd-boot detected but no loader/ directory found on ESP/XBOOTLDR; skipping entries")
         return
     if Path(root).resolve() != Path("/boot").resolve():
@@ -4459,6 +4462,8 @@ def do_build(args: argparse.Namespace) -> int:
     if not ask_yes("Proceed with this configuration?", True):
         info("Aborted by user")
         return 0
+    if not args.no_install and not args.configure_only:
+        PRIV.ensure()
     JOURNAL.open(profile.name)
     note(f"journal: {JOURNAL.path}")
     check_dependencies(profile, facts, profile.g("compiler", "toolchain"), bool(profile.g("compiler", "rust")))
@@ -4984,7 +4989,7 @@ def install_aur_package(pkg: str) -> bool:
 
 def initialize_toolchains() -> None:
     rule("Toolchains & hardware profiler")
-    official_pkgs = ["base-devel", "clang", "lld", "llvm", "rust", "rust-bindgen", "bc", "cpio", "kmod", "pahole", "zram-generator", "scx-scheds", "perf", "curl", "gnupg"]
+    official_pkgs = ["base-devel", "clang", "lld", "llvm", "rust", "rust-bindgen", "bc", "cpio", "kmod", "pahole", "zram-generator", "scx-scheds", "perf", "curl", "gnupg", "terminus-font"]
     if ask_yes(f"Install official packages (pacman -S --needed {' '.join(official_pkgs)}) ?", True):
         PRIV.run(["pacman", "-S", "--needed", *official_pkgs], capture=False)
     
