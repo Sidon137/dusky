@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
 Dusky Universal Media Downloader
-Architecture: Open Video Downloader (OVD v3.2.1) Engine Port
 Platform: Arch Linux | Python 3.14+ | yt-dlp 2026+ | FFmpeg 9+
+Architecture: Port of Open Video Downloader (OVD v3.2.1) Engine
 
-Key Features:
-- General-purpose media extractor for all yt-dlp supported sites (YouTube, Rumble, Twitch, etc.).
-- Native media titles preserved; sanitized against illegal phone/FAT32 characters.
-- Zero drive wear: Buffers directly in /mnt/zram1/dusky_ytdlp with /dev/shm fallback.
-- Process group isolation (os.killpg) to terminate orphan FFmpeg workers on interrupt.
-- Streaming RAW progress parser with multi-stage lifecycle tracking.
+Features:
+- Full general-purpose media downloader across all yt-dlp extractors (YouTube, Rumble, Twitch, etc.)[cite: 2].
+- Retains native titles while sanitizing illegal FAT32/MTP/Android characters and trailing whitespace.
+- Zero drive wear: Writes exclusively to /mnt/zram1/dusky_ytdlp with /dev/shm fallback.
+- Process-group session isolation (process_group=0 / os.killpg) to prevent orphaned FFmpeg background tasks[cite: 5, 6].
+- Streaming RAW progress parser with real byte metrics and stage-aware lifecycle monitoring[cite: 4, 6].
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from typing import Final, Iterator
 import uuid
 
 # ==============================================================================
-# PHASE 1: DEPENDENCY AUDIT & SYSTEM AUTO-ELEVATION
+# PHASE 1: DEPENDENCY VERIFICATION & ARCH LINUX AUTO-ELEVATION
 # ==============================================================================
 
 REQUIRED_SYSTEM_BINARIES: Final[dict[str, str]] = {
@@ -58,7 +58,7 @@ def bootstrap_dependencies() -> None:
     if not missing:
         return
 
-    print("\n[!] Missing Arch Linux dependencies detected:")
+    print("\n[!] Missing system packages detected on Arch Linux:")
     for pkg in missing:
         print(f"    - {pkg}")
     print("[*] Escalating privileges to execute: sudo pacman -S --needed\n")
@@ -73,7 +73,7 @@ def bootstrap_dependencies() -> None:
         sys.stderr.write(f"\n[-] Elevation error: {err}\n")
         sys.exit(1)
 
-    print("[+] Dependencies resolved. Re-executing...\n")
+    print("[+] Dependencies resolved. Initializing script environment...\n")
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
@@ -84,7 +84,7 @@ bootstrap_dependencies()
 # ==============================================================================
 
 import argparse
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
 
 import yt_dlp
@@ -113,7 +113,7 @@ ACTIVE_PROCESS_GROUPS: set[int] = set()
 
 def global_signal_handler(signum: int, frame: object) -> None:
     """Kills the entire process group (yt-dlp + FFmpeg children) on SIGINT/SIGTERM."""
-    console.print("\n\n[bold red][!] Interrupted: Reaping process tree & cleaning memory buffers...[/]")
+    console.print("\n\n[bold red][!] Interrupted: Terminating process tree & cleaning memory buffers...[/]")
     for pgid in list(ACTIVE_PROCESS_GROUPS):
         try:
             os.killpg(pgid, signal.SIGTERM)
@@ -131,10 +131,10 @@ signal.signal(signal.SIGTERM, global_signal_handler)
 
 
 class TargetFormat(StrEnum):
+    VIDEO = "video"
     AUDIO_OPUS = "audio-opus"
     AUDIO_MP3 = "audio-mp3"
     AUDIO_BEST = "audio-best"
-    VIDEO = "video"
 
 
 class ProgressStage(StrEnum):
@@ -148,7 +148,9 @@ class ProgressStage(StrEnum):
 
 @dataclass(slots=True)
 class MediaProgress:
-    percentage: float | None = None
+    downloaded_bytes: int = 0
+    total_bytes: int | None = None
+    percentage: float = 0.0
     speed_bps: float | None = None
     eta_secs: int | None = None
     stage: ProgressStage = ProgressStage.INITIALIZING
@@ -174,7 +176,7 @@ RAW_PROGRESS_TEMPLATE: Final[str] = (
 
 
 class YtdlpProgressParser:
-    """Parses yt-dlp stdout lines to extract progress metrics and stages in real time."""
+    """Parses yt-dlp stdout lines and tracks byte counts and stages in real time."""
 
     def __init__(self) -> None:
         self.current_stage = ProgressStage.INITIALIZING
@@ -182,6 +184,7 @@ class YtdlpProgressParser:
     def parse_line(self, line: str, progress_state: MediaProgress) -> None:
         line_clean = line.strip()
 
+        # 1. Postprocess stages
         if line_clean.startswith("[VideoRemuxer]"):
             self.current_stage = ProgressStage.REMUXING
             progress_state.stage = self.current_stage
@@ -191,6 +194,7 @@ class YtdlpProgressParser:
             progress_state.stage = self.current_stage
             return
 
+        # 2. Destination tracking
         if "[download] Destination:" in line_clean:
             self.current_stage = ProgressStage.DOWNLOADING
             progress_state.stage = self.current_stage
@@ -210,79 +214,52 @@ class YtdlpProgressParser:
             progress_state.destination_file = Path(dest).name
             return
 
-        finalizing_triggers = ("[ffmpeg]", "[Fixup]", "Deleting original file")
-        if any(t in line_clean for t in finalizing_triggers):
+        # 3. Finalizing triggers
+        if any(t in line_clean for t in ("[ffmpeg]", "[Fixup]", "Deleting original file")):
             if self.current_stage != ProgressStage.FINALIZING:
                 self.current_stage = ProgressStage.FINALIZING
                 progress_state.stage = self.current_stage
             return
 
+        # 4. RAW progress protocol metrics
         if line_clean.startswith("RAW|"):
-            raw_content = line_clean[4:]
-            parts = raw_content.split("|")
+            parts = line_clean[4:].split("|")
             while len(parts) < 9:
                 parts.append("")
 
-            def parse_pct(s: str) -> float | None:
-                t = s.strip().rstrip("%").strip()
-                if not t or t.lower() == "na":
-                    return None
-                try:
-                    return float(t)
-                except ValueError:
-                    return None
-
-            def parse_float(s: str) -> float | None:
-                t = s.strip()
-                if not t or t.lower() == "na":
-                    return None
-                try:
-                    return float(t)
-                except ValueError:
-                    return None
-
             def parse_int(s: str) -> int | None:
                 t = s.strip()
-                if not t or t.lower() == "na":
-                    return None
+                return int(t) if t and t.lower() != "na" and t.isdigit() else None
+
+            def parse_float(s: str) -> float | None:
+                t = s.strip().rstrip("%")
                 try:
-                    return int(t)
+                    return float(t) if t and t.lower() != "na" else None
                 except ValueError:
                     return None
 
-            pct_num = parse_pct(parts[0])
-            pct_str = parse_pct(parts[1])
-            speed_bps = parse_float(parts[2])
-            eta_secs = parse_int(parts[3])
             dl_bytes = parse_int(parts[4])
             total_bytes = parse_int(parts[5]) or parse_int(parts[6])
-            frag_i = parse_int(parts[7])
-            frag_n = parse_int(parts[8])
+            speed = parse_float(parts[2])
+            eta = parse_int(parts[3])
 
-            pct = pct_num if pct_num is not None else pct_str
-            if pct is None and dl_bytes is not None and total_bytes and total_bytes > 0:
-                pct = (dl_bytes / total_bytes) * 100.0
-            elif pct is None and frag_i is not None and frag_n and frag_n > 0:
-                pct = (frag_i / frag_n) * 100.0
-
-            if pct is not None:
-                progress_state.percentage = max(0.0, min(100.0, pct))
-            if speed_bps is not None:
-                progress_state.speed_bps = speed_bps
-            if eta_secs is not None:
-                progress_state.eta_secs = eta_secs
+            if dl_bytes is not None:
+                progress_state.downloaded_bytes = dl_bytes
+            if total_bytes is not None and total_bytes > 0:
+                progress_state.total_bytes = total_bytes
+            if speed is not None:
+                progress_state.speed_bps = speed
+            if eta is not None:
+                progress_state.eta_secs = eta
 
 
 # ==============================================================================
-# PHASE 5: GENERAL-PURPOSE RUNNER & STORAGE MANAGEMENT
+# PHASE 5: STORAGE MANAGEMENT & RUNNER COMPILER
 # ==============================================================================
 
 
 def resolve_storage_pool(custom_path: Path | None = None) -> Path:
-    """
-    Ensures media writes occur strictly in memory (ZRAM or /dev/shm).
-    Eliminates directory-nesting bugs.
-    """
+    """Ensures media writes occur strictly in memory (ZRAM or tmpfs)."""
     candidates = [custom_path] if custom_path else [PRIMARY_ZRAM_TARGET, RAM_TMPFS_FALLBACK]
 
     for path in candidates:
@@ -294,7 +271,7 @@ def resolve_storage_pool(custom_path: Path | None = None) -> Path:
 
             stats = shutil.disk_usage(path)
             if (stats.free / (1024 * 1024)) < 500:
-                console.print(f"[bold yellow]![/] Low storage pool warning on {path}")
+                console.print(f"[bold yellow]![/] Warning: Storage pool {path} has under 500 MB remaining.")
             return path
         except (OSError, PermissionError):
             continue
@@ -322,15 +299,15 @@ class YtdlpRunner:
             "--no-color",
             "--progress-template", RAW_PROGRESS_TEMPLATE,
             "--progress-delta", "0.5",
-            # Multi-connection & Frag recovery (Correct CLI flag)
+            # Multi-connection & fragment recovery
             "--concurrent-fragments", "4",
             "--retries", "30",
             "--fragment-retries", "30",
             "--file-access-retries", "10",
             "--socket-timeout", "30",
-            # Strip invalid FAT32/Android characters for direct phone transfer
+            # Replace invalid FAT32/Android characters for safe phone transfer
             "--windows-filenames",
-            # Metadata retention
+            # Preserve embedded metadata tags
             "--add-metadata",
         ]
         self._compile_format(output_template)
@@ -361,7 +338,7 @@ class YtdlpRunner:
         self.args.extend(["-o", output_template, self.url])
 
     def spawn(self) -> tuple[subprocess.Popen, int]:
-        """Spawns yt-dlp in a distinct process group (POSIX process_group=0)."""
+        """Spawns yt-dlp in a distinct process group using POSIX process_group=0."""
         cmd = ["yt-dlp"] + self.args
         proc = subprocess.Popen(
             cmd,
@@ -376,7 +353,7 @@ class YtdlpRunner:
 
 
 # ==============================================================================
-# PHASE 6: EXECUTION PIPELINE
+# PHASE 6: DOWNLOAD PIPELINE
 # ==============================================================================
 
 
@@ -411,37 +388,34 @@ def execute_download(job: MediaJob, output_dir: Path) -> JobReport:
             except Exception:
                 pass
 
-    t = threading.Thread(target=stdout_reader, args=(proc.stdout,), daemon=True)
-    t.start()
+    reader_thread = threading.Thread(target=stdout_reader, args=(proc.stdout,), daemon=True)
+    reader_thread.start()
 
-    display_title = (job.title[:36] + "..") if len(job.title) > 38 else job.title
+    display_title = (job.title[:30] + "..") if len(job.title) > 32 else job.title
 
     with Progress(
         SpinnerColumn(),
         TextColumn("[bold yellow]{task.fields[title]}[/]"),
-        BarColumn(bar_width=30),
+        BarColumn(bar_width=24),
         DownloadColumn(),
         TransferSpeedColumn(),
         TimeRemainingColumn(),
-        TextColumn("{task.description}"),
+        TextColumn("[bold cyan]{task.description}[/]"),
         console=console,
         transient=True,
     ) as progress_ui:
-        task_id = progress_ui.add_task("Queueing", total=100.0, title=display_title)
+        task_id = progress_ui.add_task("Initializing", total=None, title=display_title)
 
         while proc.poll() is None:
             time.sleep(0.1)
-            pct = progress_state.percentage or 0.0
-            eta_str = f"{progress_state.eta_secs}s" if progress_state.eta_secs else "--:--"
-            speed_str = (
-                f"{progress_state.speed_bps / (1024 * 1024):.1f}MB/s"
-                if progress_state.speed_bps
-                else "--B/s"
+            progress_ui.update(
+                task_id,
+                completed=progress_state.downloaded_bytes,
+                total=progress_state.total_bytes,
+                description=f"[{progress_state.stage}]",
             )
-            desc = f"[cyan]{progress_state.stage} ({speed_str} | ETA: {eta_str})[/]"
-            progress_ui.update(task_id, completed=pct, description=desc)
 
-    t.join(timeout=1.0)
+    reader_thread.join(timeout=1.0)
     ACTIVE_PROCESS_GROUPS.discard(pgid)
 
     exit_code = proc.returncode
@@ -450,26 +424,38 @@ def execute_download(job: MediaJob, output_dir: Path) -> JobReport:
         last_line = err_msg.split("\n")[-1] if err_msg else f"yt-dlp error code {exit_code}"
         return JobReport(title=job.title, status="Failed", error=last_line)
 
+    # Locate and clean up trailing spaces before file extensions
     dest_file = progress_state.destination_file or "--"
     size_mb = 0.0
     if dest_file != "--":
         actual_path = output_dir / dest_file
+        if not actual_path.exists():
+            candidates = sorted(output_dir.glob("*.*"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if candidates:
+                actual_path = candidates[0]
+                dest_file = actual_path.name
+
         if actual_path.exists():
+            # Fix trailing space before extension: e.g. "title .m4a" -> "title.m4a"
+            clean_name = re.sub(r"\s+\.([a-zA-Z0-9]+)$", r".\1", actual_path.name)
+            if clean_name != actual_path.name:
+                cleaned_path = actual_path.with_name(clean_name)
+                actual_path.replace(cleaned_path)
+                actual_path = cleaned_path
+                dest_file = clean_name
+
             size_mb = actual_path.stat().st_size / (1024 * 1024)
 
     return JobReport(title=job.title, status="Success", saved_file=dest_file, size_mb=size_mb)
 
 
 # ==============================================================================
-# PHASE 7: TARGET PROBING & INTERACTIVE TUI WIZARD
+# PHASE 7: TARGET PROBING & INTERACTIVE TUI
 # ==============================================================================
 
 
 def probe_media_target(url: str) -> tuple[list[tuple[str, str]], bool, str]:
-    """
-    Universal flat extraction probe across any media host.
-    Returns: (list_of_tuples(title, url), is_collection, collection_label)
-    """
+    """Universal flat extraction probe across any media endpoint."""
     opts = {
         "extract_flat": "in_playlist",
         "skip_download": True,
@@ -601,7 +587,7 @@ def main() -> None:
             with target_path.open("r", encoding="utf-8") as f:
                 for idx, line in enumerate(f, start=1):
                     clean = line.strip()
-                    if clean and not clean.startswith(("#", "//")):
+                    if not clean or clean.startswith(("#", "//")):
                         jobs.append(MediaJob(title=f"Item {idx}", url=clean, mode=mode))
         else:
             discovered, is_collection, _ = probe_media_target(args.target)
@@ -626,16 +612,17 @@ def main() -> None:
         box=box.ROUNDED,
         header_style="bold cyan",
         title_style="bold green",
+        expand=True,
     )
-    table.add_column("Title", style="yellow")
-    table.add_column("Status", justify="center")
-    table.add_column("Size", justify="right")
-    table.add_column("Filename", style="dim")
+    table.add_column("Title", style="yellow", ratio=4, overflow="ellipsis")
+    table.add_column("Status", justify="center", width=10)
+    table.add_column("Size", justify="right", width=12)
+    table.add_column("Filename", style="dim", ratio=5, overflow="ellipsis")
 
     for r in reports:
         status_str = "[bold green]Success[/]" if r.status == "Success" else f"[bold red]{r.error}[/]"
         size_str = f"{r.size_mb:.2f} MB" if r.status == "Success" else "--"
-        table.add_row(r.title[:45], status_str, size_str, r.saved_file)
+        table.add_row(r.title, status_str, size_str, r.saved_file)
 
     console.print("\n")
     console.print(table)
