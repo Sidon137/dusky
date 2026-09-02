@@ -1643,6 +1643,8 @@ class MpvPlayer:
             "--demuxer=rawaudio", f"--demuxer-rawaudio-rate={SAMPLE_RATE}",
             "--demuxer-rawaudio-channels=1", "--demuxer-rawaudio-format=floatle",
             "--cache=yes", f"--demuxer-max-bytes={c.cache_max_mb}MiB", "--demuxer-max-back-bytes=8MiB",
+            "--demuxer-readahead-secs=36000",
+            "--cache-secs=36000",
             "--cache-pause=no", "--cache-pause-initial=no",
             f"--speed={c.mpv_speed}", f"--volume={c.volume}", "--audio-pitch-correction=yes",
             f"--force-media-title={self.title}",
@@ -2382,7 +2384,8 @@ class Daemon:
                     archive = await asyncio.to_thread(ArchiveWriter.create, self.paths.archive_dir, job.title, cfg.archive.bit_depth)
                 except OSError as exc:
                     log.warning("archive disabled for this job: %s", exc)
-            chunks: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=cfg.playback.prefetch_segments)
+            max_prefetch = max(cfg.playback.prefetch_segments, 512)
+            chunks: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=max_prefetch)
             self.is_synthesizing = True
             producer = asyncio.create_task(self._produce(job, job.voice_spec, chunks), name=f"synth-{job.id}")
             first = True
