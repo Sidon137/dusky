@@ -1,64 +1,53 @@
 #!/usr/bin/env python3
-"""Dusky STT CPU daemon for Arch Linux, PipeWire, and Wayland.
+"""Dusky STT CPU daemon (hardware-agnostic).
 
-The daemon is installed in a CPU-only virtual environment. It owns audio
-capture, stateful Silero VAD, transcript stability, and Wayland output. ASR is
-performed by a fresh interpreter from a separate GPU-only virtual environment.
-Audio crosses the process boundary in sealed, non-executable memfd objects.
+Owns capture, stateful Silero VAD, append-only typing, S1-mini cleanup,
+file transcription, and the control plane. ASR runs in an on-demand worker
+(.venv-worker) whose EP matches config hardware: CUDA / CPU (+opportunistic
+MIGraphX/ROCM on AMD). Audio crosses via sealed memfds over SOCK_SEQPACKET.
 """
 
 import argparse
-import array
-from collections import deque
-from dataclasses import dataclass, field
+import collections
 import fcntl
-import hashlib
 import importlib.metadata
 import json
 import logging
+import mmap
 import os
-
-""" Python 3.14.7 (daemon venv) does not have os.MFD_NOEXEC_SEAL.
-The constant only exist in newer CPython """
-
-if not hasattr(os, 'MFD_NOEXEC_SEAL'):
-    os.MFD_NOEXEC_SEAL = 0x0008
-
-from pathlib import Path
-import shutil
+import selectors
 import signal
 import socket
-import stat
 import struct
 import subprocess
 import sys
 import threading
 import time
-from typing import Any
-import urllib.request as urllib_request
+import urllib.request
 import uuid
-import wave
-
+from datetime import datetime
+from pathlib import Path
+from typing import Any
 
 MIN_PYTHON = (3, 14, 6)
-SAMPLE_RATE = 16_000
+SAMPLE_RATE = 16000
 VAD_FRAME_SAMPLES = 512
-MAX_PACKET = 64 * 1024
-PEERCRED_SIZE = struct.calcsize("3i")
-REQUIRED_MEMFD_SEALS = (
-    fcntl.F_SEAL_SEAL
-    | fcntl.F_SEAL_SHRINK
-    | fcntl.F_SEAL_GROW
-    | fcntl.F_SEAL_WRITE
-)
+VAD_CONTEXT_SAMPLES = 64
+BYTES_PER_SAMPLE = 2
+MAX_PACKET = 65536
+MAX_INLINE = 57344
 
 if sys.version_info < MIN_PYTHON:
-    raise SystemExit("Dusky STT requires CPython 3.14.6 or newer")
-if sys.implementation.name != "cpython" or not sys._is_gil_enabled():
-    raise SystemExit("Dusky STT requires the GIL-enabled CPython 3.14 ABI")
+    raise SystemExit("Dusky STT requires CPython 3.14.6+")
+_gil = getattr(sys, "_is_gil_enabled", None)
+if _gil is None or not _gil():
+    raise SystemExit("Dusky STT requires GIL-enabled CPython")
 
-# Every descendant starts GPU-blind. WorkerManager replaces this value only in
-# the exec environment of the dedicated GPU interpreter.
+# Kernel ABI: Python 3.14 does not expose these on all builds.
+if not hasattr(os, "MFD_NOEXEC_SEAL"):
+    os.MFD_NOEXEC_SEAL = 0x0008  # type: ignore[attr-defined]
+F_SEAL_EXEC = 0x0020
+
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 
@@ -66,1456 +55,710 @@ import numpy as np
 import onnxruntime as ort
 import sounddevice as sd
 
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s dusky[%(process)d]: %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s dusky[%(process)d]: %(message)s")
 LOG = logging.getLogger("dusky")
 
 APP_DIR = Path(os.environ.get("DUSKY_APP_DIR", Path(__file__).resolve().parent))
-CONFIG_PATH = APP_DIR / "config.json"
-WORKER_PATH = APP_DIR / "dusky_worker.py"
-WORKER_PYTHON = APP_DIR / ".venv-worker" / "bin" / "python"
+CONFIG_PATH = Path(os.environ.get("DUSKY_CONFIG", APP_DIR / "config.json"))
 
 type JsonObject = dict[str, Any]
 
-
-def normalized_distribution_name(name: str) -> str:
-    return name.casefold().replace("_", "-")
+REQUIRED_SEALS = fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE
+CUDA_TOKENS = ("libcuda.so", "libcudart.so", "libcublas", "libcudnn", "libnvrtc", "onnxruntime_providers_cuda")
+PUNCT = ".,?!:;\"'()[]{}"
 
 
 def assert_cpu_ort_namespace() -> None:
-    owners = {
-        normalized_distribution_name(name)
-        for name in importlib.metadata.packages_distributions().get("onnxruntime", [])
-    }
-    if owners != {"onnxruntime"}:
-        raise RuntimeError(
-            "CPU daemon ORT namespace is not exclusive: "
-            f"expected ['onnxruntime'], found {sorted(owners)}"
-        )
-    if "CPUExecutionProvider" not in ort.get_available_providers():
-        raise RuntimeError("CPUExecutionProvider is unavailable in the main environment")
-
-
-def assert_no_cuda_mappings() -> None:
+    owners = sorted(set(importlib.metadata.packages_distributions().get("onnxruntime", [])))
+    if owners != ["onnxruntime"]:
+        raise RuntimeError(f"CPU ORT namespace not exclusive: {owners}")
     maps = Path("/proc/self/maps").read_text(encoding="utf-8", errors="replace").casefold()
-    forbidden = (
-        "libcuda.so",
-        "libcudart.so",
-        "libcublas.so",
-        "libcublaslt.so",
-        "libcudnn.so",
-        "onnxruntime_providers_cuda",
-    )
-    loaded = [name for name in forbidden if name in maps]
-    if loaded:
-        raise RuntimeError(f"CPU daemon loaded forbidden CUDA mappings: {loaded}")
+    for tok in CUDA_TOKENS:
+        if tok in maps:
+            raise RuntimeError(f"CUDA leaked into CPU daemon: {tok}")
 
 
-def require_private_directory(path: Path, *, create: bool) -> Path:
-    if create:
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    metadata = os.lstat(path)
-    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-        raise RuntimeError(f"not a real directory: {path}")
-    if metadata.st_uid != os.getuid():
-        raise RuntimeError(f"directory is not owned by the service user: {path}")
-    if stat.S_IMODE(metadata.st_mode) != 0o700:
-        raise RuntimeError(f"directory must have mode 0700: {path}")
-    return path
-
-
-def require_runtime_dir() -> Path:
-    raw = os.environ.get("XDG_RUNTIME_DIR")
-    if not raw:
-        raise RuntimeError("XDG_RUNTIME_DIR is required")
-    base = Path(raw)
-    base_metadata = os.lstat(base)
-    if (
-        not stat.S_ISDIR(base_metadata.st_mode)
-        or stat.S_ISLNK(base_metadata.st_mode)
-        or base_metadata.st_uid != os.getuid()
-    ):
-        raise RuntimeError("XDG_RUNTIME_DIR has an invalid owner or type")
-    return require_private_directory(base / "dusky-stt", create=True)
-
-
-RUNTIME_DIR = require_runtime_dir()
-CONTROL_PATH = RUNTIME_DIR / "control.sock"
-
-
-def systemd_notify(message: str) -> None:
-    address = os.environ.get("NOTIFY_SOCKET")
-    if not address:
-        return
-    if address.startswith("@"):
-        address = "\0" + address[1:]
-    notifier = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM | socket.SOCK_CLOEXEC)
+def cuda_maps() -> list[str]:
     try:
-        notifier.sendto(message.encode("utf-8"), address)
+        text = Path("/proc/self/maps").read_text(encoding="utf-8", errors="replace").casefold()
     except OSError:
-        LOG.debug("sd_notify datagram failed", exc_info=True)
-    finally:
-        notifier.close()
+        return []
+    return sorted({tok for tok in CUDA_TOKENS if tok in text})
+
+
+def systemd_notify(state: str) -> None:
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr.startswith("@"):
+        addr = "\0" + addr[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM | socket.SOCK_CLOEXEC) as s:
+            s.sendto(state.encode(), addr)
+    except OSError:
+        pass
 
 
 def watchdog_interval() -> float:
     raw = os.environ.get("WATCHDOG_USEC")
-    watchdog_pid = os.environ.get("WATCHDOG_PID")
-    if not raw or (watchdog_pid and int(watchdog_pid) != os.getpid()):
-        return 10.0
-    return max(0.25, int(raw) / 2_000_000)
+    if not raw:
+        return 0.0
+    pid = os.environ.get("WATCHDOG_PID")
+    if pid and pid.strip() and int(pid) != os.getpid():
+        return 0.0
+    try:
+        return max(0.25, int(raw) / 2_000_000.0)
+    except ValueError:
+        return 0.0
 
 
 def atomic_write_text(path: Path, content: str, mode: int = 0o600) -> None:
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, mode)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, mode)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as h:
+            h.write(content)
+            h.flush()
+            os.fsync(h.fileno())
+        os.replace(tmp, path)
+        dfd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
-            os.fsync(directory_fd)
+            os.fsync(dfd)
         finally:
-            os.close(directory_fd)
+            os.close(dfd)
     finally:
-        temporary.unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)
 
 
-def send_notification(title: str, message: str, *, critical: bool = False) -> None:
-    binary = shutil.which("notify-send")
-    if binary is None:
-        return
-    command = [binary, "-a", "Dusky STT", "-t", "3500"]
-    if critical:
-        command.extend(("-u", "critical"))
-    command.extend((title[:80], message[:400]))
+def create_sealed_audio(pcm: np.ndarray) -> int:
+    payload = pcm.astype("<i2", copy=False).tobytes()
+    fd = os.memfd_create("dusky-audio", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING | os.MFD_NOEXEC_SEAL)
     try:
-        subprocess.run(command, check=False, timeout=3)
-    except (OSError, subprocess.SubprocessError):
-        LOG.debug("desktop notification failed", exc_info=True)
-
-
-def copy_to_clipboard(text: str) -> bool:
-    binary = shutil.which("wl-copy")
-    if binary is None or not os.environ.get("WAYLAND_DISPLAY"):
-        return False
-    try:
-        completed = subprocess.run(
-            [binary, "--type", "text/plain;charset=utf-8"],
-            input=text.encode("utf-8"),
-            check=False,
-            timeout=5,
-        )
-        return completed.returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        return False
+        os.ftruncate(fd, len(payload))
+        view = memoryview(payload)
+        off = 0
+        while off < len(payload):
+            off += os.pwrite(fd, view[off:], off)
+        fcntl.fcntl(fd, fcntl.F_ADD_SEALS, REQUIRED_SEALS)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 class RingBuffer:
-    """Fixed-size int16 ring used for phrase audio without list growth."""
-
-    def __init__(self, capacity: int) -> None:
-        self._data = np.empty(capacity, dtype="<i2")
-        self._capacity = capacity
-        self._write = 0
-        self._size = 0
+    def __init__(self, capacity_samples: int) -> None:
+        self._buf = np.zeros(capacity_samples, dtype="<i2")
+        self._cap = capacity_samples
+        self._start = 0
+        self._len = 0
+        self.dropped_samples = 0
 
     def __len__(self) -> int:
-        return self._size
+        return self._len
 
-    def clear(self) -> None:
-        self._write = 0
-        self._size = 0
+    def reset(self) -> None:
+        self._start = 0
+        self._len = 0
 
-    def append(self, samples: np.ndarray) -> None:
-        count = int(samples.size)
-        if count >= self._capacity:
-            self._data[:] = samples[-self._capacity :]
-            self._write = 0
-            self._size = self._capacity
+    def append(self, frame: np.ndarray) -> None:
+        count = int(frame.size)
+        if count >= self._cap:
+            self.dropped_samples += count - self._cap
+            self._buf[:] = frame[-self._cap:]
+            self._start = 0
+            self._len = self._cap
             return
-        first = min(count, self._capacity - self._write)
-        self._data[self._write : self._write + first] = samples[:first]
-        remainder = count - first
-        if remainder:
-            self._data[:remainder] = samples[first:]
-        self._write = (self._write + count) % self._capacity
-        self._size = min(self._size + count, self._capacity)
+        end = (self._start + self._len) % self._cap
+        first = min(count, self._cap - end)
+        self._buf[end:end + first] = frame[:first]
+        if first < count:
+            self._buf[:count - first] = frame[first:]
+        ovf = max(0, self._len + count - self._cap)
+        if ovf:
+            self.dropped_samples += ovf
+            self._start = (self._start + ovf) % self._cap
+            self._len = self._cap
+        else:
+            self._len += count
 
-    def snapshot(self) -> np.ndarray:
-        if self._size == 0:
+    def read(self, max_samples: int | None = None) -> np.ndarray:
+        if self._len == 0:
             return np.empty(0, dtype="<i2")
-        start = (self._write - self._size) % self._capacity
-        if start + self._size <= self._capacity:
-            return self._data[start : start + self._size].copy()
-        first = self._capacity - start
-        result = np.empty(self._size, dtype="<i2")
-        result[:first] = self._data[start:]
-        result[first:] = self._data[: self._size - first]
-        return result
+        first = min(self._len, self._cap - self._start)
+        chunks = [self._buf[self._start:self._start + first]]
+        if first < self._len:
+            chunks.append(self._buf[:self._len - first])
+        data = np.concatenate(chunks) if len(chunks) > 1 else chunks[0].copy()
+        return data[-max_samples:] if max_samples and data.size > max_samples else data
 
 
 class StatefulSileroVad:
-    """Silero v6.2.1 streaming wrapper with recurrent and context state."""
-
     def __init__(self, model_path: Path) -> None:
-        options = ort.SessionOptions()
-        options.intra_op_num_threads = 1
-        options.inter_op_num_threads = 1
-        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        options.enable_cpu_mem_arena = True
-        self._session = ort.InferenceSession(
-            str(model_path),
-            sess_options=options,
-            providers=["CPUExecutionProvider"],
-        )
-        input_names = {item.name for item in self._session.get_inputs()}
-        if input_names != {"input", "state", "sr"}:
-            raise RuntimeError(f"unexpected Silero VAD inputs: {sorted(input_names)}")
-        if self._session.get_providers() != ["CPUExecutionProvider"]:
-            raise RuntimeError(f"Silero did not bind exclusively to CPU: {self._session.get_providers()}")
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = 1
+        opts.inter_op_num_threads = 1
+        opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        self._session = ort.InferenceSession(str(model_path), sess_options=opts, providers=["CPUExecutionProvider"])
         self.reset()
-        assert_no_cuda_mappings()
 
     def reset(self) -> None:
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
-        self._context = np.zeros((1, 64), dtype=np.float32)
+        self._context = np.zeros((1, VAD_CONTEXT_SAMPLES), dtype=np.float32)
 
     def probability(self, pcm: np.ndarray) -> float:
-        if pcm.shape != (VAD_FRAME_SAMPLES,) or pcm.dtype != np.dtype("<i2"):
-            raise ValueError("VAD frame must be 512 little-endian int16 samples")
-        current = pcm.astype(np.float32).reshape(1, -1)
-        current *= 1.0 / 32768.0
+        current = (pcm.astype(np.float32) * (1.0 / 32768.0)).reshape(1, -1)
         model_input = np.concatenate((self._context, current), axis=1)
-        output, next_state = self._session.run(
-            None,
-            {
-                "input": model_input,
-                "state": self._state,
-                "sr": np.array(SAMPLE_RATE, dtype=np.int64),
-            },
-        )
-        self._context = current[:, -64:].copy()
-        self._state = np.asarray(next_state, dtype=np.float32)
-        return float(np.asarray(output).reshape(-1)[0])
-
-
-def write_all(fd: int, payload: memoryview) -> None:
-    offset = 0
-    while offset < len(payload):
-        written = os.write(fd, payload[offset:])
-        if written <= 0:
-            raise OSError("short write to audio memfd")
-        offset += written
-
-
-def recv_seqpacket(sock: socket.socket) -> bytes:
-    packet, _ancillary, flags, _address = sock.recvmsg(MAX_PACKET)
-    if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
-        raise RuntimeError("truncated IPC packet")
-    return packet
+        out, nxt = self._session.run(None, {
+            "input": model_input, "state": self._state,
+            "sr": np.array(SAMPLE_RATE, dtype=np.int64)})
+        self._context = current[:, -VAD_CONTEXT_SAMPLES:].copy()
+        self._state = np.asarray(nxt, dtype=np.float32)
+        return float(np.asarray(out).reshape(-1)[0])
 
 
 class WorkerManager:
-    """Owns one exec-isolated GPU worker and routes results by request ID."""
-
     def __init__(self, config: JsonObject) -> None:
-        self._config = config
-        self._condition = threading.Condition(threading.RLock())
-        self._process: subprocess.Popen[bytes] | None = None
-        self._socket: socket.socket | None = None
-        self._generation = 0
+        self.config = config
+        self._cv = threading.Condition(threading.RLock())
+        self._proc: subprocess.Popen[bytes] | None = None
+        self._sock: socket.socket | None = None
+        self._gen = 0
+        self._spawns = 0
         self._inflight: dict[str, int] = {}
         self._results: dict[str, JsonObject] = {}
         self._discarded: set[str] = set()
 
     @property
     def pid(self) -> int | None:
-        with self._condition:
-            if self._process is None or self._process.poll() is not None:
-                return None
-            return self._process.pid
-
-    @property
-    def inflight(self) -> int:
-        with self._condition:
-            return len(self._inflight)
+        with self._cv:
+            return self._proc.pid if self._proc and self._proc.poll() is None else None
 
     def _spawn_locked(self) -> None:
-        if self._process is not None and self._process.poll() is None and self._socket is not None:
+        if self._proc and self._proc.poll() is None and self._sock:
             return
-        if not WORKER_PYTHON.is_file() or not os.access(WORKER_PYTHON, os.X_OK):
-            raise RuntimeError(f"GPU worker interpreter is unavailable: {WORKER_PYTHON}")
-
-        parent, child = socket.socketpair(
-            socket.AF_UNIX,
-            socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC,
-        )
+        parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC)
+        for s in (parent, child):
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 20)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+            except OSError:
+                pass
         child.set_inheritable(True)
-        environment = os.environ.copy()
-        environment["CUDA_VISIBLE_DEVICES"] = str(self._config["gpu_device"])
-        environment["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-        environment["CUDA_MODULE_LOADING"] = "LAZY"
-        environment["PYTHONDONTWRITEBYTECODE"] = "1"
-        try:
-            process = subprocess.Popen(
-                [
-                    str(WORKER_PYTHON),
-                    str(WORKER_PATH),
-                    "--ipc-fd",
-                    str(child.fileno()),
-                    "--config",
-                    str(CONFIG_PATH),
-                ],
-                cwd=APP_DIR,
-                env=environment,
-                close_fds=True,
-                pass_fds=(child.fileno(),),
-            )
-        except Exception:
-            parent.close()
-            child.close()
-            raise
+        env = dict(os.environ)
+        if str(self.config.get("hardware", "cpu")) == "nvidia":
+            env["CUDA_VISIBLE_DEVICES"] = str(self.config.get("gpu_device", 0))
+            env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+            env["CUDA_MODULE_LOADING"] = "LAZY"
+        else:
+            env["CUDA_VISIBLE_DEVICES"] = "-1"
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        env["HF_HUB_OFFLINE"] = "1"
+        worker_py = APP_DIR / str(self.config.get("worker_python", ".venv-worker/bin/python"))
+        worker_script = APP_DIR / str(self.config.get("worker_script", "dusky_worker.py"))
+        cfg = APP_DIR / "config.json"
+        proc = subprocess.Popen([str(worker_py), str(worker_script), "--config", str(cfg),
+                                 "--fd", str(child.fileno())],
+                                cwd=APP_DIR, env=env, close_fds=True, pass_fds=(child.fileno(),))
         child.close()
-        self._generation += 1
-        generation = self._generation
-        self._process = process
-        self._socket = parent
-        threading.Thread(
-            target=self._reader_loop,
-            args=(generation, process, parent),
-            name=f"dusky-worker-reader-{generation}",
-            daemon=True,
-        ).start()
-        LOG.info("spawned GPU worker pid=%d generation=%d", process.pid, generation)
+        self._gen += 1
+        self._spawns += 1
+        self._proc = proc
+        self._sock = parent
+        threading.Thread(target=self._reader_loop, args=(self._gen, proc, parent),
+                         name=f"dusky-worker-{self._gen}", daemon=True).start()
+        LOG.info("Spawned worker PID=%d gen=%d hw=%s", proc.pid, self._gen, self.config.get("hardware"))
 
-    def _reader_loop(
-        self,
-        generation: int,
-        process: subprocess.Popen[bytes],
-        ipc: socket.socket,
-    ) -> None:
+    def _fail_generation(self, gen: int, reason: str) -> None:
+        with self._cv:
+            for req_id, g in list(self._inflight.items()):
+                if g == gen and req_id not in self._results:
+                    self._results[req_id] = {"ok": False, "request_id": req_id, "error": reason}
+            self._cv.notify_all()
+
+    def _reader_loop(self, gen: int, proc: subprocess.Popen[bytes], sock: socket.socket) -> None:
         try:
-            while packet := recv_seqpacket(ipc):
-                response = json.loads(packet.decode("utf-8"))
-                if not isinstance(response, dict):
-                    raise ValueError("worker response is not an object")
-                request_id = response.get("request_id")
-                if not isinstance(request_id, str) or not request_id:
-                    LOG.warning("worker sent response without a request ID: %r", response)
-                    continue
-                with self._condition:
-                    self._inflight.pop(request_id, None)
-                    if request_id in self._discarded:
-                        self._discarded.remove(request_id)
-                    else:
-                        self._results[request_id] = response
-                    self._condition.notify_all()
-        except (OSError, ValueError, json.JSONDecodeError):
-            LOG.debug("GPU worker result channel closed", exc_info=True)
-        finally:
-            try:
-                return_code = process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                return_code = process.wait(timeout=3)
-            with self._condition:
-                abandoned = [
-                    request_id
-                    for request_id, request_generation in self._inflight.items()
-                    if request_generation == generation
-                ]
-                for request_id in abandoned:
-                    self._inflight.pop(request_id, None)
-                    if request_id in self._discarded:
-                        self._discarded.remove(request_id)
-                    else:
-                        self._results[request_id] = {
-                            "type": "result",
-                            "request_id": request_id,
-                            "text": "",
-                            "error": f"GPU worker exited with status {return_code}",
-                        }
-                if generation == self._generation:
-                    self._process = None
-                    self._socket = None
-                self._condition.notify_all()
-            try:
-                ipc.close()
-            except OSError:
-                pass
-            LOG.info("GPU worker pid=%d exited status=%d", process.pid, return_code)
-
-    def _invalidate_locked(self) -> None:
-        ipc, process = self._socket, self._process
-        self._socket = None
-        self._process = None
-        if ipc is not None:
-            try:
-                ipc.close()
-            except OSError:
-                pass
-        if process is not None and process.poll() is None:
-            process.terminate()
-
-    def submit(
-        self,
-        pcm: np.ndarray,
-        metadata: JsonObject,
-        *,
-        force: bool,
-        wait_seconds: float | None = None,
-    ) -> str | None:
-        contiguous = np.ascontiguousarray(pcm, dtype="<i2")
-        if contiguous.size == 0:
-            return None
-        timeout = float(wait_seconds or self._config["worker_queue_timeout_seconds"])
-        deadline = time.monotonic() + timeout
-
-        for attempt in range(2):
-            with self._condition:
-                while len(self._inflight) >= int(self._config["max_inflight_requests"]):
-                    if not force:
-                        return None
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise TimeoutError("timed out waiting for GPU worker queue capacity")
-                    self._condition.wait(min(remaining, 0.1))
-
-                self._spawn_locked()
-                assert self._socket is not None
-                request_id = uuid.uuid4().hex
-                payload: JsonObject = {
-                    "type": "transcribe",
-                    "request_id": request_id,
-                    "samples": int(contiguous.size),
-                    "encoding": "s16le",
-                    **metadata,
-                }
-                encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode()
-                if len(encoded) > MAX_PACKET:
-                    raise ValueError("ASR request metadata is too large")
-
-                memfd = os.memfd_create(
-                    "dusky-audio",
-                    os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING | os.MFD_NOEXEC_SEAL,
-                )
+            while True:
+                fds: list[int] = []
                 try:
-                    os.ftruncate(memfd, contiguous.nbytes)
-                    write_all(memfd, memoryview(contiguous).cast("B"))
-                    fcntl.fcntl(memfd, fcntl.F_ADD_SEALS, REQUIRED_MEMFD_SEALS)
-                    if fcntl.fcntl(memfd, fcntl.F_GET_SEALS) & REQUIRED_MEMFD_SEALS != REQUIRED_MEMFD_SEALS:
-                        raise RuntimeError("audio memfd did not acquire all required seals")
-                    descriptor = array.array("i", [memfd])
-                    self._inflight[request_id] = self._generation
-                    sent = self._socket.sendmsg(
-                        [encoded],
-                        [(socket.SOL_SOCKET, socket.SCM_RIGHTS, descriptor.tobytes())],
-                    )
-                    if sent != len(encoded):
-                        raise OSError(f"short SOCK_SEQPACKET send: {sent}/{len(encoded)}")
-                    return request_id
-                except OSError:
-                    self._inflight.pop(request_id, None)
-                    self._invalidate_locked()
-                    self._condition.notify_all()
-                    if attempt:
-                        raise
-                finally:
-                    os.close(memfd)
-        return None
+                    payload, ancdata, flags, _ = sock.recvmsg(MAX_PACKET, socket.CMSG_SPACE(4 * 8))
+                except OSError as exc:
+                    LOG.debug("Worker recv failed: %s", exc)
+                    break
+                for level, ctype, data in ancdata:
+                    if level == socket.SOL_SOCKET and ctype == socket.SCM_RIGHTS:
+                        n = len(data) // struct.calcsize("i")
+                        fds.extend(struct.unpack(f"{n}i", data[:n * struct.calcsize("i")]))
+                if flags & getattr(socket, "MSG_CTRUNC", 0x20) or flags & getattr(socket, "MSG_TRUNC", 0x20):
+                    for fd in fds:
+                        os.close(fd)
+                    LOG.warning("Worker packet truncated; discarding generation %d", gen)
+                    break
+                if len(fds) > 1:
+                    for fd in fds:
+                        os.close(fd)
+                    LOG.warning("Worker sent >1 fd; discarding")
+                    continue
+                if not payload:
+                    for fd in fds:
+                        os.close(fd)
+                    break
+                try:
+                    resp = json.loads(payload.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    for fd in fds:
+                        os.close(fd)
+                    continue
+                if resp.get("payload") == "memfd" and fds:
+                    fd = fds[0]
+                    try:
+                        sz = os.fstat(fd).st_size
+                        with mmap.mmap(fd, sz, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ) as m:
+                            resp.update(json.loads(m.read().decode("utf-8")))
+                    except (OSError, ValueError, json.JSONDecodeError) as exc:
+                        LOG.warning("Bad worker memfd reply: %s", exc)
+                    finally:
+                        for fd in fds:
+                            os.close(fd)
+                else:
+                    for fd in fds:
+                        os.close(fd)
+                req_id = resp.get("request_id")
+                with self._cv:
+                    self._inflight.pop(req_id, None)
+                    if req_id in self._discarded:
+                        self._discarded.discard(req_id)
+                    elif req_id:
+                        self._results[req_id] = resp
+                    self._cv.notify_all()
+        except Exception as exc:
+            LOG.debug("Worker channel closed: %s", exc)
+        finally:
+            self._fail_generation(gen, "worker exited")
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            with self._cv:
+                if gen == self._gen:
+                    self._proc = None
+                    self._sock = None
+                self._cv.notify_all()
+            sock.close()
 
-    def pop_result(self, request_id: str) -> JsonObject | None:
-        with self._condition:
-            return self._results.pop(request_id, None)
+    def submit(self, pcm: np.ndarray, meta: JsonObject, *, force: bool) -> str | None:
+        with self._cv:
+            limit = int(self.config.get("max_inflight_requests", 2))
+            while len(self._inflight) >= limit:
+                if not force:
+                    return None
+                self._cv.wait(0.1)
+            self._spawn_locked()
+            assert self._sock is not None
+            req_id = uuid.uuid4().hex
+            fd = create_sealed_audio(pcm)
+            try:
+                self._inflight[req_id] = self._gen
+                self._sock.sendmsg([json.dumps({"op": "recognize", "request_id": req_id,
+                                                "samples": int(pcm.size), "encoding": "s16le", **meta}).encode()],
+                                   [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("i", fd))])
+            except OSError:
+                self._inflight.pop(req_id, None)
+                raise
+            finally:
+                os.close(fd)
+            return req_id
 
-    def wait_result(self, request_id: str, timeout: float) -> JsonObject:
+    def wait_result(self, req_id: str, timeout: float) -> JsonObject | None:
         deadline = time.monotonic() + timeout
-        with self._condition:
-            while request_id not in self._results:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    self.discard(request_id)
-                    raise TimeoutError(f"ASR request {request_id} timed out")
-                self._condition.wait(min(remaining, 0.2))
-            return self._results.pop(request_id)
-
-    def discard(self, request_id: str) -> None:
-        with self._condition:
-            self._results.pop(request_id, None)
-            if request_id in self._inflight:
-                self._discarded.add(request_id)
+        with self._cv:
+            while req_id not in self._results:
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    self._discarded.add(req_id)
+                    self._inflight.pop(req_id, None)
+                    return None
+                self._cv.wait(min(rem, 0.2))
+            return self._results.pop(req_id)
 
     def stop(self) -> None:
-        with self._condition:
-            ipc, process = self._socket, self._process
-            if ipc is not None:
-                try:
-                    ipc.send(json.dumps({"type": "shutdown"}).encode("utf-8"))
-                except OSError:
-                    pass
-        if process is not None:
+        with self._cv:
+            sock = self._sock
+        if sock:
             try:
-                process.wait(timeout=5)
+                sock.sendmsg([b'{"op":"shutdown"}'])
+            except OSError:
+                pass
+        proc = self._proc
+        if proc:
+            try:
+                proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                process.terminate()
-                try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=3)
-
-
-def normalized_words(text: str) -> list[str]:
-    return text.strip().split()
-
-
-def comparison_word(word: str) -> str:
-    return word.casefold().strip(".,?!:;\"'()[]{}")
-
-
-def common_prefix_length(left: list[str], right: list[str]) -> int:
-    length = 0
-    for left_word, right_word in zip(left, right, strict=False):
-        if comparison_word(left_word) != comparison_word(right_word):
-            break
-        length += 1
-    return length
-
-
-HALLUCINATIONS = frozenset(
-    {
-        "thank you",
-        "thanks for watching",
-        "thank you for watching",
-        "please subscribe",
-        "amara.org",
-    }
-)
-
-
-def usable_transcript(text: str) -> bool:
-    normalized = " ".join(text.casefold().split()).strip(" .,!?:;")
-    return len(normalized) >= 2 and normalized not in HALLUCINATIONS
-
-
-S1_MINI_SYSTEM_PROMPT = (
-    "You are a text normalizer for speech-to-text transcripts. The input begins "
-    "with a control line specifying the styling, structure, and context settings; "
-    "clean the transcript to match those settings and output only the cleaned text."
-)
+                proc.kill()
 
 
 class S1Cleanup:
-    """Post-ASR transcript normalizer backed by the local s1-mini model via Ollama.
-
-    S1-mini (superwhisper/s1-mini) is a small text normalizer that sits between ASR
-    and output. It is not a chat model and is steered only by an exact system prompt
-    plus a control line. It is Qwen3-based, which defaults to thinking mode; S1-mini
-    was trained with thinking off, so the assistant turn must begin with an empty
-    ``thinking`` block or the model emits nothing. Ollama's chat template can
-    mishandle that generation prefix, so this builds the raw prompt by hand and
-    sends it through ``/api/generate`` with ``raw: true`` — the documented fallback
-    that matches the training prefix exactly. Greedy decoding (temperature 0) is
-    required. Any failure falls back to the raw text so the STT pipeline is never
-    blocked by an unavailable cleanup model.
-    """
-
+    SYSTEM = ("You are a text normalizer for speech-to-text transcripts. Output only the cleaned text.")
     def __init__(self, config: JsonObject) -> None:
-        self._endpoint = str(config.get("llm_endpoint", "http://localhost:11434")) + "/api/generate"
-        self._model = str(config.get("llm_model", "s1-mini"))
-        self._styling = str(config.get("llm_cleanup_style", "semi-formal"))
-        self._structure = str(config.get("llm_cleanup_structure", "prose"))
-        self._context = str(config.get("llm_cleanup_context", "general"))
-        self._timeout = float(config.get("llm_timeout_seconds", 60))
-        self._max_tokens = int(config.get("llm_max_tokens", 2048))
-        self._system = S1_MINI_SYSTEM_PROMPT
+        self.enabled = bool(config.get("llm_enabled", True))
+        self.endpoint = f"{config.get('llm_endpoint', 'http://127.0.0.1:11434')}/api/generate"
+        self.model = str(config.get("llm_model", "s1-mini"))
+        self.timeout = float(config.get("llm_timeout_seconds", 20.0))
+        self.max_tokens = int(config.get("llm_max_tokens", 2048))
 
-    def _prompt(self, transcript: str) -> str:
-        control = (
-            f"[Styling: {self._styling}] "
-            f"[Structure: {self._structure}] "
-            f"[Context: {self._context}]"
-        )
-        return (
-            f"<|im_start|>system\n{self._system}<|im_end|>\n"
-            f"<|im_start|>user\n{control}\n{transcript}<|im_end|>\n"
-            "<|im_start|>assistant\n thinking\n\n response\n\n"
-        )
-
-    def normalize(self, transcript: str) -> str:
+    def clean(self, transcript: str) -> str:
         raw = transcript.strip()
-        if not raw:
+        if not self.enabled or not raw:
             return raw
-        payload = {
-            "model": self._model,
-            "prompt": self._prompt(raw),
-            "raw": True,
-            "stream": False,
-            "options": {"temperature": 0, "num_predict": self._max_tokens},
-        }
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        request = urllib_request.Request(
-            self._endpoint,
-            data=data,
-            method="POST",
-            headers={"Content-Type": "application/json"},
-        )
+        payload = {"model": self.model, "prompt": raw, "raw": True, "stream": False,
+                   "options": {"temperature": 0, "num_predict": self.max_tokens}}
+        req = urllib.request.Request(self.endpoint, data=json.dumps(payload).encode(),
+                                     headers={"Content-Type": "application/json"}, method="POST")
         try:
-            with urllib_request.urlopen(request, timeout=self._timeout) as response:
-                body = json.loads(response.read().decode("utf-8"))
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                cleaned = str(json.loads(resp.read().decode()).get("response", "")).strip()
+            if cleaned and "[Styling:" not in cleaned and "<|im_start|>" not in cleaned:
+                return cleaned
         except Exception as exc:
-            LOG.warning("S1-mini cleanup request failed; using raw transcript: %s", exc)
-            return raw
-        try:
-            content = str(body["response"]).strip()
-        except (KeyError, TypeError) as exc:
-            LOG.warning("S1-mini returned an unexpected payload; using raw transcript: %s", exc)
-            return raw
-        if not content or not usable_transcript(content):
-            return raw
-        return content
-
-
-class WaylandTyper:
-    def __init__(self) -> None:
-        binary = shutil.which("wtype")
-        if binary is None:
-            raise RuntimeError("wtype is required for typing output")
-        if not os.environ.get("WAYLAND_DISPLAY"):
-            raise RuntimeError("WAYLAND_DISPLAY is absent from the user service environment")
-        self._binary = binary
-
-    def type_text(self, text: str) -> None:
-        if not text:
-            return
-        completed = subprocess.run(
-            [self._binary, "-"],
-            input=text.encode("utf-8"),
-            capture_output=True,
-            timeout=8,
-            check=False,
-        )
-        if completed.returncode != 0:
-            detail = completed.stderr.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"wtype failed ({completed.returncode}): {detail}")
-
-
-@dataclass(slots=True)
-class PhraseTypingState:
-    previous: list[str] = field(default_factory=list)
-    emitted: list[str] = field(default_factory=list)
-    diverged: bool = False
+            LOG.warning("LLM cleanup bypassed: %s", exc)
+        return raw
 
 
 class StableSuffixTyper:
-    """Types only stable LCP words and never deletes focused-window content."""
-
     def __init__(self, holdback_words: int) -> None:
-        self._wayland = WaylandTyper()
-        self._holdback = holdback_words
-        self._phrases: dict[int, PhraseTypingState] = {}
-        self._has_output = False
-        self.typed_text = ""
+        self.holdback = max(0, holdback_words)
+        self.emitted: list[str] = []
+        self.diverged = False
+        self.disabled = False
 
-    def update(self, phrase_id: int, text: str, *, final: bool) -> None:
-        words = normalized_words(text)
-        if not words:
+    def reset(self) -> None:
+        self.emitted = []
+        self.diverged = False
+
+    def update(self, text: str, *, final: bool) -> None:
+        if self.diverged or self.disabled:
             return
-        state = self._phrases.setdefault(phrase_id, PhraseTypingState())
-        if state.diverged:
-            state.previous = words
+        words = text.strip().split()
+        e_norm = [w.strip(PUNCT).casefold() for w in self.emitted]
+        w_norm = [w.strip(PUNCT).casefold() for w in words]
+        overlap = 0
+        for a, b in zip(e_norm, w_norm):
+            if a != b:
+                break
+            overlap += 1
+        if overlap < len(e_norm):
+            self.diverged = True
+            LOG.warning("Hypothesis diverged; live typing suspended for phrase.")
             return
-
-        emitted_count = len(state.emitted)
-        if common_prefix_length(state.emitted, words) < emitted_count:
-            state.diverged = True
-            state.previous = words
-            LOG.warning(
-                "ASR revision diverged from typed prefix for phrase %d; further live output "
-                "for this phrase is suppressed, while the final text remains available in the clipboard",
-                phrase_id,
-            )
-            return
-
-        if final:
-            stable_count = len(words)
-        elif state.previous:
-            stable_count = max(0, common_prefix_length(state.previous, words) - self._holdback)
-        else:
-            stable_count = 0
-
-        if stable_count > emitted_count:
-            suffix_words = words[emitted_count:stable_count]
-            suffix = " ".join(suffix_words)
-            if self._has_output:
-                suffix = " " + suffix
-            self._wayland.type_text(suffix)
-            self.typed_text += suffix
-            self._has_output = True
-            state.emitted.extend(suffix_words)
-        state.previous = words
+        target = len(words) if final else max(0, len(words) - self.holdback)
+        if target > len(self.emitted):
+            chunk = (" " if self.emitted else "") + " ".join(words[len(self.emitted):target])
+            try:
+                subprocess.run(["wtype", "-"], input=chunk.encode(), check=False, timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                self.disabled = True
+                LOG.warning("wtype failed; live typing disabled for session.")
+                return
+            self.emitted.extend(words[len(self.emitted):target])
 
 
-@dataclass(slots=True)
-class TranscriptRevision:
-    revision: int
-    text: str
-    final: bool
+def decode_file_to_pcm(path: Path, chunk_seconds: float) -> list[np.ndarray]:
+    """Decode any ffmpeg-readable file to 16k mono s16 chunks. Raises on failure."""
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(path),
+           "-map", "0:a:0", "-vn", "-sn", "-dn", "-ac", "1", "-ar", "16000",
+           "-f", "s16le", "-acodec", "pcm_s16le", "-"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert proc.stdout and proc.stderr
+    errs: list[bytes] = []
+    def drain() -> None:
+        try:
+            errs.append(proc.stderr.read() or b"")
+        except OSError:
+            pass
+    t = threading.Thread(target=drain, daemon=True)
+    t.start()
+    raw = proc.stdout.read()
+    t.join(timeout=10)
+    rc = proc.wait(timeout=30)
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg failed ({rc}): {b''.join(errs)[-1000:].decode(errors='replace')}")
+    pcm = np.frombuffer(raw, dtype="<i2").copy()
+    per = int(chunk_seconds * SAMPLE_RATE)
+    return [pcm[i:i + per] for i in range(0, max(1, pcm.size), per)] if pcm.size else []
 
 
 class RecordingSession:
-    def __init__(self, config: JsonObject, worker: WorkerManager, realtime: bool) -> None:
-        self.config = config
-        self.worker = worker
+    def __init__(self, daemon: "DuskyDaemon", realtime: bool) -> None:
+        self.daemon = daemon
+        self.config = daemon.config
         self.realtime = realtime
         self.session_id = uuid.uuid4().hex
         self.stop_event = threading.Event()
-        self.vad = StatefulSileroVad(APP_DIR / "models" / "silero_vad.onnx")
-        self.pre_roll: deque[np.ndarray] = deque(
-            maxlen=max(1, round(float(config["pre_roll_seconds"]) * SAMPLE_RATE / VAD_FRAME_SAMPLES))
-        )
-        self.phrase_audio = RingBuffer(round(float(config["max_phrase_seconds"]) * SAMPLE_RATE))
+        self.vad = StatefulSileroVad(APP_DIR / str(self.config.get("vad_model_path", "models/silero_vad.onnx")))
+        cap = int((float(self.config.get("max_phrase_seconds", 15.0)) + 2.0) * SAMPLE_RATE)
+        self.ring = RingBuffer(cap)
+        self.pre_roll: collections.deque[np.ndarray] = collections.deque(
+            maxlen=max(1, round(float(self.config.get("pre_roll_seconds", 0.32)) * SAMPLE_RATE / VAD_FRAME_SAMPLES)))
+        self.typer = StableSuffixTyper(int(self.config.get("stable_holdback_words", 2))) if realtime else None
+        self.phrases: list[str] = []
         self.phrase_id = 0
-        self.revision = 0
-        self.phrase_active = False
-        self.onset_frames = 0
-        self.speech_frames = 0
-        self.silence_frames = 0
-        self.pending: set[str] = set()
-        self.pending_by_phrase: dict[int, set[str]] = {}
-        self.request_phrases: dict[str, int] = {}
-        self.latest: dict[int, TranscriptRevision] = {}
-        self.last_provisional_at = 0.0
-        self.overflow_count = 0
-        self.typer = StableSuffixTyper(int(config["stable_holdback_words"])) if realtime else None
-        self._s1: S1Cleanup | None = None
-        if bool(config.get("llm_enabled", False)):
-            try:
-                self._s1 = S1Cleanup(config)
-            except Exception as exc:
-                LOG.warning("S1-mini cleanup disabled for this session: %s", exc)
-        self._audio_temporary: Path | None = None
-        self._wave: wave.Wave_write | None = None
-        if bool(config["keep_audio"]):
-            self._audio_temporary = RUNTIME_DIR / f"capture-{self.session_id}.wav"
-            self._wave = wave.open(str(self._audio_temporary), "wb")
-            self._wave.setnchannels(1)
-            self._wave.setsampwidth(2)
-            self._wave.setframerate(SAMPLE_RATE)
+        self._s1 = S1Cleanup(self.config)
 
-    def request_stop(self) -> None:
-        self.stop_event.set()
+    def _finalize_text(self, raw: str) -> str:
+        return self._s1.clean(raw) if raw.strip() else ""
 
-    def _submit_phrase(self, *, final: bool) -> None:
-        minimum_samples = round(float(self.config["vad_min_speech_seconds"]) * SAMPLE_RATE)
-        if self.speech_frames * VAD_FRAME_SAMPLES < minimum_samples:
-            return
-        if not final and self.pending_by_phrase.get(self.phrase_id):
-            return
-        self.revision += 1
-        request_id = self.worker.submit(
-            self.phrase_audio.snapshot(),
-            {
-                "session_id": self.session_id,
-                "phrase_id": self.phrase_id,
-                "revision": self.revision,
-                "final": final,
-            },
-            force=final,
-        )
-        if request_id is not None:
-            self.pending.add(request_id)
-            self.pending_by_phrase.setdefault(self.phrase_id, set()).add(request_id)
-            self.request_phrases[request_id] = self.phrase_id
-            self.last_provisional_at = time.monotonic()
-
-    def _finish_phrase(self) -> None:
-        if self.phrase_active:
-            self._submit_phrase(final=True)
-        self.phrase_id += 1
-        self.revision = 0
-        self.phrase_active = False
-        self.onset_frames = 0
-        self.speech_frames = 0
-        self.silence_frames = 0
-        self.phrase_audio.clear()
-        self.pre_roll.clear()
-
-    def _process_frame(self, frame: np.ndarray) -> None:
-        if self._wave is not None:
-            self._wave.writeframesraw(memoryview(frame).cast("B"))
-        probability = self.vad.probability(frame)
-        start_threshold = float(self.config["vad_start_threshold"])
-        end_threshold = float(self.config["vad_end_threshold"])
-        end_frames = max(
-            1,
-            round(float(self.config["phrase_silence_seconds"]) * SAMPLE_RATE / VAD_FRAME_SAMPLES),
-        )
-        onset_required = max(
-            1,
-            round(float(self.config["vad_onset_seconds"]) * SAMPLE_RATE / VAD_FRAME_SAMPLES),
-        )
-
-        if not self.phrase_active:
-            self.pre_roll.append(frame.copy())
-            self.onset_frames = self.onset_frames + 1 if probability >= start_threshold else 0
-            if self.onset_frames < onset_required:
-                return
-            self.phrase_active = True
-            for buffered in self.pre_roll:
-                self.phrase_audio.append(buffered)
-            self.speech_frames = self.onset_frames
-            self.silence_frames = 0
-            self.last_provisional_at = time.monotonic()
-            return
-
-        self.phrase_audio.append(frame)
-        if probability >= end_threshold:
-            self.speech_frames += 1
-            self.silence_frames = 0
-        else:
-            self.silence_frames += 1
-
-        now = time.monotonic()
-        if (
-            self.realtime
-            and len(self.phrase_audio) >= SAMPLE_RATE
-            and now - self.last_provisional_at >= float(self.config["realtime_interval_seconds"])
-        ):
-            self._submit_phrase(final=False)
-
-        max_samples = round(float(self.config["max_phrase_seconds"]) * SAMPLE_RATE)
-        if self.silence_frames >= end_frames or len(self.phrase_audio) >= max_samples:
-            self._finish_phrase()
-
-    def _handle_result(self, request_id: str, result: JsonObject) -> None:
-        self.pending.discard(request_id)
-        phrase_value = self.request_phrases.pop(request_id, None)
-        if phrase_value is not None:
-            phrase_pending = self.pending_by_phrase.get(phrase_value)
-            if phrase_pending is not None:
-                phrase_pending.discard(request_id)
-                if not phrase_pending:
-                    self.pending_by_phrase.pop(phrase_value, None)
-        if result.get("session_id") != self.session_id:
-            return
-        if result.get("error"):
-            LOG.error("ASR request failed: %s", result["error"])
-            return
-        text = str(result.get("text", "")).strip()
-        if not usable_transcript(text):
-            return
-        phrase_id = int(result["phrase_id"])
-        revision = int(result["revision"])
-        current = self.latest.get(phrase_id)
-        if current is not None and revision < current.revision:
-            return
-        final = bool(result.get("final"))
-        self.latest[phrase_id] = TranscriptRevision(revision, text, final)
-        if self.typer is not None:
-            try:
-                self.typer.update(phrase_id, text, final=final)
-            except Exception as exc:
-                LOG.error("Wayland typing failed: %s", exc)
-
-    def _drain_results(self) -> None:
-        for request_id in tuple(self.pending):
-            result = self.worker.pop_result(request_id)
-            if result is not None:
-                self._handle_result(request_id, result)
-
-    def _close_wave(self) -> None:
-        if self._wave is not None:
-            self._wave.close()
-            self._wave = None
-
-    def _save_outputs(self) -> str:
-        transcript = " ".join(self.latest[key].text for key in sorted(self.latest)).strip()
-        if transcript and self._s1 is not None:
-            cleaned = self._s1.normalize(transcript)
-            if cleaned and cleaned != transcript:
-                LOG.info("S1-mini cleaned transcript (%d -> %d chars)", len(transcript), len(cleaned))
-                transcript = cleaned
-        state_dir = require_private_directory(Path(self.config["state_dir"]), create=True)
-        transcript_dir = require_private_directory(state_dir / "transcripts", create=True)
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-
-        if transcript:
-            output = transcript_dir / f"capture-{stamp}-{self.session_id[:8]}.txt"
-            atomic_write_text(output, transcript + "\n")
-            if not self.realtime and bool(self.config["push_type_at_end"]):
-                try:
-                    WaylandTyper().type_text(transcript)
-                except Exception as exc:
-                    LOG.error("push-mode Wayland typing failed: %s", exc)
-            if self.config["output_mode"] in {"clipboard", "both", "realtime-both"}:
-                if not copy_to_clipboard(transcript):
-                    LOG.warning("could not copy transcript to the Wayland clipboard")
-            send_notification("Transcription complete", transcript[:220])
-            LOG.info("saved transcript to %s", output)
-        else:
-            send_notification("No speech detected", "No transcript was produced")
-
-        if self._audio_temporary is not None:
-            audio_dir = require_private_directory(state_dir / "audio", create=True)
-            destination = audio_dir / f"capture-{stamp}-{self.session_id[:8]}.wav"
-            os.replace(self._audio_temporary, destination)
-            os.chmod(destination, 0o600)
-        return transcript
+    def _publish(self, final_text: str) -> str:
+        if not final_text:
+            return ""
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        out_dir = Path(str(self.config.get("state_dir", "~/.local/state/dusky-stt"))).expanduser() / "transcripts"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(out_dir / f"capture-{stamp}-{self.session_id[:8]}.txt", final_text + "\n")
+        if not self.realtime and self.config.get("push_type_at_end", True):
+            subprocess.run(["wtype", "-"], input=final_text.encode(), check=False)
+        subprocess.run(["wl-copy", "--type", "text/plain;charset=utf-8"], input=final_text.encode(), check=False)
+        if self.config.get("notifications", True):
+            subprocess.run(["notify-send", "-a", "Dusky STT", "-t", "3500",
+                            "Transcription complete", final_text[:220]], check=False)
+        return final_text
 
     def run(self) -> str:
-        LOG.info("recording session %s started realtime=%s", self.session_id, self.realtime)
-        device = self.config.get("input_device")
-        if isinstance(device, str) and device.lstrip("-").isdecimal():
-            device = int(device)
-        try:
-            with sd.RawInputStream(
-                samplerate=SAMPLE_RATE,
-                blocksize=VAD_FRAME_SAMPLES,
-                device=device if device not in (None, "") else None,
-                channels=1,
-                dtype="int16",
-                latency="low",
-            ) as stream:
-                while not self.stop_event.is_set():
-                    packet, overflowed = stream.read(VAD_FRAME_SAMPLES)
-                    if overflowed:
-                        self.overflow_count += 1
-                    frame = np.frombuffer(packet, dtype="<i2", count=VAD_FRAME_SAMPLES).copy()
-                    self._process_frame(frame)
-                    self._drain_results()
+        dev = self.config.get("input_device")
+        with sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=VAD_FRAME_SAMPLES, channels=1,
+                               dtype="int16", latency="low", device=dev) as stream:
+            active = False
+            onset = silence = 0
+            onset_target = max(1, round(float(self.config.get("vad_onset_seconds", 0.096)) * SAMPLE_RATE / VAD_FRAME_SAMPLES))
+            silence_target = max(1, round(float(self.config.get("phrase_silence_seconds", 0.80)) * SAMPLE_RATE / VAD_FRAME_SAMPLES))
+            min_speech = int(float(self.config.get("vad_min_speech_seconds", 0.25)) * SAMPLE_RATE)
+            last_interim = time.monotonic()
+            while not self.stop_event.is_set():
+                raw, _ = stream.read(VAD_FRAME_SAMPLES)
+                frame = np.frombuffer(raw, dtype="<i2").copy()
+                prob = self.vad.probability(frame)
+                if not active:
+                    self.pre_roll.append(frame)
+                    onset = onset + 1 if prob >= float(self.config.get("vad_start_threshold", 0.50)) else 0
+                    if onset >= onset_target:
+                        active = True
+                        self.phrase_id += 1
+                        self.ring.reset()
+                        for p in self.pre_roll:
+                            self.ring.append(p)
+                        if self.typer:
+                            self.typer.reset()
+                else:
+                    self.ring.append(frame)
+                    silence = silence + 1 if prob < float(self.config.get("vad_end_threshold", 0.35)) else 0
+                    now = time.monotonic()
+                    if self.realtime and (now - last_interim) >= float(self.config.get("realtime_interval_seconds", 1.2)):
+                        last_interim = now
+                        if len(self.ring) >= min_speech:
+                            req = self.daemon.worker.submit(self.ring.read(), {"session_id": self.session_id,
+                                "phrase_id": self.phrase_id, "final": False}, force=False)
+                            if req:
+                                res = self.daemon.worker.wait_result(req, 1.0)
+                                if res and res.get("text") and res.get("ok", True) and self.typer:
+                                    self.typer.update(res["text"], final=False)
+                    max_samples = int(float(self.config.get("max_phrase_seconds", 15.0)) * SAMPLE_RATE)
+                    if silence >= silence_target or len(self.ring) >= max_samples:
+                        active = False
+                        onset = silence = 0
+                        if len(self.ring) >= min_speech:
+                            req = self.daemon.worker.submit(self.ring.read(), {"session_id": self.session_id,
+                                "phrase_id": self.phrase_id, "final": True}, force=True)
+                            if req:
+                                res = self.daemon.worker.wait_result(req, float(self.config.get("finalize_timeout_seconds", 120.0)))
+                                if res and res.get("text") and res.get("ok", True):
+                                    txt = res["text"].strip()
+                                    if self.typer:
+                                        self.typer.update(txt, final=True)
+                                    self.phrases.append(txt)
+                        self.vad.reset()
+                        if self.ring.dropped_samples:
+                            LOG.warning("Ring overflow dropped %d samples", self.ring.dropped_samples)
+        return self._publish(self._finalize_text(" ".join(self.phrases)))
 
-            self._finish_phrase()
-            deadline = time.monotonic() + float(self.config["finalize_timeout_seconds"])
-            while self.pending and time.monotonic() < deadline:
-                self._drain_results()
-                if self.pending:
-                    time.sleep(0.05)
-            if self.pending:
-                LOG.error("finalization timed out with %d ASR requests pending", len(self.pending))
-                for request_id in tuple(self.pending):
-                    self.worker.discard(request_id)
-            self._close_wave()
-            return self._save_outputs()
-        finally:
-            self._close_wave()
-            if self._audio_temporary is not None:
-                self._audio_temporary.unlink(missing_ok=True)
-            if self.overflow_count:
-                LOG.warning("PortAudio reported %d input overflows", self.overflow_count)
-
-
-class FileTranscriber:
-    def __init__(self, config: JsonObject, worker: WorkerManager) -> None:
-        self.config = config
-        self.worker = worker
-        self.session_id = uuid.uuid4().hex
-        self.vad = StatefulSileroVad(APP_DIR / "models" / "silero_vad.onnx")
-        self.parts: list[str] = []
-        self._s1: S1Cleanup | None = None
-        if bool(config.get("llm_enabled", False)):
-            try:
-                self._s1 = S1Cleanup(config)
-            except Exception as exc:
-                LOG.warning("S1-mini cleanup disabled for file transcription: %s", exc)
-
-    def _transcribe_segment(self, segment: list[np.ndarray], index: int) -> None:
-        if not segment:
-            return
-        audio = np.concatenate(segment).astype("<i2", copy=False)
-        request_id = self.worker.submit(
-            audio,
-            {
-                "session_id": self.session_id,
-                "phrase_id": index,
-                "revision": 1,
-                "final": True,
-            },
-            force=True,
-        )
-        if request_id is None:
-            raise RuntimeError("failed to queue file segment")
-        result = self.worker.wait_result(request_id, float(self.config["finalize_timeout_seconds"]))
-        if result.get("error"):
-            raise RuntimeError(str(result["error"]))
-        text = str(result.get("text", "")).strip()
-        if usable_transcript(text):
-            self.parts.append(text)
-
-    def run(self, source: Path) -> str:
-        if not source.is_file():
-            raise FileNotFoundError(source)
-        ffmpeg = shutil.which("ffmpeg")
-        if ffmpeg is None:
-            raise RuntimeError("ffmpeg is required for file transcription")
-        process = subprocess.Popen(
-            [
-                ffmpeg,
-                "-nostdin",
-                "-v",
-                "error",
-                "-i",
-                str(source),
-                "-map",
-                "0:a:0",
-                "-ac",
-                "1",
-                "-ar",
-                str(SAMPLE_RATE),
-                "-af",
-                "aresample=resampler=soxr:precision=28",
-                "-f",
-                "s16le",
-                "pipe:1",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        assert process.stdout is not None
-        assert process.stderr is not None
-        stderr_chunks: deque[bytes] = deque(maxlen=16)
-
-        def drain_stderr() -> None:
-            while chunk := process.stderr.read(64 * 1024):
-                stderr_chunks.append(chunk)
-
-        stderr_thread = threading.Thread(
-            target=drain_stderr,
-            name=f"dusky-ffmpeg-stderr-{self.session_id[:8]}",
-            daemon=True,
-        )
-        stderr_thread.start()
-
-        pre_roll: deque[np.ndarray] = deque(
-            maxlen=max(1, round(float(self.config["pre_roll_seconds"]) * SAMPLE_RATE / VAD_FRAME_SAMPLES))
-        )
-        active: list[np.ndarray] = []
-        active_samples = 0
-        onset_frames = 0
-        speech_frames = 0
-        silence_frames = 0
-        segment_index = 0
-        max_samples = round(float(self.config["file_chunk_seconds"]) * SAMPLE_RATE)
-        end_frames = max(
-            1,
-            round(float(self.config["phrase_silence_seconds"]) * SAMPLE_RATE / VAD_FRAME_SAMPLES),
-        )
-        onset_required = max(
-            1,
-            round(float(self.config["vad_onset_seconds"]) * SAMPLE_RATE / VAD_FRAME_SAMPLES),
-        )
-        byte_buffer = bytearray()
-        frame_bytes = VAD_FRAME_SAMPLES * 2
-
-        try:
-            while block := process.stdout.read(64 * 1024):
-                byte_buffer.extend(block)
-                offset = 0
-                while len(byte_buffer) - offset >= frame_bytes:
-                    frame = np.frombuffer(
-                        byte_buffer,
-                        dtype="<i2",
-                        count=VAD_FRAME_SAMPLES,
-                        offset=offset,
-                    ).copy()
-                    offset += frame_bytes
-                    probability = self.vad.probability(frame)
-
-                    if not active:
-                        pre_roll.append(frame)
-                        onset_frames = onset_frames + 1 if probability >= float(
-                            self.config["vad_start_threshold"]
-                        ) else 0
-                        if onset_frames < onset_required:
-                            continue
-                        active = list(pre_roll)
-                        active_samples = sum(item.size for item in active)
-                        speech_frames = onset_frames
-                        silence_frames = 0
-                        continue
-
-                    active.append(frame)
-                    active_samples += frame.size
-                    if probability >= float(self.config["vad_end_threshold"]):
-                        speech_frames += 1
-                        silence_frames = 0
-                    else:
-                        silence_frames += 1
-
-                    if silence_frames >= end_frames or active_samples >= max_samples:
-                        minimum_samples = round(float(self.config["vad_min_speech_seconds"]) * SAMPLE_RATE)
-                        if speech_frames * VAD_FRAME_SAMPLES >= minimum_samples:
-                            self._transcribe_segment(active, segment_index)
-                        segment_index += 1
-                        active = []
-                        active_samples = 0
-                        onset_frames = 0
-                        speech_frames = 0
-                        silence_frames = 0
-                        pre_roll.clear()
-                if offset:
-                    del byte_buffer[:offset]
-
-            if active:
-                minimum_samples = round(float(self.config["vad_min_speech_seconds"]) * SAMPLE_RATE)
-                if speech_frames * VAD_FRAME_SAMPLES >= minimum_samples:
-                    self._transcribe_segment(active, segment_index)
-            return_code = process.wait(timeout=10)
-            stderr_thread.join(timeout=2)
-            stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace")
-            if return_code != 0:
-                raise RuntimeError(f"ffmpeg failed ({return_code}): {stderr[-1000:]}")
-        finally:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=3)
-            stderr_thread.join(timeout=2)
-
-        transcript = " ".join(self.parts).strip()
-        if transcript and self._s1 is not None:
-            cleaned = self._s1.normalize(transcript)
-            if cleaned and cleaned != transcript:
-                LOG.info("S1-mini cleaned file transcript (%d -> %d chars)", len(transcript), len(cleaned))
-                transcript = cleaned
-        if transcript:
-            state_dir = require_private_directory(Path(self.config["state_dir"]), create=True)
-            transcript_dir = require_private_directory(state_dir / "transcripts", create=True)
-            stamp = time.strftime("%Y%m%d-%H%M%S")
-            output = transcript_dir / f"{source.stem}-{stamp}-{self.session_id[:8]}.txt"
-            atomic_write_text(output, transcript + "\n")
-            copy_to_clipboard(transcript)
-            send_notification("File transcription complete", source.name)
-            LOG.info("saved file transcript to %s", output)
-        else:
-            send_notification("No speech detected", source.name)
-        return transcript
-
-
-def process_rss_kib() -> int:
-    for line in Path("/proc/self/status").read_text(encoding="utf-8").splitlines():
-        if line.startswith("VmRSS:"):
-            return int(line.split()[1])
-    return -1
+    def run_file(self, path: Path) -> str:
+        chunks = decode_file_to_pcm(path, float(self.config.get("file_chunk_seconds", 25.0)))
+        texts: list[str] = []
+        for i, ch in enumerate(chunks):
+            if self.stop_event.is_set():
+                break
+            req = self.daemon.worker.submit(ch, {"session_id": self.session_id, "phrase_id": i + 1, "final": True}, force=True)
+            if not req:
+                continue
+            res = self.daemon.worker.wait_result(req, float(self.config.get("finalize_timeout_seconds", 120.0)))
+            if res and res.get("text") and res.get("ok", True):
+                texts.append(res["text"].strip())
+        return self._publish(self._finalize_text(" ".join(texts)))
 
 
 class DuskyDaemon:
-    def __init__(self, config: JsonObject) -> None:
-        self.config = config
-        self.worker = WorkerManager(config)
-        self._state_lock = threading.RLock()
-        self._state = "idle"
+    def __init__(self, config_path: Path) -> None:
+        self.config = json.loads(config_path.read_text(encoding="utf-8"))
+        if self.config.get("schema_version") != 2:
+            raise RuntimeError("config schema_version must be 2")
+        self.worker = WorkerManager(self.config)
+        self.state = "idle"
+        self._lock = threading.RLock()
         self._session: RecordingSession | None = None
-        self._shutdown = threading.Event()
-        self._listener: socket.socket | None = None
-        self._socket_identity: tuple[int, int] | None = None
+        self._file_session: RecordingSession | None = None
+        self._stop = threading.Event()
+        self._start_time = time.monotonic()
+        rt = os.environ.get("XDG_RUNTIME_DIR")
+        if not rt:
+            raise RuntimeError("XDG_RUNTIME_DIR unset")
+        self.control_path = Path(rt) / "dusky-stt" / "control.sock"
+        self._listener = self._bind_socket()
 
-    def _set_state(self, state: str) -> None:
-        with self._state_lock:
-            self._state = state
-        systemd_notify(f"STATUS=Dusky STT: {state}")
+    def _bind_socket(self) -> socket.socket:
+        self.control_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.control_path.parent, 0o700)
+        self.control_path.unlink(missing_ok=True)
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC)
+        old = os.umask(0o177)
+        try:
+            s.bind(str(self.control_path))
+        finally:
+            os.umask(old)
+        os.chmod(self.control_path, 0o600)
+        s.listen(16)
+        s.setblocking(False)
+        return s
 
     def status(self) -> JsonObject:
-        with self._state_lock:
-            return {
-                "ok": True,
-                "state": self._state,
-                "daemon_pid": os.getpid(),
-                "daemon_rss_kib": process_rss_kib(),
-                "worker_pid": self.worker.pid,
-                "worker_inflight": self.worker.inflight,
-                "backend": "cuda13",
-                "model": self.config["model"],
-                "quantization": self.config["quantization"],
-            }
+        with self._lock:
+            return {"ok": True, "state": self.state, "pid": os.getpid(), "worker_pid": self.worker.pid,
+                    "hardware": self.config.get("hardware", "cpu"),
+                    "uptime_seconds": round(time.monotonic() - self._start_time, 1),
+                    "rss_kib": self._rss(), "cuda_maps": cuda_maps(),
+                    "dropped_samples": self._session.ring.dropped_samples if self._session else 0}
 
-    def _recording_thread(self, session: RecordingSession) -> None:
+    @staticmethod
+    def _rss() -> int:
         try:
-            session.run()
-        except Exception as exc:
-            LOG.exception("recording session failed")
-            send_notification("Dusky STT failed", str(exc), critical=True)
-        finally:
-            with self._state_lock:
-                if self._session is session:
-                    self._session = None
-                    self._state = "idle"
-            systemd_notify("STATUS=Dusky STT: idle")
-
-    def start_recording(self, realtime: bool) -> JsonObject:
-        with self._state_lock:
-            if self._state != "idle":
-                return {"ok": False, "error": f"daemon is busy ({self._state})"}
-            session = RecordingSession(self.config, self.worker, realtime)
-            self._session = session
-            self._state = "recording-realtime" if realtime else "recording-push"
-            threading.Thread(
-                target=self._recording_thread,
-                args=(session,),
-                name="dusky-recording",
-                daemon=True,
-            ).start()
-        systemd_notify(f"STATUS=Dusky STT: {self._state}")
-        return {"ok": True, "state": self._state, "session_id": session.session_id}
-
-    def stop_recording(self) -> JsonObject:
-        with self._state_lock:
-            if self._session is None or not self._state.startswith("recording-"):
-                return {"ok": False, "error": f"not recording ({self._state})"}
-            self._state = "finalizing"
-            self._session.request_stop()
-        systemd_notify("STATUS=Dusky STT: finalizing")
-        return {"ok": True, "state": "finalizing"}
-
-    def toggle(self, realtime: bool) -> JsonObject:
-        with self._state_lock:
-            recording = self._state.startswith("recording-")
-        return self.stop_recording() if recording else self.start_recording(realtime)
-
-    def _file_thread(self, source: Path) -> None:
-        try:
-            FileTranscriber(self.config, self.worker).run(source)
-        except Exception as exc:
-            LOG.exception("file transcription failed")
-            send_notification("File transcription failed", str(exc), critical=True)
-        finally:
-            self._set_state("idle")
-
-    def start_file(self, source_text: str) -> JsonObject:
-        source = Path(source_text).expanduser().resolve()
-        with self._state_lock:
-            if self._state != "idle":
-                return {"ok": False, "error": f"daemon is busy ({self._state})"}
-            if not source.is_file():
-                return {"ok": False, "error": f"file not found: {source}"}
-            self._state = "transcribing-file"
-            threading.Thread(
-                target=self._file_thread,
-                args=(source,),
-                name="dusky-file",
-                daemon=True,
-            ).start()
-        systemd_notify("STATUS=Dusky STT: transcribing-file")
-        return {"ok": True, "state": "transcribing-file", "file": str(source)}
-
-    def handle_command(self, request: JsonObject) -> JsonObject:
-        command = request.get("command")
-        if command == "status":
-            return self.status()
-        if command == "start":
-            return self.start_recording(bool(request.get("realtime", True)))
-        if command == "stop":
-            return self.stop_recording()
-        if command == "toggle":
-            return self.toggle(bool(request.get("realtime", True)))
-        if command == "file":
-            return self.start_file(str(request.get("path", "")))
-        return {"ok": False, "error": "unsupported command"}
-
-    def _prepare_control_socket(self) -> socket.socket:
-        if CONTROL_PATH.exists() or CONTROL_PATH.is_symlink():
-            existing = os.lstat(CONTROL_PATH)
-            if existing.st_uid != os.getuid():
-                raise RuntimeError("control path is owned by another user")
-            if not stat.S_ISSOCK(existing.st_mode):
-                raise RuntimeError("refusing to replace a non-socket control path")
-            CONTROL_PATH.unlink()
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC)
-        old_umask = os.umask(0o077)
-        try:
-            listener.bind(str(CONTROL_PATH))
-        finally:
-            os.umask(old_umask)
-        os.chmod(CONTROL_PATH, 0o600)
-        metadata = os.lstat(CONTROL_PATH)
-        self._socket_identity = (metadata.st_dev, metadata.st_ino)
-        listener.listen(16)
-        listener.settimeout(0.5)
-        return listener
-
-    def _control_loop(self) -> None:
-        assert self._listener is not None
-        while not self._shutdown.is_set():
-            try:
-                connection, _address = self._listener.accept()
-            except TimeoutError:
-                continue
-            except OSError:
-                if self._shutdown.is_set():
-                    return
-                raise
-            with connection:
-                try:
-                    credentials = connection.getsockopt(
-                        socket.SOL_SOCKET,
-                        socket.SO_PEERCRED,
-                        PEERCRED_SIZE,
-                    )
-                    _pid, uid, _gid = struct.unpack("3i", credentials)
-                    if uid != os.getuid():
-                        response = {"ok": False, "error": "peer uid rejected"}
-                    else:
-                        packet = recv_seqpacket(connection)
-                        if not packet:
-                            continue
-                        request = json.loads(packet.decode("utf-8"))
-                        if not isinstance(request, dict):
-                            raise ValueError("request must be a JSON object")
-                        response = self.handle_command(request)
-                except Exception as exc:
-                    LOG.warning("control request rejected: %s", exc)
-                    response = {"ok": False, "error": str(exc)[:500]}
-                encoded = json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode()
-                if len(encoded) > MAX_PACKET:
-                    encoded = b'{"ok":false,"error":"response exceeds packet limit"}'
-                try:
-                    connection.send(encoded)
-                except OSError:
-                    LOG.debug("control peer disconnected before response", exc_info=True)
-
-    def _unlink_owned_socket(self) -> None:
-        if self._socket_identity is None:
-            return
-        try:
-            metadata = os.lstat(CONTROL_PATH)
-        except FileNotFoundError:
-            return
-        if (
-            stat.S_ISSOCK(metadata.st_mode)
-            and (metadata.st_dev, metadata.st_ino) == self._socket_identity
-        ):
-            CONTROL_PATH.unlink()
+            for line in Path("/proc/self/status").read_text().splitlines():
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+        except OSError:
+            pass
+        return 0
 
     def run(self) -> int:
-        def handle_signal(signum: int, frame: Any) -> None:
-            del signum, frame
-            self._shutdown.set()
-            with self._state_lock:
-                if self._session is not None:
-                    self._session.request_stop()
-
-        signal.signal(signal.SIGTERM, handle_signal)
-        signal.signal(signal.SIGINT, handle_signal)
-        self._listener = self._prepare_control_socket()
-        threading.Thread(target=self._control_loop, name="dusky-control", daemon=True).start()
-        LOG.info("control socket ready at %s", CONTROL_PATH)
+        signal.signal(signal.SIGTERM, lambda *_: self._stop.set())
+        signal.signal(signal.SIGINT, lambda *_: self._stop.set())
+        sel = selectors.DefaultSelector()
+        sel.register(self._listener, selectors.EVENT_READ)
+        interval = watchdog_interval()
         systemd_notify("READY=1\nSTATUS=Dusky STT: idle")
-        heartbeat = watchdog_interval()
-
+        nxt = time.monotonic() + interval if interval else 0.0
         try:
-            while not self._shutdown.wait(heartbeat):
-                systemd_notify("WATCHDOG=1")
-            with self._state_lock:
-                session = self._session
-            if session is not None:
-                session.request_stop()
-                deadline = time.monotonic() + 12
-                while self._session is not None and time.monotonic() < deadline:
-                    time.sleep(0.1)
-            return 0
+            while not self._stop.is_set():
+                timeout = max(0.05, min(0.5, nxt - time.monotonic())) if interval else 0.5
+                for key, _ in sel.select(timeout=timeout):
+                    if key.fileobj is self._listener:
+                        try:
+                            conn, _ = self._listener.accept()
+                        except (BlockingIOError, OSError):
+                            continue
+                        threading.Thread(target=self._handle_conn, args=(conn,), daemon=True).start()
+                if interval and time.monotonic() >= nxt:
+                    systemd_notify("WATCHDOG=1")
+                    nxt = time.monotonic() + interval
         finally:
-            systemd_notify("STOPPING=1\nSTATUS=Dusky STT: stopping")
-            if self._listener is not None:
-                self._listener.close()
+            systemd_notify("STOPPING=1")
+            sel.close()
+            self._listener.close()
             self.worker.stop()
-            self._unlink_owned_socket()
+            self.control_path.unlink(missing_ok=True)
+        return 0
 
+    def _handle_conn(self, conn: socket.socket) -> None:
+        with conn:
+            try:
+                cred = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+                _, uid, _ = struct.unpack("3i", cred)
+                if uid != os.getuid():
+                    return
+                data = conn.recv(MAX_PACKET)
+                if not data:
+                    return
+                req = json.loads(data.decode("utf-8"))
+            except (OSError, ValueError):
+                return
+            cmd = req.get("command")
+            resp: JsonObject = {"ok": False, "error": f"unknown command {cmd!r}"}
+            with self._lock:
+                if cmd == "status":
+                    resp = self.status()
+                elif cmd in ("start", "toggle"):
+                    if self.state == "idle":
+                        realtime = req.get("mode", "realtime") != "push"
+                        self._session = RecordingSession(self, realtime)
+                        threading.Thread(target=self._run_session, args=(self._session, False, None), daemon=True).start()
+                        resp = {"ok": True, "state": "recording"}
+                    elif cmd == "toggle" and self._session:
+                        self._session.stop_event.set()
+                        resp = {"ok": True, "state": "finalizing"}
+                    else:
+                        resp = {"ok": False, "error": "already recording", "state": self.state}
+                elif cmd == "stop":
+                    if self._session:
+                        self._session.stop_event.set()
+                        resp = {"ok": True, "state": "finalizing"}
+                    else:
+                        resp = {"ok": False, "error": "not recording", "state": self.state}
+                elif cmd == "file":
+                    if self.state == "idle":
+                        try:
+                            p = Path(str(req.get("path", ""))).expanduser()
+                            if not p.is_file():
+                                # PrivateTmp=yes gives the daemon a private /tmp:
+                                # host /tmp files are invisible by design.
+                                resp = {"ok": False, "error": f"file not found (sandbox: place files under $HOME, not /tmp): {p}"}
+                            else:
+                                self._session = RecordingSession(self, False)
+                                threading.Thread(target=self._run_session, args=(self._session, True, p), daemon=True).start()
+                                resp = {"ok": True, "state": "transcribing"}
+                        except (OSError, ValueError) as exc:
+                            resp = {"ok": False, "error": str(exc)}
+                    else:
+                        resp = {"ok": False, "error": "busy", "state": self.state}
+            try:
+                conn.sendall(json.dumps(resp).encode())
+            except OSError:
+                pass
 
-def load_config() -> JsonObject:
-    metadata = os.lstat(CONFIG_PATH)
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
-        raise RuntimeError("config.json must be a regular file owned by the service user")
-    config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    for key, default in {
-        "llm_enabled": True,
-        "llm_endpoint": "http://localhost:11434",
-        "llm_model": "s1-mini",
-        "llm_cleanup_style": "semi-formal",
-        "llm_cleanup_structure": "prose",
-        "llm_cleanup_context": "general",
-        "llm_timeout_seconds": 60,
-        "llm_max_tokens": 2048,
-    }.items():
-        config.setdefault(key, default)
-    required = {
-        "schema_version",
-        "model",
-        "model_dir",
-        "quantization",
-        "gpu_device",
-        "gpu_mem_limit_mb",
-        "state_dir",
-        "idle_timeout_seconds",
-        "max_inflight_requests",
-        "worker_queue_timeout_seconds",
-        "realtime_interval_seconds",
-        "finalize_timeout_seconds",
-        "max_phrase_seconds",
-        "file_chunk_seconds",
-        "pre_roll_seconds",
-        "phrase_silence_seconds",
-        "vad_onset_seconds",
-        "vad_min_speech_seconds",
-        "vad_start_threshold",
-        "vad_end_threshold",
-        "stable_holdback_words",
-        "silero_sha256",
-        "output_mode",
-        "push_type_at_end",
-        "keep_audio",
-    }
-    missing = required.difference(config)
-    if missing:
-        raise RuntimeError(f"configuration is missing keys: {sorted(missing)}")
-    if config["schema_version"] != 2:
-        raise RuntimeError("unsupported configuration schema")
-    if config["model"] not in {
-        "nemo-parakeet-tdt-0.6b-v2",
-        "nemo-parakeet-tdt-0.6b-v3",
-    }:
-        raise RuntimeError("unsupported onnx-asr Parakeet model")
-    if config["quantization"] not in {"int8", "fp16", "fp32"}:
-        raise RuntimeError("unsupported quantization")
-    if int(config["max_inflight_requests"]) not in {1, 2}:
-        raise RuntimeError("max_inflight_requests must be one or two")
-    if not 0.0 < float(config["vad_end_threshold"]) <= float(config["vad_start_threshold"]) < 1.0:
-        raise RuntimeError("VAD thresholds are invalid")
-    if config["llm_cleanup_style"] not in {"casual", "semi-casual", "semi-formal", "formal"}:
-        raise RuntimeError("unsupported LLM cleanup styling")
-    if config["llm_cleanup_structure"] not in {"prose", "lists"}:
-        raise RuntimeError("unsupported LLM cleanup structure")
-    if config["llm_cleanup_context"] not in {"general", "email"}:
-        raise RuntimeError("unsupported LLM cleanup context")
-    vad_path = APP_DIR / "models" / "silero_vad.onnx"
-    digest = hashlib.sha256()
-    with vad_path.open("rb") as model_file:
-        while chunk := model_file.read(1024 * 1024):
-            digest.update(chunk)
-    if digest.hexdigest() != config["silero_sha256"]:
-        raise RuntimeError("Silero VAD integrity check failed")
-    require_private_directory(Path(config["state_dir"]), create=True)
-    return config
+    def _run_session(self, sess: RecordingSession, is_file: bool, path: Path | None) -> None:
+        self.state = "transcribing" if is_file else "recording"
+        systemd_notify(f"STATUS=Dusky STT: {self.state}")
+        try:
+            sess.run_file(path) if (is_file and path) else sess.run()
+        except Exception as exc:
+            LOG.error("Session failed: %s", exc)
+        finally:
+            with self._lock:
+                self.state = "idle"
+                self._session = None
+            systemd_notify("STATUS=Dusky STT: idle")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Dusky STT CPU daemon")
-    parser.add_argument("--daemon", action="store_true", required=True)
-    parser.parse_args()
+    global APP_DIR, CONFIG_PATH
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", type=Path, default=CONFIG_PATH)
+    ap.add_argument("--check-cpu-isolation", action="store_true")
+    args = ap.parse_args()
+    CONFIG_PATH = args.config
+    APP_DIR = Path(os.environ.get("DUSKY_APP_DIR", args.config.parent if args.config.name == "config.json" else APP_DIR))
     assert_cpu_ort_namespace()
-    assert_no_cuda_mappings()
-    return DuskyDaemon(load_config()).run()
+    if args.check_cpu_isolation:
+        print(json.dumps({"ok": True, "isolation": "clean", "cuda_maps": cuda_maps()}))
+        return 0
+    return DuskyDaemon(CONFIG_PATH).run()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
