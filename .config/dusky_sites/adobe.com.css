@@ -32,5 +32,6 @@
     div.universal-nav-divider { background: var(--primary_container) !important; color: var(--on_primary_container, var(--surface)) !important; } /* bg: primary_container */
     div.community-product-mneumonic__post-stats { color: var(--secondary) !important; } /* text: secondary */
     div.community-product-mneumonic__post-stats { background: var(--primary) !important; color: var(--on_primary, var(--surface)) !important; } /* bg: primary */
+    h1.ufd-page__heading { background: var(--primary_container) !important; color: var(--on_primary_container, var(--surface)) !important; } /* bg: primary_container */
     /* <<< dusky:picks */
 }
