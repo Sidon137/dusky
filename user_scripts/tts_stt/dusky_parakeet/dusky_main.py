@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Dusky STT CPU daemon (hardware-agnostic).
 
-Owns capture, stateful Silero VAD, append-only typing, S1-mini cleanup,
-file transcription, and the control plane. ASR runs in an on-demand worker
-(.venv-worker) whose EP matches config hardware: CUDA / CPU (+opportunistic
-MIGraphX/ROCM on AMD). Audio crosses via sealed memfds over SOCK_SEQPACKET.
+Owns capture, stateful Silero VAD, append-only typing, file transcription,
+and the control plane. ASR runs in an on-demand worker (.venv-worker) whose
+EP matches config hardware: CUDA / CPU (+opportunistic MIGraphX/ROCM on
+AMD). Audio crosses via sealed memfds over SOCK_SEQPACKET.
+
+Transcripts are pure Parakeet output: the model already emits punctuated,
+capitalized text at ~6% WER, so there is deliberately no LLM cleanup stage
+(no Ollama server, no extra VRAM/RAM, no rewrite risk, no added latency).
 """
 
 import argparse
@@ -15,6 +19,7 @@ import json
 import logging
 import mmap
 import os
+import queue
 import selectors
 import signal
 import socket
@@ -23,7 +28,6 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.request
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -238,6 +242,23 @@ class WorkerManager:
     def _spawn_locked(self) -> None:
         if self._proc and self._proc.poll() is None and self._sock:
             return
+        # Reap a dead predecessor before overwriting (else zombie Popen +
+        # leaked socketpair fd); the old reader thread already closes its sock.
+        if self._proc is not None and self._proc.poll() is not None:
+            try:
+                self._proc.wait(timeout=5)
+            except (subprocess.TimeoutExpired, OSError):
+                try:
+                    self._proc.kill()
+                except OSError:
+                    pass
+            if self._sock is not None:
+                try:
+                    self._sock.close()
+                except OSError:
+                    pass
+            self._proc = None
+            self._sock = None
         parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC)
         for s in (parent, child):
             try:
@@ -275,6 +296,10 @@ class WorkerManager:
             for req_id, g in list(self._inflight.items()):
                 if g == gen and req_id not in self._results:
                     self._results[req_id] = {"ok": False, "request_id": req_id, "error": reason}
+                    # Free the slot: without this two worker crashes pin
+                    # len(_inflight) == limit forever and the next
+                    # submit(force=True) spins forever (extended-session deadlock).
+                    self._inflight.pop(req_id, None)
             self._cv.notify_all()
 
     def _reader_loop(self, gen: int, proc: subprocess.Popen[bytes], sock: socket.socket) -> None:
@@ -324,6 +349,9 @@ class WorkerManager:
                 else:
                     for fd in fds:
                         os.close(fd)
+                    if resp.get("payload") == "memfd":
+                        resp = {"ok": False, "request_id": resp.get("request_id"),
+                                "error": "worker memfd reply arrived without fd"}
                 req_id = resp.get("request_id")
                 with self._cv:
                     self._inflight.pop(req_id, None)
@@ -365,22 +393,64 @@ class WorkerManager:
                                    [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("i", fd))])
             except OSError:
                 self._inflight.pop(req_id, None)
+                # Dead-socket race (worker idle-exited before the reader
+                # reaped it): drop the stale handles so the retry respawns.
+                try:
+                    self._sock.close()
+                except OSError:
+                    pass
+                self._proc = None
+                self._sock = None
                 raise
             finally:
                 os.close(fd)
             return req_id
 
-    def wait_result(self, req_id: str, timeout: float) -> JsonObject | None:
+    def wait_result(self, req_id: str, timeout: float, stop: threading.Event | None = None) -> JsonObject | None:
         deadline = time.monotonic() + timeout
         with self._cv:
             while req_id not in self._results:
+                if stop is not None and stop.is_set():
+                    self._discarded.add(req_id)
+                    if len(self._discarded) > 128:
+                        self._discarded.pop()
+                    self._inflight.pop(req_id, None)
+                    return None
                 rem = deadline - time.monotonic()
                 if rem <= 0:
                     self._discarded.add(req_id)
+                    if len(self._discarded) > 128:
+                        self._discarded.pop()
                     self._inflight.pop(req_id, None)
                     return None
                 self._cv.wait(min(rem, 0.2))
+            self._inflight.pop(req_id, None)
             return self._results.pop(req_id)
+
+    def poll(self, req_id: str) -> JsonObject | None:
+        """Non-blocking collect: return the result if it has arrived, else
+        None. Never discards, never waits: the capture loop calls this once
+        per 32 ms audio frame so the microphone stalls for exactly 0 s."""
+        with self._cv:
+            if req_id not in self._results:
+                return None
+            self._inflight.pop(req_id, None)
+            return self._results.pop(req_id)
+
+    def cancel(self, req_id: str) -> None:
+        """Abandon a superseded interim: drop it if already answered, else
+        mark it discarded so the late reply is dropped on arrival instead of
+        leaking in _results forever."""
+        with self._cv:
+            if req_id in self._results:
+                self._results.pop(req_id, None)
+                self._inflight.pop(req_id, None)
+            else:
+                self._discarded.add(req_id)
+                if len(self._discarded) > 128:
+                    self._discarded.pop()
+                self._inflight.pop(req_id, None)
+            self._cv.notify_all()
 
     def stop(self) -> None:
         with self._cv:
@@ -396,33 +466,10 @@ class WorkerManager:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
-
-
-class S1Cleanup:
-    SYSTEM = ("You are a text normalizer for speech-to-text transcripts. Output only the cleaned text.")
-    def __init__(self, config: JsonObject) -> None:
-        self.enabled = bool(config.get("llm_enabled", True))
-        self.endpoint = f"{config.get('llm_endpoint', 'http://127.0.0.1:11434')}/api/generate"
-        self.model = str(config.get("llm_model", "s1-mini"))
-        self.timeout = float(config.get("llm_timeout_seconds", 20.0))
-        self.max_tokens = int(config.get("llm_max_tokens", 2048))
-
-    def clean(self, transcript: str) -> str:
-        raw = transcript.strip()
-        if not self.enabled or not raw:
-            return raw
-        payload = {"model": self.model, "prompt": raw, "raw": True, "stream": False,
-                   "options": {"temperature": 0, "num_predict": self.max_tokens}}
-        req = urllib.request.Request(self.endpoint, data=json.dumps(payload).encode(),
-                                     headers={"Content-Type": "application/json"}, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                cleaned = str(json.loads(resp.read().decode()).get("response", "")).strip()
-            if cleaned and "[Styling:" not in cleaned and "<|im_start|>" not in cleaned:
-                return cleaned
-        except Exception as exc:
-            LOG.warning("LLM cleanup bypassed: %s", exc)
-        return raw
+                try:
+                    proc.wait(timeout=5)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
 
 
 class StableSuffixTyper:
@@ -463,12 +510,20 @@ class StableSuffixTyper:
             self.emitted.extend(words[len(self.emitted):target])
 
 
-def decode_file_to_pcm(path: Path, chunk_seconds: float) -> list[np.ndarray]:
-    """Decode any ffmpeg-readable file to 16k mono s16 chunks. Raises on failure."""
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(path),
+def decode_file_to_pcm(path: Path, chunk_seconds: float) -> "collections.abc.Iterator[np.ndarray]":
+    """Stream-decode any ffmpeg-readable file to 16k mono s16 chunks.
+
+    Generator: yields one chunk at a time so a 2-hour podcast (~230 MB PCM)
+    never materializes fully in the daemon (constant ~1 MB RSS instead of
+    ~460 MB transient). Raises on ffmpeg failure.
+    """
+    per_samples = max(1, int(chunk_seconds * SAMPLE_RATE))
+    per_bytes = per_samples * BYTES_PER_SAMPLE
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-i", str(path),
            "-map", "0:a:0", "-vn", "-sn", "-dn", "-ac", "1", "-ar", "16000",
-           "-f", "s16le", "-acodec", "pcm_s16le", "-"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+           "-f", "s16le", "-c:a", "pcm_s16le", "-"]
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert proc.stdout and proc.stderr
     errs: list[bytes] = []
     def drain() -> None:
@@ -478,14 +533,38 @@ def decode_file_to_pcm(path: Path, chunk_seconds: float) -> list[np.ndarray]:
             pass
     t = threading.Thread(target=drain, daemon=True)
     t.start()
-    raw = proc.stdout.read()
-    t.join(timeout=10)
-    rc = proc.wait(timeout=30)
-    if rc != 0:
-        raise RuntimeError(f"ffmpeg failed ({rc}): {b''.join(errs)[-1000:].decode(errors='replace')}")
-    pcm = np.frombuffer(raw, dtype="<i2").copy()
-    per = int(chunk_seconds * SAMPLE_RATE)
-    return [pcm[i:i + per] for i in range(0, max(1, pcm.size), per)] if pcm.size else []
+    try:
+        carry = b""
+        while True:
+            buf = proc.stdout.read(max(per_bytes - len(carry), 4096))
+            if not buf:
+                break
+            carry += buf
+            while len(carry) >= per_bytes:
+                piece, carry = carry[:per_bytes], carry[per_bytes:]
+                yield np.frombuffer(piece, dtype="<i2").copy()
+        if carry:
+            # Odd trailing byte cannot form a sample; drop it.
+            carry = carry[:len(carry) & ~1]
+            if carry:
+                yield np.frombuffer(carry, dtype="<i2").copy()
+    finally:
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except OSError:
+            pass
+        t.join(timeout=10)
+        try:
+            rc = proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            rc = proc.wait(timeout=30)
+        if rc != 0:
+            raise RuntimeError(f"ffmpeg failed ({rc}): {b''.join(errs)[-1000:].decode(errors='replace')}")
 
 
 class RecordingSession:
@@ -503,10 +582,18 @@ class RecordingSession:
         self.typer = StableSuffixTyper(int(self.config.get("stable_holdback_words", 2))) if realtime else None
         self.phrases: list[str] = []
         self.phrase_id = 0
-        self._s1 = S1Cleanup(self.config)
+        # Live-typing state is touched from the capture thread (interim) and
+        # the finalizer thread (final): always hold this around typer calls.
+        self._typer_lock = threading.Lock()
+        # Phrase finals are transcribed off the capture thread so hours-long
+        # continuous speech never stalls the microphone (see run()).
+        self._final_q: queue.Queue[tuple[int, np.ndarray] | None] = queue.Queue(maxsize=8)
+        self._final_thread: threading.Thread | None = None
 
-    def _finalize_text(self, raw: str) -> str:
-        return self._s1.clean(raw) if raw.strip() else ""
+    # Typing 20k words (~120 KB) via wtype would flood the focused window
+    # for tens of minutes and wedge the session thread; file transcripts
+    # always land on disk + clipboard, typing is only for short captures.
+    MAX_TYPE_CHARS = 2000
 
     def _publish(self, final_text: str) -> str:
         if not final_text:
@@ -515,16 +602,102 @@ class RecordingSession:
         out_dir = Path(str(self.config.get("state_dir", "~/.local/state/dusky-stt"))).expanduser() / "transcripts"
         out_dir.mkdir(parents=True, exist_ok=True)
         atomic_write_text(out_dir / f"capture-{stamp}-{self.session_id[:8]}.txt", final_text + "\n")
-        if not self.realtime and self.config.get("push_type_at_end", True):
-            subprocess.run(["wtype", "-"], input=final_text.encode(), check=False)
-        subprocess.run(["wl-copy", "--type", "text/plain;charset=utf-8"], input=final_text.encode(), check=False)
+        try:
+            if not self.realtime and self.config.get("push_type_at_end", True) and len(final_text) <= self.MAX_TYPE_CHARS:
+                subprocess.run(["wtype", "-"], input=final_text.encode(), check=False, timeout=30)
+            elif not self.realtime and len(final_text) > self.MAX_TYPE_CHARS:
+                LOG.info("Transcript too long for typing (%d chars); kept file+clipboard.", len(final_text))
+            subprocess.run(["wl-copy", "--type", "text/plain;charset=utf-8"], input=final_text.encode(),
+                           check=False, timeout=10)
+        except (OSError, subprocess.SubprocessError) as exc:
+            LOG.warning("Publish helper failed: %s", exc)
         if self.config.get("notifications", True):
-            subprocess.run(["notify-send", "-a", "Dusky STT", "-t", "3500",
-                            "Transcription complete", final_text[:220]], check=False)
+            try:
+                subprocess.run(["notify-send", "-a", "Dusky STT", "-t", "3500",
+                                "Transcription complete", final_text[:220]], check=False, timeout=5)
+            except (OSError, subprocess.SubprocessError) as exc:
+                LOG.warning("notify-send failed: %s", exc)
         return final_text
 
+    def _finalizer_loop(self) -> None:
+        """Transcribe phrase finals off the capture thread, in order.
+
+        The capture loop must never block on inference: a 15 s phrase costs
+        ~3-5 s of GPU time, and stalling stream.read() that long overflows
+        PortAudio and deletes the start of the next phrase. So finals go
+        through this FIFO while capture keeps reading the mic. Runs until a
+        None sentinel; plain (non-stop-aware) waits are correct here because
+        nothing time-critical shares this thread, and draining the backlog
+        on --stop preserves the last words instead of dropping them.
+        """
+        per_request = float(self.config.get("finalize_timeout_seconds", 120.0))
+        while True:
+            item = self._final_q.get()
+            if item is None:
+                return
+            phrase_id, pcm = item
+            if pcm.size == 0:
+                continue
+            res: JsonObject | None = None
+            for attempt in (1, 2):
+                try:
+                    req = self.daemon.worker.submit(pcm, {"session_id": self.session_id,
+                        "phrase_id": phrase_id, "final": True}, force=True)
+                except OSError as exc:
+                    LOG.warning("Phrase %d submit failed (attempt %d): %s", phrase_id, attempt, exc)
+                    req = None
+                    continue
+                if req:
+                    res = self.daemon.worker.wait_result(req, per_request)
+                if res and res.get("text") and res.get("ok", True):
+                    break
+                if res and not res.get("ok", True):
+                    LOG.warning("Phrase %d failed (attempt %d): %s", phrase_id, attempt, res.get("error"))
+                res = None
+            if res and res.get("text") and res.get("ok", True):
+                txt = res["text"].strip()
+                if self.typer:
+                    with self._typer_lock:
+                        self.typer.update(txt, final=True)
+                self.phrases.append(txt)
+            elif not self.stop_event.is_set():
+                LOG.error("Phrase %d skipped after retries; continuing session.", phrase_id)
+
+    def _offer_final(self, phrase_id: int, pcm: np.ndarray) -> None:
+        """Hand a snapshot to the finalizer without stalling the mic."""
+        while not self.stop_event.is_set():
+            try:
+                self._final_q.put((phrase_id, pcm), timeout=0.2)
+                return
+            except queue.Full:
+                continue
+        LOG.warning("Phrase %d dropped: session stopping with a full final queue.", phrase_id)
+
     def run(self) -> str:
+        self._final_thread = threading.Thread(target=self._finalizer_loop,
+                                              name=f"dusky-final-{self.session_id[:8]}", daemon=True)
+        self._final_thread.start()
+        try:
+            self._capture_loop()
+        finally:
+            # Drain finals (preserves trailing speech on --stop), then publish.
+            while True:
+                try:
+                    self._final_q.put(None, timeout=0.2)
+                    break
+                except queue.Full:
+                    if self._final_thread is not None and not self._final_thread.is_alive():
+                        break
+                    continue
+            if self._final_thread is not None:
+                self._final_thread.join(timeout=float(self.config.get("finalize_timeout_seconds", 120.0)) + 30.0)
+                if self._final_thread.is_alive():
+                    LOG.warning("Finalizer did not drain; publishing partial transcript.")
+        return self._publish(" ".join(self.phrases).strip())
+
+    def _capture_loop(self) -> None:
         dev = self.config.get("input_device")
+        pending_interim: str | None = None
         with sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=VAD_FRAME_SAMPLES, channels=1,
                                dtype="int16", latency="low", device=dev) as stream:
             active = False
@@ -534,9 +707,20 @@ class RecordingSession:
             min_speech = int(float(self.config.get("vad_min_speech_seconds", 0.25)) * SAMPLE_RATE)
             last_interim = time.monotonic()
             while not self.stop_event.is_set():
-                raw, _ = stream.read(VAD_FRAME_SAMPLES)
+                raw, overflowed = stream.read(VAD_FRAME_SAMPLES)
+                if overflowed:
+                    LOG.warning("PortAudio input overflow: audio lost before VAD (system under load?).")
                 frame = np.frombuffer(raw, dtype="<i2").copy()
                 prob = self.vad.probability(frame)
+                # Collect any finished interim result without blocking: the
+                # mic stalls for exactly 0 s waiting on inference now.
+                if pending_interim is not None:
+                    res = self.daemon.worker.poll(pending_interim)
+                    if res is not None:
+                        pending_interim = None
+                        if res.get("text") and res.get("ok", True) and self.typer:
+                            with self._typer_lock:
+                                self.typer.update(res["text"], final=False)
                 if not active:
                     self.pre_roll.append(frame)
                     onset = onset + 1 if prob >= float(self.config.get("vad_start_threshold", 0.50)) else 0
@@ -547,52 +731,89 @@ class RecordingSession:
                         for p in self.pre_roll:
                             self.ring.append(p)
                         if self.typer:
-                            self.typer.reset()
+                            with self._typer_lock:
+                                self.typer.reset()
                 else:
                     self.ring.append(frame)
                     silence = silence + 1 if prob < float(self.config.get("vad_end_threshold", 0.35)) else 0
                     now = time.monotonic()
-                    if self.realtime and (now - last_interim) >= float(self.config.get("realtime_interval_seconds", 1.2)):
+                    if self.realtime and pending_interim is None and (now - last_interim) >= float(self.config.get("realtime_interval_seconds", 1.2)):
                         last_interim = now
                         if len(self.ring) >= min_speech:
-                            req = self.daemon.worker.submit(self.ring.read(), {"session_id": self.session_id,
+                            # Fire-and-forget: force=False drops (rather than
+                            # queues) when the worker is saturated, and the
+                            # result is polled above on later frames.
+                            pending_interim = self.daemon.worker.submit(self.ring.read(), {"session_id": self.session_id,
                                 "phrase_id": self.phrase_id, "final": False}, force=False)
-                            if req:
-                                res = self.daemon.worker.wait_result(req, 1.0)
-                                if res and res.get("text") and res.get("ok", True) and self.typer:
-                                    self.typer.update(res["text"], final=False)
                     max_samples = int(float(self.config.get("max_phrase_seconds", 15.0)) * SAMPLE_RATE)
                     if silence >= silence_target or len(self.ring) >= max_samples:
                         active = False
                         onset = silence = 0
+                        if pending_interim is not None:
+                            # A late interim for the closing phrase is stale;
+                            # the final carries the authoritative hypothesis.
+                            self.daemon.worker.cancel(pending_interim)
+                            pending_interim = None
                         if len(self.ring) >= min_speech:
-                            req = self.daemon.worker.submit(self.ring.read(), {"session_id": self.session_id,
-                                "phrase_id": self.phrase_id, "final": True}, force=True)
-                            if req:
-                                res = self.daemon.worker.wait_result(req, float(self.config.get("finalize_timeout_seconds", 120.0)))
-                                if res and res.get("text") and res.get("ok", True):
-                                    txt = res["text"].strip()
-                                    if self.typer:
-                                        self.typer.update(txt, final=True)
-                                    self.phrases.append(txt)
+                            self._offer_final(self.phrase_id, self.ring.read())
                         self.vad.reset()
                         if self.ring.dropped_samples:
                             LOG.warning("Ring overflow dropped %d samples", self.ring.dropped_samples)
-        return self._publish(self._finalize_text(" ".join(self.phrases)))
 
     def run_file(self, path: Path) -> str:
-        chunks = decode_file_to_pcm(path, float(self.config.get("file_chunk_seconds", 25.0)))
-        texts: list[str] = []
-        for i, ch in enumerate(chunks):
-            if self.stop_event.is_set():
-                break
-            req = self.daemon.worker.submit(ch, {"session_id": self.session_id, "phrase_id": i + 1, "final": True}, force=True)
-            if not req:
-                continue
-            res = self.daemon.worker.wait_result(req, float(self.config.get("finalize_timeout_seconds", 120.0)))
-            if res and res.get("text") and res.get("ok", True):
-                texts.append(res["text"].strip())
-        return self._publish(self._finalize_text(" ".join(texts)))
+        chunk_seconds = float(self.config.get("file_chunk_seconds", 20.0))
+        per_request = float(self.config.get("finalize_timeout_seconds", 120.0))
+        try:
+            texts: list[str] = []
+            for i, ch in enumerate(decode_file_to_pcm(path, chunk_seconds)):
+                if self.stop_event.is_set():
+                    break
+                if ch.size == 0:
+                    continue
+                # Per-chunk retry: one transient worker crash must cost one
+                # retry, never a 20 s hole and never the remaining ~359 chunks.
+                res: JsonObject | None = None
+                for attempt in (1, 2):
+                    if self.stop_event.is_set():
+                        res = None
+                        break
+                    try:
+                        req = self.daemon.worker.submit(
+                            ch, {"session_id": self.session_id, "phrase_id": i + 1, "final": True}, force=True)
+                    except OSError as exc:
+                        LOG.warning("Chunk %d submit failed (attempt %d): %s", i + 1, attempt, exc)
+                        req = None
+                    if req:
+                        # Stop-aware: --stop aborts within ~0.2 s instead of
+                        # one uninterruptible 120 s block.
+                        res = self._wait_interruptible(req, per_request)
+                    if res and res.get("text") and res.get("ok", True):
+                        break
+                    if res and not res.get("ok", True):
+                        LOG.warning("Chunk %d failed (attempt %d): %s", i + 1, attempt, res.get("error"))
+                    res = None
+                if res and res.get("text") and res.get("ok", True):
+                    texts.append(res["text"].strip())
+                elif not self.stop_event.is_set():
+                    LOG.error("Chunk %d skipped after retries; continuing file.", i + 1)
+            return self._publish(" ".join(texts).strip())
+        finally:
+            # Deterministic VRAM offload: a file job is batch work, so shut
+            # the worker down NOW instead of holding the CUDA context (and
+            # the dGPU in D0) until idle_timeout_seconds expires. Process
+            # exit is the only guaranteed CUDA teardown, which is what lets
+            # the GPU reach D3cold. Next request respawns on demand.
+            # (Realtime sessions deliberately stay warm for toggle latency.)
+            try:
+                self.daemon.worker.stop()
+            except Exception as exc:
+                LOG.debug("Worker release after file job failed: %s", exc)
+
+    def _wait_interruptible(self, req_id: str, total: float) -> JsonObject | None:
+        # Stop-aware single wait: --stop aborts within ~0.2 s instead of one
+        # uninterruptible 120 s block. No slicing (an intermediate timeout
+        # would discard the request and orphan the late reply).
+        return self.daemon.worker.wait_result(req_id, total, stop=self.stop_event)
 
 
 class DuskyDaemon:
@@ -682,7 +903,12 @@ class DuskyDaemon:
                 _, uid, _ = struct.unpack("3i", cred)
                 if uid != os.getuid():
                     return
-                data = conn.recv(MAX_PACKET)
+                # recvmsg (not recv): SEQPACKET truncation is only visible
+                # via MSG_TRUNC, otherwise a crafted oversize datagram could
+                # truncate to still-valid JSON and mis-execute.
+                data, _, flags, _ = conn.recvmsg(MAX_PACKET)
+                if flags & getattr(socket, "MSG_TRUNC", 0x20):
+                    return
                 if not data:
                     return
                 req = json.loads(data.decode("utf-8"))
@@ -697,6 +923,9 @@ class DuskyDaemon:
                     if self.state == "idle":
                         realtime = req.get("mode", "realtime") != "push"
                         self._session = RecordingSession(self, realtime)
+                        # Publish state under the lock so --status never
+                        # reports stale idle after start was acked recording.
+                        self.state = "recording"
                         threading.Thread(target=self._run_session, args=(self._session, False, None), daemon=True).start()
                         resp = {"ok": True, "state": "recording"}
                     elif cmd == "toggle" and self._session:
@@ -710,6 +939,16 @@ class DuskyDaemon:
                         resp = {"ok": True, "state": "finalizing"}
                     else:
                         resp = {"ok": False, "error": "not recording", "state": self.state}
+                elif cmd == "unload":
+                    # Free VRAM/RAM now (worker process exit is the only
+                    # guaranteed CUDA teardown, letting the dGPU reach
+                    # D3cold). Next request respawns on demand. Refused while
+                    # busy so an in-flight transcription is never robbed.
+                    if self.state == "idle":
+                        self.worker.stop()
+                        resp = {"ok": True, "event": "unloaded", "worker_pid": None}
+                    else:
+                        resp = {"ok": False, "error": "busy", "state": self.state}
                 elif cmd == "file":
                     if self.state == "idle":
                         try:
@@ -720,6 +959,7 @@ class DuskyDaemon:
                                 resp = {"ok": False, "error": f"file not found (sandbox: place files under $HOME, not /tmp): {p}"}
                             else:
                                 self._session = RecordingSession(self, False)
+                                self.state = "transcribing"
                                 threading.Thread(target=self._run_session, args=(self._session, True, p), daemon=True).start()
                                 resp = {"ok": True, "state": "transcribing"}
                         except (OSError, ValueError) as exc:
@@ -727,7 +967,12 @@ class DuskyDaemon:
                     else:
                         resp = {"ok": False, "error": "busy", "state": self.state}
             try:
-                conn.sendall(json.dumps(resp).encode())
+                # Single datagram: sendall could split an oversize reply into
+                # N datagrams of which the client reads only the first.
+                raw = json.dumps(resp).encode()
+                if len(raw) > MAX_PACKET:
+                    raw = json.dumps({"ok": False, "error": "response too large"}).encode()
+                conn.sendmsg([raw])
             except OSError:
                 pass
 

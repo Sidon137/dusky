@@ -3,7 +3,7 @@
 Local speech-to-text for Arch Linux rolling on Wayland. No usernames or machines hardcoded — everything resolves from `$HOME`, `%h`, `$USER`, `$XDG_RUNTIME_DIR`.
 
 - **CPU daemon** (`.venv-main`): capture, Silero VAD v6.2.1, live typing, control plane. Never maps CUDA.
-- **On-demand worker** (`.venv-worker`): Parakeet TDT 0.6B via ONNX Runtime 1.27.0. EP follows `--hardware`: `CUDAExecutionProvider` (NVIDIA), opportunistic `MIGraphX/ROCM` else CPU (AMD), `CPUExecutionProvider` (CPU). Exits on idle so NVIDIA dGPUs can reach D3cold.
+- **On-demand worker** (`.venv-worker`): Parakeet TDT 0.6B via ONNX Runtime 1.29.0. EP follows `--hardware`: `CUDAExecutionProvider` (NVIDIA), opportunistic `MIGraphX/ROCM` else CPU (AMD), `CPUExecutionProvider` (CPU). Exits on idle so NVIDIA dGPUs can reach D3cold.
 - **IPC**: sealed memfds (`MFD_NOEXEC_SEAL` + `F_SEAL_EXEC=0x20`) over `SOCK_SEQPACKET` + `SCM_RIGHTS`. Large replies return via a second memfd, never truncated.
 
 Target: Arch rolling, kernel 6.10+ (7.x tested), CPython 3.14.6+ GIL, `uv`, NVIDIA driver 580+ (for nvidia mode).
@@ -28,8 +28,24 @@ dusky_trigger --status
 dusky_trigger --start --realtime | dusky_trigger --stop
 dusky_trigger --start --push   | dusky_trigger --stop
 dusky_trigger --file ~/audio.m4a
+dusky_trigger --file ~/episode.mp3 --wait   # block, then print transcript to stdout
+dusky_trigger --unload        # free GPU VRAM / RAM now (respawns on demand)
 dusky_trigger --logs | dusky_trigger --restart | dusky_trigger --kill
+dusky_trigger --help          # full usage + hotkey examples
 ```
+
+## Hotkeys (Hyprland / sway)
+
+```ini
+# Hyprland (~/.config/hypr/hyprland.conf):
+bind = SUPER, S, exec, dusky_trigger
+# sway (~/.config/sway/config):
+bindsym $mod+s exec dusky_trigger
+```
+
+Bare `dusky_trigger` toggles: idle → start realtime, recording → stop and finalize.
+Transcripts are pure Parakeet output (punctuated, ~6% WER) — there is no LLM
+cleanup stage and no Ollama dependency.
 
 ## Verify
 

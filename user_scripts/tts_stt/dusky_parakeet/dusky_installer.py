@@ -63,8 +63,12 @@ BASE_PACKAGES = (
 )
 NVIDIA_PACKAGES = ("nvidia-utils",)
 
-MAIN_PACKAGES = ("onnxruntime==1.27.0", "numpy==2.5.1", "sounddevice==0.5.5")
+MAIN_PACKAGES = ("onnxruntime==1.29.0", "numpy==2.5.2", "sounddevice==0.5.6")
 
+# CUDA 13.0.x is deliberately HELD (not bumped to 13.3.x): 13.3 needs
+# driver >= 610.43 per NVIDIA release notes, which would brick every
+# 580-609 user this installer explicitly accepts (MIN_DRIVER_MAJOR=580).
+# ORT 1.29 + CUDA 13.0 runtime remain ABI-compatible (SONAME .so.13).
 WORKER_CUDA_PACKAGES = (
     "nvidia-cuda-runtime==13.0.88",
     "nvidia-cublas==13.0.2.14",
@@ -74,9 +78,9 @@ WORKER_CUDA_PACKAGES = (
     "nvidia-curand==10.4.0.35",
     "nvidia-nvjitlink==13.0.88",
 )
-WORKER_NVIDIA_PACKAGES = ("onnxruntime-gpu==1.27.0", "numpy==2.5.1", "huggingface-hub>=0.34")
+WORKER_NVIDIA_PACKAGES = ("onnxruntime-gpu==1.29.0", "numpy==2.5.2", "huggingface-hub>=0.34")
 WORKER_NVIDIA_NO_DEPS = ("onnx-asr==0.12.0",)
-WORKER_CPU_PACKAGES = ("onnxruntime==1.27.0", "numpy==2.5.1", "huggingface-hub>=0.34", "onnx-asr==0.12.0")
+WORKER_CPU_PACKAGES = ("onnxruntime==1.29.0", "numpy==2.5.2", "huggingface-hub>=0.34", "onnx-asr==0.12.0")
 
 SILERO_TAG = "v6.2.1"
 SILERO_URL = f"https://raw.githubusercontent.com/snakers4/silero-vad/{SILERO_TAG}/src/silero_vad/data/silero_vad.onnx"
@@ -512,9 +516,6 @@ def parse_arguments(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--output-mode", default="realtime-both", choices=("clipboard", "both", "realtime-both"))
     p.add_argument("--keep-audio", action="store_true")
     p.add_argument("--idle-timeout-seconds", type=float, default=90.0)
-    p.add_argument("--no-llm", action="store_true", help="Disable S1-mini normalization (default enabled if Ollama present)")
-    p.add_argument("--llm-endpoint", default="http://127.0.0.1:11434")
-    p.add_argument("--llm-model", default="s1-mini")
     p.add_argument("--silero-sha256", default=None)
     p.add_argument("--skip-pacman", action="store_true")
     p.add_argument("--uninstall", action="store_true")
@@ -547,6 +548,15 @@ def main(argv: list[str]) -> int:
     gpu_limit = 4096
     if hardware == "nvidia":
         total_mb, _driver = query_nvidia_gpu(args.gpu_device)
+        # 2GB-VRAM guard: fp32 encoder alone is ~2.5 GB and can never fit;
+        # fail fast with a clear message instead of a post-download OOM.
+        if total_mb < 3072 and args.quantization in ("none", "fp32"):
+            raise InstallError(
+                f"GPU has {total_mb} MiB VRAM: fp32 model needs ~2.5 GB just for "
+                "weights. Re-run with --quantization int8 (recommended) or fp16.")
+        if total_mb < 3072 and args.quantization == "fp16":
+            log_warn(f"Only {total_mb} MiB VRAM with fp16 (~1.25 GB weights + CUDA "
+                     "context + activations): tight. Prefer --quantization int8.")
         gpu_limit = choose_vram_limit(total_mb, args.gpu_mem_limit_mb)
     elif hardware == "amd":
         log_warn("AMD GPU acceleration via MIGraphX/ROCm is opportunistic; CPU fallback always works. "
@@ -587,18 +597,16 @@ def main(argv: list[str]) -> int:
             "output_mode": args.output_mode,
             "push_type_at_end": True,
             "keep_audio": args.keep_audio,
-            "llm_enabled": not args.no_llm,
-            "llm_endpoint": args.llm_endpoint,
-            "llm_model": args.llm_model,
-            "llm_timeout_seconds": 20.0,
-            "llm_max_tokens": 2048,
             "idle_timeout_seconds": args.idle_timeout_seconds,
             "max_inflight_requests": 2,
             "realtime_interval_seconds": 1.2,
             "finalize_timeout_seconds": 120.0,
             "max_request_seconds": 30.0,
             "max_phrase_seconds": 15.0,
-            "file_chunk_seconds": 25.0,
+            # 20 s (not 25 s): Parakeet TDT is trained on short utterances and
+            # onnx-asr caps at 20-30 s per forward; 20 s cuts O(T^2) attention
+            # peak ~1.5x vs 25 s on 2 GB VRAM with fewer mid-word seams.
+            "file_chunk_seconds": 20.0,
             "pre_roll_seconds": 0.32,
             "phrase_silence_seconds": 0.80,
             "vad_onset_seconds": 0.096,

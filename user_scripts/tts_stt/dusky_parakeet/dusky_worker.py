@@ -124,8 +124,18 @@ class AsrEngine:
         opts = _ort.SessionOptions()
         opts.execution_mode = _ort.ExecutionMode.ORT_SEQUENTIAL
         opts.graph_optimization_level = _ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        opts.intra_op_num_threads = 1
-        opts.inter_op_num_threads = 1
+        # Variable-length audio (partial tail chunks, 0.25-15 s phrases):
+        # pre-planned mem patterns never hit, so they only cost VRAM.
+        opts.enable_mem_pattern = False
+        if hardware == "cpu":
+            # Throughput path: file transcription is embarrassingly parallel
+            # across ORT intra-op threads; single-thread would 4-8x slowdown.
+            opts.intra_op_num_threads = max(1, os.cpu_count() or 4)
+            opts.inter_op_num_threads = 1
+        else:
+            # Low-VRAM path (2GB): one inference at a time minimizes arena peak.
+            opts.intra_op_num_threads = 1
+            opts.inter_op_num_threads = 1
         opts.log_severity_level = 3
         if profiling:
             opts.enable_profiling = True
@@ -146,6 +156,13 @@ class AsrEngine:
                 "device_id": 0, "arena_extend_strategy": "kSameAsRequested",
                 "gpu_mem_limit": limit_mb * 1024 * 1024,
                 "cudnn_conv_algo_search": "HEURISTIC",
+                # 2GB-VRAM spike killers: clamp cudnn workspace (default max
+                # can transiently cost GBs on first Run; useless for int8
+                # Gemm/Attention anyway) and use one unified stream instead
+                # of per-thread streams + graph pools (variable-T audio).
+                "cudnn_conv_use_max_workspace": "0",
+                "use_ep_level_unified_stream": "1",
+                "enable_cuda_graph": "0",
                 "use_tf32": True, "do_copy_in_default_stream": True}), "CPUExecutionProvider"]
         elif hardware == "amd":
             # Opportunistic: use MIGraphX/ROCM only if the installed wheel provides them.
@@ -205,9 +222,11 @@ def validate_memfd(fd: int, samples: int) -> None:
     st = os.fstat(fd)
     if not stat.S_ISREG(st.st_mode):
         raise ValueError("Descriptor is not a regular file")
+    # Same-uid peer is trusted for content but not for size: cap the mmap
+    # before touching it (legit max is a 20 s file chunk = 320k samples).
+    if samples <= 0 or samples > 480000:
+        raise ValueError(f"Samples out of range: {samples}")
     expected = samples * BYTES_PER_SAMPLE
-    if expected <= 0:
-        raise ValueError("Empty audio payload")
     if st.st_size != expected:
         raise ValueError(f"Size mismatch: {st.st_size} != {expected}")
     seals = fcntl.fcntl(fd, fcntl.F_GET_SEALS)
@@ -341,8 +360,12 @@ def run_worker(fd: int, config_path: Path) -> int:
                     raise ValueError("Bad encoding/samples")
                 validate_memfd(audio_fd, samples)
                 with mmap.mmap(audio_fd, samples * BYTES_PER_SAMPLE, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ) as m:
-                    pcm = engine.np.frombuffer(m, dtype="<i2", count=samples)
-                    f32 = pcm.astype(engine.np.float32) * (1.0 / 32768.0)
+                    pcm_view = engine.np.frombuffer(m, dtype="<i2", count=samples)
+                    f32 = pcm_view.astype(engine.np.float32) * (1.0 / 32768.0)
+                    # Release the mmap export BEFORE the with-block closes it:
+                    # mmap.close() raises BufferError if any exporter is alive,
+                    # which deterministically failed every request.
+                    del pcm_view
                 t0 = time.monotonic()
                 text = engine.recognize(f32)
                 send_response(sock, {"ok": True, "request_id": req.get("request_id"), "text": text,
