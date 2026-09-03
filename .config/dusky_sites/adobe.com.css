@@ -1,0 +1,34 @@
+@-moz-document domain("adobe.com") {
+    /* >>> dusky:picks - managed by the Visual Picker, one rule per line */
+    div.ufd-layout { background: var(--surface) !important; } /* bg: surface */
+    a.featured-community-card { background: var(--primary_container) !important; color: var(--on_primary_container, var(--surface)) !important; } /* bg: primary_container */
+    p.ufd-page__subheading { color: var(--on_surface) !important; } /* text: on_surface */
+    div.discussion-blade-content { color: var(--on_surface) !important; } /* text: on_surface */
+    nav.feds-topnav.feds-topnav--overflowing { color: var(--surface) !important; } /* text: surface */
+    header.custom-header-container.global-navigation.ready { color: var(--on_surface) !important; } /* text: on_surface */
+    div.feds-topnav-wrapper { background: var(--primary_container) !important; color: var(--on_primary_container, var(--surface)) !important; } /* bg: primary_container */
+    div.featured-community-card__title { color: var(--on_surface) !important; } /* text: on_surface */
+    a.featured-card { color: var(--on_surface) !important; } /* text: on_surface */
+    div.community-sub-section { background: var(--surface_container_high) !important; } /* bg: surface_container_high */
+    section.carousel-inner { background: var(--primary_container) !important; color: var(--on_primary_container, var(--surface)) !important; } /* bg: primary_container */
+    a.featured-card { background: var(--secondary_container) !important; color: var(--on_secondary_container, var(--surface)) !important; } /* bg: secondary_container */
+    div.community-product-mneumonic__content { background: var(--secondary_container) !important; color: var(--on_secondary_container, var(--surface)) !important; } /* bg: secondary_container */
+    div.community-product-mneumonic__iconcontainer { background: var(--secondary_container) !important; color: var(--on_secondary_container, var(--surface)) !important; } /* bg: secondary_container */
+    div.community-product-mneumonic__title { color: var(--on_surface) !important; } /* text: on_surface */
+    div.ufd-section__header { color: var(--on_surface) !important; } /* text: on_surface */
+    sp-button.explore-button.explore-button__ufd-home { color: var(--on_surface) !important; } /* text: on_surface */
+    h2.community-sub-section__title { color: var(--on_surface) !important; } /* text: on_surface */
+    a.feds-navLink { color: var(--on_surface) !important; } /* text: on_surface */
+    footer.global-footer { color: var(--surface) !important; } /* text: surface */
+    footer.global-footer { background: var(--surface) !important; } /* bg: surface */
+    div.connect-with-us-icons-container-wrapper { background: var(--surface) !important; } /* bg: surface */
+    sp-action-button.connect-with-us-icon-container { background: var(--on_surface_variant) !important; } /* bg: on_surface_variant */
+    sp-button.explore-button.undefined { color: var(--on_surface) !important; } /* text: on_surface */
+    sp-button.explore-button.undefined { border-color: var(--primary) !important; } /* border: primary */
+    sp-divider[role="separator"] { border-color: var(--primary) !important; } /* border: primary */
+    div.ufd-community-page { background: var(--secondary) !important; color: var(--on_secondary, var(--surface)) !important; } /* bg: secondary */
+    button.feds-navLink.feds-navLink--hoverCaret { color: var(--on_surface) !important; } /* text: on_surface */
+    #unav-app-switcher { background: var(--primary_container) !important; color: var(--on_primary_container, var(--surface)) !important; } /* bg: primary_container */
+    div.universal-nav-divider { background: var(--primary_container) !important; color: var(--on_primary_container, var(--surface)) !important; } /* bg: primary_container */
+    /* <<< dusky:picks */
+}
