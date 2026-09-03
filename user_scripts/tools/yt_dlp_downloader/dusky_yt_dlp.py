@@ -24,6 +24,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Final
@@ -504,8 +505,15 @@ def resolve_storage_pool(custom_path: Path | None = None) -> Path:
             continue
 
     fallback = Path.cwd() / "dusky_downloads"
-    fallback.mkdir(parents=True, exist_ok=True)
-    return fallback
+    try:
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+    except (OSError, PermissionError):
+        pass
+
+    last_resort = Path(tempfile.gettempdir()) / "dusky_downloads"
+    last_resort.mkdir(parents=True, exist_ok=True)
+    return last_resort
 
 
 class YtdlpRunner:
@@ -652,13 +660,48 @@ def parse_batch_file(path: Path) -> list[str]:
     `//` is also accepted. Blank lines are skipped.
     """
     urls: list[str] = []
-    with path.open("r", encoding="utf-8") as f:
+    with path.open("r", encoding="utf-8-sig") as f:
         for line in f:
             clean = line.strip()
             if not clean or clean.startswith(_BATCH_COMMENT_PREFIXES):
                 continue
             urls.append(clean)
     return urls
+
+
+# Compact port of OVD's diagnostic rules: raw yt-dlp errors stay visible, but
+# the most common actionable failures get a plain-English tail hint.
+_ERROR_HINTS: Final[tuple[tuple[str, str], ...]] = (
+    ("sign in to confirm your age", "requires login/age verification — supply cookies or retry signed in"),
+    ("sign in required", "requires login — supply cookies or retry signed in"),
+    ("not a bot", "YouTube bot check — wait a while or supply cookies and retry"),
+    ("members-only content", "members-only content — a membership login is required"),
+    ("not available in your country", "geo-blocked in your region"),
+    ("not available from your location", "geo-blocked in your region"),
+    ("http error 429", "rate-limited — wait before retrying"),
+    ("too many requests", "rate-limited — wait before retrying"),
+    ("http error 403", "access forbidden — login/cookies may help"),
+    ("premieres in", "not premiered yet — retry after it airs"),
+    ("will begin in", "livestream has not started yet"),
+    ("requested format is not available", "that quality does not exist here — retry with best"),
+    ("the playlist does not exist", "playlist is missing or private"),
+    ("private video", "video is private or removed"),
+    ("video has not been found", "video is private or removed"),
+    ("video unavailable", "video is private or removed"),
+)
+
+
+def translate_error(err_msg: str, mode: TargetFormat) -> str:
+    """Append a plain-English hint to known yt-dlp failure signatures."""
+    lowered = err_msg.lower()
+    # The source simply carries no audio track (e.g. a video-only clip), so
+    # no audio mode can ever succeed — say so instead of leaking internals.
+    if mode != TargetFormat.VIDEO and "unable to obtain file audio codec" in lowered:
+        return err_msg + " — source has no audio track; retry with -f video"
+    for signature, hint in _ERROR_HINTS:
+        if signature in lowered:
+            return f"{err_msg} — {hint}"
+    return err_msg
 
 
 def execute_download(
@@ -750,13 +793,18 @@ def execute_download(
 
             while proc.poll() is None:
                 if timeout_secs is not None and (time.monotonic_ns() - started_ns) / 1e9 > timeout_secs:
-                    with _ACTIVE_PG_LOCK:
-                        pass
                     try:
                         os.killpg(pgid, signal.SIGTERM)
                     except OSError:
                         pass
-                    proc.wait(timeout=10)
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            os.killpg(pgid, signal.SIGKILL)
+                        except OSError:
+                            pass
+                        proc.wait()
                     break
                 # Prefer byte-accurate totals; fall back to OVD-derived % for
                 # fragment-only (HLS) streams where no total exists.
@@ -790,11 +838,7 @@ def execute_download(
             err_msg = " | ".join(ln.strip()[:300] for ln in tail)
         else:
             err_msg = f"yt-dlp error code {exit_code}"
-        # Translate the cryptic ffprobe failure: the source simply carries no
-        # audio track (e.g. a video-only clip), so no audio mode can succeed.
-        # Say so plainly instead of leaking postprocessor internals.
-        if job.mode != TargetFormat.VIDEO and "unable to obtain file audio codec" in err_msg:
-            err_msg += " — source has no audio track; retry with -f video"
+        err_msg = translate_error(err_msg, job.mode)
         try:
             proc.stdout.close()
         except Exception:
@@ -1032,7 +1076,7 @@ def select_playlist_items(
             if i not in picked:
                 picked.append(i)
 
-    selected = [discovered[i] for i in sorted(picked) if 0 <= i < total]
+    selected = [discovered[i] for i in picked if 0 <= i < total]
     if not selected:
         raise ValueError(f"No items matched range {range_val!r} (playlist has {total}).")
     return selected
