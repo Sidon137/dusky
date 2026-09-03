@@ -30,5 +30,7 @@
     button.feds-navLink.feds-navLink--hoverCaret { color: var(--on_surface) !important; } /* text: on_surface */
     #unav-app-switcher { background: var(--primary_container) !important; color: var(--on_primary_container, var(--surface)) !important; } /* bg: primary_container */
     div.universal-nav-divider { background: var(--primary_container) !important; color: var(--on_primary_container, var(--surface)) !important; } /* bg: primary_container */
+    div.community-product-mneumonic__post-stats { color: var(--secondary) !important; } /* text: secondary */
+    div.community-product-mneumonic__post-stats { background: var(--primary) !important; color: var(--on_primary, var(--surface)) !important; } /* bg: primary */
     /* <<< dusky:picks */
 }
