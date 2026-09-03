@@ -158,7 +158,8 @@ def main() -> int:
   dusky_trigger --ACTION
 
 ACTIONS
-  (none) / --toggle   start realtime if idle, else stop and finalize
+  (none) / --toggle   start if idle, else stop and finalize
+                      (tap again mid-drain to chain a fresh take; --stop cancels)
   --start [--realtime|--push]   begin capture (realtime live-types as you speak)
   --stop              stop capture and finalize (waits for the last phrase)
   --pause             pause / resume capture (keeps the session)

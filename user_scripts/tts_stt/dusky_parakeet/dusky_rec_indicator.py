@@ -122,9 +122,11 @@ class LevelTap(threading.Thread):
 
 
 class Indicator:
-    def __init__(self) -> None:
+    def __init__(self, session: str = "") -> None:
         self.t0 = time.monotonic()
+        self.session = session
         self.paused = False
+        self.finalizing = False
         self._pulse_on = True
         self._idle_seen = 0
 
@@ -190,15 +192,22 @@ class Indicator:
 
     def _paint(self) -> None:
         # Pulse via widget opacity against the theme accent dot: no
-        # hardcoded colors anywhere, full opacity when paused.
-        if self.paused:
+        # hardcoded colors anywhere, full opacity when paused/finalizing.
+        if self.finalizing:
+            self.dot.set_opacity(1.0)
+            self.rec.set_text("…")
+            self.pause_btn.set_label("❚❚")
+            self.pause_btn.set_sensitive(False)
+        elif self.paused:
             self.dot.set_opacity(1.0)
             self.rec.set_text("PAUSED")
             self.pause_btn.set_label("▶")
+            self.pause_btn.set_sensitive(True)
         else:
             self.dot.set_opacity(1.0 if self._pulse_on else 0.3)
             self.rec.set_text("REC")
             self.pause_btn.set_label("❚❚")
+            self.pause_btn.set_sensitive(True)
 
     def _tick(self) -> bool:
         self._pulse_on = not self._pulse_on
@@ -209,17 +218,41 @@ class Indicator:
 
     def _watchdog(self) -> bool:
         st = send_command({"command": "status"})
-        if st is None or st.get("state", "idle") != "recording":
-            self._idle_seen += 1
-            if self._idle_seen >= 2:
+        if st is None:
+            return self._note_idle()
+        state = st.get("state", "idle")
+        if state == "idle":
+            return self._note_idle()
+        if state == "finalizing":
+            # GPU drain continues headless; show it so rapid re-taps are
+            # understood instead of feeling swallowed.
+            self._idle_seen = 0
+            if not self.finalizing:
+                self.finalizing = True
+                self._paint()
+            return True
+        if state == "recording":
+            self._idle_seen = 0
+            if self.finalizing:
+                self.finalizing = False
+            owner = str(st.get("session") or "")
+            if self.session and owner and not self.session.startswith(owner) and not owner.startswith(self.session):
+                # A chained take replaced our session (its own pill spawns):
+                # quit so two pills never linger.
                 self._quit()
                 return False
-        else:
-            self._idle_seen = 0
             paused = bool(st.get("paused", False))
             if paused != self.paused:
                 self.paused = paused
                 self._paint()
+            return True
+        return self._note_idle()
+
+    def _note_idle(self) -> bool:
+        self._idle_seen += 1
+        if self._idle_seen >= 2:
+            self._quit()
+            return False
         return True
 
     def _on_pause(self, _btn) -> None:
@@ -252,11 +285,11 @@ def main(argv: list[str] | None = None) -> int:
     import argparse
     ap = argparse.ArgumentParser(prog="dusky_rec_indicator",
                                  description="Dusky STT on-screen recording indicator")
-    ap.add_argument("--session", default="", help="Owning recording session id (informational)")
-    ap.parse_args(argv)
+    ap.add_argument("--session", default="", help="Owning recording session id (quit if another takes over)")
+    args = ap.parse_args(argv)
     if not control_path().exists():
         return 2
-    Indicator().run()
+    Indicator(session=args.session).run()
     return 0
 
 

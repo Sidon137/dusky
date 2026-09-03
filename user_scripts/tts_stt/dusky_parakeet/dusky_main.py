@@ -614,6 +614,10 @@ class RecordingSession:
         # while set, mic frames are read-and-discarded so the stream never
         # overflows, and VAD restarts fresh on resume.
         self.paused = threading.Event()
+        # Recording pill process (set by _run_session when spawned). Killed
+        # the moment a stop is requested so the UI feels instant even though
+        # the GPU drain continues headless until the final toast.
+        self._indicator: subprocess.Popen | None = None
         # Live-typing state is touched from the capture thread (interim) and
         # the finalizer thread (final): always hold this around typer calls.
         self._typer_lock = threading.Lock()
@@ -873,12 +877,29 @@ class RecordingSession:
         return self.daemon.worker.wait_result(req_id, total, stop=self.stop_event)
 
 
+def _kill_indicator(sess: RecordingSession) -> None:
+    """Drop the on-screen pill without waiting (fire-and-forget). Used the
+    instant a stop is requested; the session drain continues headless."""
+    proc = sess._indicator
+    sess._indicator = None
+    if proc is not None:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+
+
 class DuskyDaemon:
     def __init__(self, config_path: Path) -> None:
         self.config = json.loads(config_path.read_text(encoding="utf-8"))
         if self.config.get("schema_version") != 2:
             raise RuntimeError("config schema_version must be 2")
         self.worker = WorkerManager(self.config)
+        # Chained take: a toggle received mid-drain stores (mode, time)
+        # here; _run_session picks it up instead of going idle. `stop` and a
+        # fresh `start` clear it. Entries older than 120 s are dropped so a
+        # wedged drain can never surprise-restart minutes later.
+        self._pending_restart: tuple[str, float] | None = None
         en = unit_is_enabled()
         # Service ON (unit enabled)   -> warm-resident: model preloaded,
         #                              instant dictation, VRAM held.
@@ -920,9 +941,16 @@ class DuskyDaemon:
     def status(self) -> JsonObject:
         with self._lock:
             sess = self._session
-            return {"ok": True, "state": self.state, "pid": os.getpid(), "worker_pid": self.worker.pid,
+            state = self.state
+            if sess is not None and sess.stop_event.is_set() and state in ("recording", "transcribing"):
+                # Draining the GPU backlog: visibly distinct from capturing so
+                # the pill and clients never present a dead-feeling "still
+                # recording" state, and rapid re-taps are understood.
+                state = "finalizing"
+            return {"ok": True, "state": state, "pid": os.getpid(), "worker_pid": self.worker.pid,
                     "hardware": self.config.get("hardware", "cpu"),
                     "warm": self.warm,
+                    "session": sess.session_id[:8] if sess is not None else None,
                     "paused": bool(sess.paused.is_set()) if sess is not None else False,
                     "uptime_seconds": round(time.monotonic() - self._start_time, 1),
                     "rss_kib": self._rss(), "cuda_maps": cuda_maps(),
@@ -1002,6 +1030,7 @@ class DuskyDaemon:
                 elif cmd in ("start", "toggle"):
                     if self.state == "idle":
                         realtime = req.get("mode", "realtime") != "push"
+                        self._pending_restart = None
                         self._session = RecordingSession(self, realtime)
                         # Publish state under the lock so --status never
                         # reports stale idle after start was acked recording.
@@ -1009,13 +1038,28 @@ class DuskyDaemon:
                         threading.Thread(target=self._run_session, args=(self._session, False, None), daemon=True).start()
                         resp = {"ok": True, "state": "recording"}
                     elif cmd == "toggle" and self._session:
-                        self._session.stop_event.set()
-                        resp = {"ok": True, "state": "finalizing"}
+                        if self._session.stop_event.is_set():
+                            # Already draining: this tap chains a fresh take
+                            # after the drain (every press does something
+                            # visible; the pill shows the drain meanwhile).
+                            # Deliberately NOT set on the stop tap itself, or
+                            # every stop would phantom-restart (pill reopen).
+                            if self.state == "recording":
+                                self._pending_restart = (req.get("mode", "realtime"), time.monotonic())
+                                resp = {"ok": True, "state": "finalizing", "restart": "queued"}
+                            else:
+                                resp = {"ok": True, "state": "finalizing"}
+                        else:
+                            self._session.stop_event.set()
+                            _kill_indicator(self._session)
+                            resp = {"ok": True, "state": "finalizing"}
                     else:
                         resp = {"ok": False, "error": "already recording", "state": self.state}
                 elif cmd == "stop":
+                    self._pending_restart = None
                     if self._session:
                         self._session.stop_event.set()
+                        _kill_indicator(self._session)
                         resp = {"ok": True, "state": "finalizing"}
                     else:
                         resp = {"ok": False, "error": "not recording", "state": self.state}
@@ -1099,6 +1143,7 @@ class DuskyDaemon:
         indicator: subprocess.Popen | None = None
         if not is_file:
             indicator = self._spawn_indicator(sess)
+            sess._indicator = indicator
         try:
             sess.run_file(path) if (is_file and path) else sess.run()
         except Exception as exc:
@@ -1110,9 +1155,12 @@ class DuskyDaemon:
                 except (OSError, subprocess.SubprocessError):
                     pass
         finally:
+            # Pill is usually already gone (killed the instant stop was
+            # requested for instant UI feedback); this covers session end
+            # without an explicit stop (e.g. file jobs, errors).
+            _kill_indicator(sess)
             if indicator is not None:
                 try:
-                    indicator.terminate()
                     indicator.wait(timeout=2.0)
                 except (OSError, subprocess.TimeoutExpired):
                     try:
@@ -1129,11 +1177,29 @@ class DuskyDaemon:
                     self.worker.stop()
                 except Exception as exc:
                     LOG.debug("Worker release after session failed: %s", exc)
+            pending: tuple[str, float] | None = None
+            new_sess: RecordingSession | None = None
             with self._lock:
                 self.state = "idle"
                 self._session = None
+                pending, self._pending_restart = self._pending_restart, None
+                if pending is not None:
+                    mode, queued_at = pending
+                    if time.monotonic() - queued_at > 120.0:
+                        LOG.warning("Dropping stale chained take (%.0fs old).", time.monotonic() - queued_at)
+                    else:
+                        # Spawn under the SAME lock hold: no interleaving
+                        # toggle/start can slip in and double-start a session.
+                        self._session = RecordingSession(self, mode != "push")
+                        self.state = "recording"
+                        new_sess = self._session
             systemd_notify("STATUS=Dusky STT: idle")
-            if not self.warm:
+            if new_sess is not None:
+                # Chained take: the user tapped again mid-drain. New pill
+                # spawns with the new session.
+                systemd_notify("STATUS=Dusky STT: recording")
+                threading.Thread(target=self._run_session, args=(new_sess, False, None), daemon=True).start()
+            elif not self.warm:
                 threading.Thread(target=self._maybe_self_stop, daemon=True,
                                  name="dusky-self-stop").start()
 
