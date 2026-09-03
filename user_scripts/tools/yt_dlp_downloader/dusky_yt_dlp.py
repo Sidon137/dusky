@@ -733,6 +733,7 @@ class MediaJob:
     url: str
     mode: TargetFormat
     max_height: int | None = None
+    needs_probe: bool = False
 
 
 @dataclass(slots=True)
@@ -796,6 +797,26 @@ def translate_error(err_msg: str, mode: TargetFormat) -> str:
         if signature in lowered:
             return f"{err_msg} — {hint}"
     return err_msg
+
+
+def resolve_job_title(job: MediaJob) -> None:
+    """Just-in-time title for batch-sourced jobs (which skip upfront probing).
+
+    Runs one isolated flat probe right before download so Processing lines and
+    the final log show the real video/collection name instead of "Batch Item
+    N". Never raises: on any failure the generic title stays and the download
+    stage — with its retries and translated errors — reports the verdict.
+    Playlist lines keep single-video (`--no-playlist`) semantics; they are
+    simply labelled with the collection name.
+    """
+    try:
+        found, is_collection, label = probe_media_target(job.url)
+    except Exception:
+        return
+    if is_collection:
+        job.title = label
+    elif found:
+        job.title = found[0][0]
 
 
 def execute_download(
@@ -1388,7 +1409,7 @@ def run_interactive_wizard() -> tuple[list[MediaJob], Path]:
     jobs: list[MediaJob] = []
     if batch_urls is not None:
         jobs = [
-            MediaJob(title=f"Batch Item {idx}", url=u, mode=mode, max_height=max_height)
+            MediaJob(title=f"Batch Item {idx}", url=u, mode=mode, max_height=max_height, needs_probe=True)
             for idx, u in enumerate(batch_urls, start=1)
         ]
         console.print(f"[green]✓[/] Queued [yellow]{len(jobs)}[/] item(s) from batch file.")
@@ -1487,7 +1508,7 @@ def main() -> None:
             for err in probe_errors:
                 console.print(f"[bold yellow]![/] Skipped: {escape(err)}")
             discovered.extend(found)
-        jobs = [MediaJob(title=f"Item {idx}", url=u, mode=mode, max_height=max_height) for idx, u in enumerate(batch_urls, start=1)]
+        jobs = [MediaJob(title=f"Item {idx}", url=u, mode=mode, max_height=max_height, needs_probe=True) for idx, u in enumerate(batch_urls, start=1)]
         jobs.extend(
             MediaJob(title=item[0], url=item[1], mode=mode, max_height=max_height)
             for item in discovered
@@ -1511,9 +1532,19 @@ def main() -> None:
 
     reports: list[JobReport] = []
     for job in jobs:
+        if job.needs_probe:
+            resolve_job_title(job)
         console.print(f"[bold blue]•[/] Processing: [bold yellow]{escape(job.title)}[/]")
         res = execute_download(job, destination)
         reports.append(res)
+
+    n_ok = sum(1 for r in reports if r.status == "Success")
+    n_skip = sum(1 for r in reports if r.status == "Skipped")
+    n_fail = sum(1 for r in reports if r.status not in ("Success", "Skipped"))
+    console.print(
+        f"[green]✓[/] {n_ok} downloaded · [yellow]{n_skip} already done[/] · "
+        f"[{'green' if not n_fail else 'red'}]{n_fail} failed[/]"
+    )
 
     table = Table(
         title="Extraction Log",
@@ -1540,9 +1571,11 @@ def main() -> None:
 
     console.print("\n")
     console.print(table)
+    archive = download_archive_path(jobs[0].mode)
+    skip_line = f"\n[dim]Skip-state: {escape(str(archive))}[/]" if archive else ""
     console.print(
         Panel(
-            f"[bold green]Location:[/] [cyan]{destination}[/]\n"
+            f"[bold green]Location:[/] [cyan]{escape(str(destination))}[/]{skip_line}\n"
             f"[dim]Media downloaded with native titles directly into RAM/ZRAM.[/]",
             border_style="green",
         )
