@@ -47,6 +47,18 @@ Bare `dusky_trigger` toggles: idle → start realtime, recording → stop and fi
 Transcripts are pure Parakeet output (punctuated, ~6% WER) — there is no LLM
 cleanup stage and no Ollama dependency.
 
+## Power modes (follows the systemd unit)
+
+- **Service enabled** (default): **warm-resident**. The worker preloads at
+  boot and is never released — dictation is instant, VRAM stays held, and
+  the dGPU stays awake. For plugged-in / desktop use.
+- **Service disabled** (toggle off in the Dusky service TUI): **on-demand**.
+  The hotkey still works (the trigger starts the service), VRAM is held
+  only mid-job, then the worker exits and the service stops itself so the
+  dGPU can reach D3cold. For battery use.
+
+`dusky_trigger --unload` frees VRAM immediately in either mode.
+
 ## Verify
 
 ```bash

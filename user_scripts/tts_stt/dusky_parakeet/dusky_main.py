@@ -70,6 +70,19 @@ type JsonObject = dict[str, Any]
 REQUIRED_SEALS = fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE
 CUDA_TOKENS = ("libcuda.so", "libcudart.so", "libcublas", "libcudnn", "libnvrtc", "onnxruntime_providers_cuda")
 PUNCT = ".,?!:;\"'()[]{}"
+UNIT_NAME = "dusky_stt.service"
+NO_IDLE_EXIT_ENV = "DUSKY_WORKER_NO_IDLE_EXIT"
+
+
+def unit_is_enabled() -> bool | None:
+    """True if the user unit is enabled (warm-resident mode), False if
+    disabled (on-demand mode), None when the answer is unknowable."""
+    try:
+        r = subprocess.run(["systemctl", "--user", "is-enabled", UNIT_NAME],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() == "enabled"
 
 
 def assert_cpu_ort_namespace() -> None:
@@ -225,6 +238,11 @@ class StatefulSileroVad:
 class WorkerManager:
     def __init__(self, config: JsonObject) -> None:
         self.config = config
+        # Warm mode (service unit enabled): the worker is pre-spawned at
+        # boot and never released after sessions, so dictation is instant.
+        # The daemon sets this from unit_is_enabled(); the flag reaches the
+        # worker process as DUSKY_WORKER_NO_IDLE_EXIT (no idle exit there).
+        self.warm = False
         self._cv = threading.Condition(threading.RLock())
         self._proc: subprocess.Popen[bytes] | None = None
         self._sock: socket.socket | None = None
@@ -276,6 +294,9 @@ class WorkerManager:
             env["CUDA_VISIBLE_DEVICES"] = "-1"
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["HF_HUB_OFFLINE"] = "1"
+        if self.warm:
+            # Warm-resident service mode: the worker must not idle-exit.
+            env[NO_IDLE_EXIT_ENV] = "1"
         worker_py = APP_DIR / str(self.config.get("worker_python", ".venv-worker/bin/python"))
         worker_script = APP_DIR / str(self.config.get("worker_script", "dusky_worker.py"))
         cfg = APP_DIR / "config.json"
@@ -451,6 +472,13 @@ class WorkerManager:
                     self._discarded.pop()
                 self._inflight.pop(req_id, None)
             self._cv.notify_all()
+
+    def prewarm(self) -> None:
+        """Spawn the worker now (warm mode): model loads at boot so the
+        first dictation pays no cold-start. Best effort; the next submit
+        respawns transparently if this fails."""
+        with self._cv:
+            self._spawn_locked()
 
     def stop(self) -> None:
         with self._cv:
@@ -804,51 +832,39 @@ class RecordingSession:
     def run_file(self, path: Path) -> str:
         chunk_seconds = float(self.config.get("file_chunk_seconds", 20.0))
         per_request = float(self.config.get("finalize_timeout_seconds", 120.0))
-        try:
-            texts: list[str] = []
-            for i, ch in enumerate(decode_file_to_pcm(path, chunk_seconds)):
+        texts: list[str] = []
+        for i, ch in enumerate(decode_file_to_pcm(path, chunk_seconds)):
+            if self.stop_event.is_set():
+                break
+            if ch.size == 0:
+                continue
+            # Per-chunk retry: one transient worker crash must cost one
+            # retry, never a 20 s hole and never the remaining ~359 chunks.
+            res: JsonObject | None = None
+            for attempt in (1, 2):
                 if self.stop_event.is_set():
-                    break
-                if ch.size == 0:
-                    continue
-                # Per-chunk retry: one transient worker crash must cost one
-                # retry, never a 20 s hole and never the remaining ~359 chunks.
-                res: JsonObject | None = None
-                for attempt in (1, 2):
-                    if self.stop_event.is_set():
-                        res = None
-                        break
-                    try:
-                        req = self.daemon.worker.submit(
-                            ch, {"session_id": self.session_id, "phrase_id": i + 1, "final": True}, force=True)
-                    except OSError as exc:
-                        LOG.warning("Chunk %d submit failed (attempt %d): %s", i + 1, attempt, exc)
-                        req = None
-                    if req:
-                        # Stop-aware: --stop aborts within ~0.2 s instead of
-                        # one uninterruptible 120 s block.
-                        res = self._wait_interruptible(req, per_request)
-                    if res and res.get("text") and res.get("ok", True):
-                        break
-                    if res and not res.get("ok", True):
-                        LOG.warning("Chunk %d failed (attempt %d): %s", i + 1, attempt, res.get("error"))
                     res = None
+                    break
+                try:
+                    req = self.daemon.worker.submit(
+                        ch, {"session_id": self.session_id, "phrase_id": i + 1, "final": True}, force=True)
+                except OSError as exc:
+                    LOG.warning("Chunk %d submit failed (attempt %d): %s", i + 1, attempt, exc)
+                    req = None
+                if req:
+                    # Stop-aware: --stop aborts within ~0.2 s instead of
+                    # one uninterruptible 120 s block.
+                    res = self._wait_interruptible(req, per_request)
                 if res and res.get("text") and res.get("ok", True):
-                    texts.append(res["text"].strip())
-                elif not self.stop_event.is_set():
-                    LOG.error("Chunk %d skipped after retries; continuing file.", i + 1)
-            return self._publish(" ".join(texts).strip())
-        finally:
-            # Deterministic VRAM offload: a file job is batch work, so shut
-            # the worker down NOW instead of holding the CUDA context (and
-            # the dGPU in D0) until idle_timeout_seconds expires. Process
-            # exit is the only guaranteed CUDA teardown, which is what lets
-            # the GPU reach D3cold. Next request respawns on demand.
-            # (Realtime sessions deliberately stay warm for toggle latency.)
-            try:
-                self.daemon.worker.stop()
-            except Exception as exc:
-                LOG.debug("Worker release after file job failed: %s", exc)
+                    break
+                if res and not res.get("ok", True):
+                    LOG.warning("Chunk %d failed (attempt %d): %s", i + 1, attempt, res.get("error"))
+                res = None
+            if res and res.get("text") and res.get("ok", True):
+                texts.append(res["text"].strip())
+            elif not self.stop_event.is_set():
+                LOG.error("Chunk %d skipped after retries; continuing file.", i + 1)
+        return self._publish(" ".join(texts).strip())
 
     def _wait_interruptible(self, req_id: str, total: float) -> JsonObject | None:
         # Stop-aware single wait: --stop aborts within ~0.2 s instead of one
@@ -863,6 +879,17 @@ class DuskyDaemon:
         if self.config.get("schema_version") != 2:
             raise RuntimeError("config schema_version must be 2")
         self.worker = WorkerManager(self.config)
+        en = unit_is_enabled()
+        # Service ON (unit enabled)   -> warm-resident: model preloaded,
+        #                              instant dictation, VRAM held.
+        # Service OFF (unit disabled) -> on-demand: VRAM only mid-job, full
+        #                              release after, then self-stop.
+        # Unknown                     -> on-demand (battery-safe default).
+        self.warm = en is True
+        self.worker.warm = self.warm
+        LOG.info("Service mode: %s (unit %s)",
+                 "warm-resident" if self.warm else "on-demand",
+                 "enabled" if en is True else ("disabled" if en is False else "unknown, assuming on-demand"))
         self.state = "idle"
         self._lock = threading.RLock()
         self._session: RecordingSession | None = None
@@ -895,6 +922,7 @@ class DuskyDaemon:
             sess = self._session
             return {"ok": True, "state": self.state, "pid": os.getpid(), "worker_pid": self.worker.pid,
                     "hardware": self.config.get("hardware", "cpu"),
+                    "warm": self.warm,
                     "paused": bool(sess.paused.is_set()) if sess is not None else False,
                     "uptime_seconds": round(time.monotonic() - self._start_time, 1),
                     "rss_kib": self._rss(), "cuda_maps": cuda_maps(),
@@ -918,6 +946,11 @@ class DuskyDaemon:
         interval = watchdog_interval()
         systemd_notify("READY=1\nSTATUS=Dusky STT: idle")
         nxt = time.monotonic() + interval if interval else 0.0
+        if self.warm:
+            # Boot-time preload off the notify path: the model (~622 MB
+            # int8) loads in the background so the first keypress is instant.
+            threading.Thread(target=self._prewarm_worker, daemon=True,
+                             name="dusky-prewarm").start()
         try:
             while not self._stop.is_set():
                 timeout = max(0.05, min(0.5, nxt - time.monotonic())) if interval else 0.5
@@ -1034,6 +1067,32 @@ class DuskyDaemon:
             except OSError:
                 pass
 
+    def _prewarm_worker(self) -> None:
+        try:
+            self.worker.prewarm()
+        except Exception as exc:
+            LOG.warning("Worker prewarm failed (on-demand respawn still works): %s", exc)
+
+    def _maybe_self_stop(self) -> None:
+        """On-demand mode only: after a session, stop the whole service so
+        zero footprint remains (daemon RAM included). The next hotkey starts
+        it again via the trigger's ensure_service. Delayed so --wait clients
+        observe idle + transcript first; aborted if new work arrives or the
+        unit got enabled meanwhile."""
+        time.sleep(3.0)
+        with self._lock:
+            if self.state != "idle" or self._session is not None:
+                return
+        if self.warm or unit_is_enabled() is not False:
+            return
+        LOG.info("On-demand session complete and unit disabled; stopping service.")
+        try:
+            subprocess.run(["systemctl", "--user", "stop", UNIT_NAME],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=30, check=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            LOG.debug("Self-stop failed: %s", exc)
+
     def _run_session(self, sess: RecordingSession, is_file: bool, path: Path | None) -> None:
         self.state = "transcribing" if is_file else "recording"
         systemd_notify(f"STATUS=Dusky STT: {self.state}")
@@ -1060,10 +1119,23 @@ class DuskyDaemon:
                         indicator.kill()
                     except OSError:
                         pass
+            # On-demand mode: deterministic VRAM offload after every session
+            # (mic and file) so the dGPU can reach D3cold instead of burning
+            # battery until idle_timeout_seconds expires. Worker process exit
+            # is the only guaranteed CUDA teardown. Warm mode skips this:
+            # the model stays resident for instant dictation by design.
+            if not self.warm:
+                try:
+                    self.worker.stop()
+                except Exception as exc:
+                    LOG.debug("Worker release after session failed: %s", exc)
             with self._lock:
                 self.state = "idle"
                 self._session = None
             systemd_notify("STATUS=Dusky STT: idle")
+            if not self.warm:
+                threading.Thread(target=self._maybe_self_stop, daemon=True,
+                                 name="dusky-self-stop").start()
 
     @staticmethod
     def _spawn_indicator(sess: RecordingSession) -> "subprocess.Popen[bytes] | None":

@@ -104,14 +104,30 @@ def wait_for_transcript(baseline: float) -> JsonObject:
     """Poll until the daemon returns to idle, then print the transcript.
 
     Ctrl-C aborts only this client; the daemon keeps transcribing.
+    In on-demand mode the service stops itself after the job: a dead
+    socket then counts as done, and the transcript file is authoritative.
     """
     deadline = time.monotonic() + WAIT_DEADLINE_S
+    missed = 0
     try:
         while time.monotonic() < deadline:
             try:
                 st = send_command({"command": "status"}, timeout=DEFAULT_TIMEOUT)
-            except (OSError, ValueError, TimeoutError) as exc:
-                return {"ok": False, "error": f"status poll failed: {exc}"}
+                missed = 0
+            except (OSError, ValueError, TimeoutError):
+                st = None
+                missed += 1
+            if st is None:
+                # Daemon unreachable: either still booting (keep waiting) or
+                # self-stopped after finishing (transcript decides below).
+                # A crash mid-job looks the same, so give up after ~30 s of
+                # continuous silence with no transcript to show for it.
+                if newest_transcript(after=baseline) is not None:
+                    break
+                if missed >= 15:
+                    return {"ok": False, "error": "daemon unreachable for 30s (crashed mid-job?)"}
+                time.sleep(2.0)
+                continue
             if st.get("state", "idle") == "idle":
                 break
             time.sleep(2.0)
@@ -153,6 +169,10 @@ ACTIONS
   --restart           restart the service
   --kill              stop the service
   --logs              follow the daemon log
+
+POWER MODES (follow the systemd unit)
+  enabled   warm-resident: instant dictation, VRAM held, dGPU awake
+  disabled  on-demand: hotkey still works, VRAM mid-job only, auto-offload after
 
 HOTKEY EXAMPLES
   hyprland:  bind = SUPER, S, exec, dusky_trigger

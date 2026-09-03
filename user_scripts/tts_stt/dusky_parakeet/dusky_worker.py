@@ -324,16 +324,27 @@ def run_worker(fd: int, config_path: Path) -> int:
     send_response(sock, {"ok": True, "event": "ready", "hardware": hardware,
                          "providers": {k: list(v.get_providers()) for k, v in engine.sessions.items()}})
     timeout = max(5.0, float(cfg.get("idle_timeout_seconds", 90.0)))
+    # Warm-resident service mode: the daemon sets DUSKY_WORKER_NO_IDLE_EXIT
+    # so the model stays loaded for instant dictation (no D3cold in this
+    # mode by design; use `dusky_trigger --unload` or disable the service
+    # to free the GPU).
+    no_idle_exit = os.environ.get("DUSKY_WORKER_NO_IDLE_EXIT") == "1"
+    if no_idle_exit:
+        sys.stderr.write("dusky-worker: warm mode, idle exit disabled\n")
     sel = selectors.DefaultSelector()
     sel.register(sock, selectors.EVENT_READ)
-    deadline = time.monotonic() + timeout
+    deadline = None if no_idle_exit else time.monotonic() + timeout
     try:
         while True:
-            rem = deadline - time.monotonic()
-            if rem <= 0:
-                return 0
-            if not sel.select(timeout=min(rem, 1.0)):
-                continue
+            if deadline is None:
+                if not sel.select(timeout=1.0):
+                    continue
+            else:
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    return 0
+                if not sel.select(timeout=min(rem, 1.0)):
+                    continue
             try:
                 req, audio_fd = recv_request(sock)
             except ValueError as exc:
@@ -341,7 +352,8 @@ def run_worker(fd: int, config_path: Path) -> int:
                 continue
             if req is None:
                 return 0
-            deadline = time.monotonic() + timeout
+            if deadline is not None:
+                deadline = time.monotonic() + timeout
             op = req.get("op", "recognize")
             if op == "shutdown":
                 send_response(sock, {"ok": True, "request_id": req.get("request_id")})
