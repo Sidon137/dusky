@@ -43,6 +43,7 @@ REQUIRED_SYSTEM_BINARIES: Final[dict[str, str]] = {
 REQUIRED_PYTHON_MODULES: Final[dict[str, str]] = {
     "rich": "python-rich",
     "yt_dlp": "yt-dlp",
+    "prompt_toolkit": "python-prompt_toolkit",
 }
 
 MIN_PYTHON: Final[tuple[int, int]] = (3, 14)
@@ -114,8 +115,26 @@ from rich.progress import (
     TimeRemainingColumn,
     TransferSpeedColumn,
 )
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Prompt
 from rich.table import Table
+
+try:
+    from prompt_toolkit import prompt as pt_prompt
+    from prompt_toolkit.application.current import get_app
+    from prompt_toolkit.completion import PathCompleter
+    from prompt_toolkit.filters import Condition
+    from prompt_toolkit.history import FileHistory, InMemoryHistory
+    from prompt_toolkit.key_binding import KeyBindings
+
+    _PT_KEYS = KeyBindings()
+
+    @_PT_KEYS.add("c-d", filter=Condition(lambda: get_app().current_buffer.text == ""))
+    def _pt_eof_on_empty(event) -> None:
+        event.app.exit(exception=EOFError())
+
+    _PT_AVAILABLE = True
+except ImportError:  # pragma: no cover — bootstrap installs it via pacman
+    _PT_AVAILABLE = False
 
 console: Final[Console] = Console()
 
@@ -180,6 +199,81 @@ def fzf_pick(prompt: str, choices: list[str], default: str) -> str:
         choices=choices,
         default=default,
     )
+
+
+# ==============================================================================
+# Sophisticated line input (prompt_toolkit) with graceful degradation.
+#
+# Why not Rich's Prompt / bare input() here: Rich prints its styled prompt and
+# then reads through a bare input(), so readline never learns the true prompt
+# width — cursor tracking desyncs (backspace/arrows corrupt the line) and,
+# with no completer installed, Tab just inserts whitespace. prompt_toolkit
+# owns the whole render+edit loop: exact cursor model, Tab path-completion,
+# persistent history, Ctrl-C/D handling. Questions/hints are printed as plain
+# console lines first (kernel-script pattern); the editable line itself is
+# always exactly `>:` so nothing can desync.
+# ==============================================================================
+
+_PT_HISTORY: object | None = None
+
+
+def _input_history() -> object:
+    """Persistent input history in the state dir; in-memory if unwritable."""
+    global _PT_HISTORY
+    if _PT_HISTORY is None:
+        state_dir = config_state_dir() if "config_state_dir" in globals() else None
+        try:
+            _PT_HISTORY = FileHistory(str(state_dir / "input_history.txt")) if state_dir else InMemoryHistory()
+        except Exception:
+            _PT_HISTORY = InMemoryHistory()
+    return _PT_HISTORY
+
+
+def ask_text(prompt: str = ">: ", default: str = "", *, path_complete: bool = False) -> str:
+    """Read one line with full editing, history, and optional Tab path-completion.
+
+    Empty input returns `default` (kernel-script `ask()` semantics). Ctrl-D
+    also yields `default`; Ctrl-C exits 130 like the global signal handler.
+    With no TTY (pipes) or no prompt_toolkit, degrades to a plain read.
+    """
+    if _PT_AVAILABLE and sys.stdin.isatty():
+        try:
+            completer = PathCompleter(expanduser=True) if path_complete else None
+            text = pt_prompt(
+                prompt,
+                completer=completer,
+                history=_input_history(),  # type: ignore[arg-type]
+                key_bindings=_PT_KEYS,
+                enable_history_search=True,
+            )
+            return text.strip() or default
+        except EOFError:
+            console.print("")
+            return default
+        except KeyboardInterrupt:
+            console.print("\n[bold red][!] Interrupted.[/]")
+            sys.exit(130)
+    try:
+        return input(prompt).strip() or default
+    except EOFError:
+        return default
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+def ask_confirm(question: str, default: bool = False) -> bool:
+    """Yes/no question with validation loop (kernel-script `ask_yes()` semantics)."""
+    hint = "Y/n" if default else "y/N"
+    console.print(f"[bold green]?[/] {question} [dim]({hint})[/]")
+    while True:
+        val = ask_text(">: ").lower()
+        if not val:
+            return default
+        if val in ("y", "yes"):
+            return True
+        if val in ("n", "no"):
+            return False
+        console.print("[bold red]Answer y or n.[/]")
 
 
 # ==============================================================================
@@ -1184,10 +1278,13 @@ def run_interactive_wizard() -> tuple[list[MediaJob], Path]:
     multi_mode = False
 
     while True:
-        raw_target = Prompt.ask(
-            "\n[bold green]?[/] Enter media link(s), playlist URL, or batch file path"
-            "\n[dim]Several links? Separate them with commas.[/]"
-        ).strip()
+        # Hint on its own line (kernel-script pattern): Rich prints the prompt
+        # then reads via bare input(), so a multi-line prompt string corrupts
+        # readline's cursor tracking and line editing eats characters. A
+        # single-line ask keeps navigation/redraw exact.
+        console.print("\n[bold green]?[/] Enter media link(s), playlist URL, or batch file path")
+        console.print("[dim]Several links? Separate them with commas. Tab completes file paths.[/]")
+        raw_target = ask_text(">: ", path_complete=True)
         if not raw_target:
             continue
 
@@ -1303,25 +1400,24 @@ def run_interactive_wizard() -> tuple[list[MediaJob], Path]:
         jobs = [MediaJob(title=details.title if details else title, url=link, mode=mode, max_height=max_height)]
     else:
         total = len(discovered)
-        if total > 1 and Confirm.ask("[bold green]?[/] Invert order? (Oldest ➔ Newest)", default=False):
+        if total > 1 and ask_confirm("Invert order? (Oldest ➔ Newest)", default=False):
             discovered.reverse()
 
         while True:
-            range_val = Prompt.ask(
-                "[bold green]?[/] Range ('all', '5', '1-3' or '1:10:2')",
-                default="all",
-            ).strip()
+            console.print("[bold green]?[/] Range ('all', '5', '1-3' or '1:10:2') [dim][all][/]")
+            range_val = ask_text(">: ", default="all")
             try:
                 picked = select_playlist_items(discovered, range_val)
                 break
             except ValueError as err:
-                console.print(f"[bold red]{err}[/]")
+                console.print(f"[bold red]{escape(str(err))}[/]")
 
         jobs = [MediaJob(title=item[0], url=item[1], mode=mode, max_height=max_height) for item in picked]
         console.print(f"[green]✓[/] Queued [yellow]{len(jobs)}[/] item(s).")
 
     default_dir = resolve_storage_pool()
-    custom_dir = Prompt.ask("[bold green]?[/] Target directory (ZRAM)", default=str(default_dir))
+    console.print(f"[bold green]?[/] Target directory (ZRAM) [dim](default: {escape(str(default_dir))})[/]")
+    custom_dir = ask_text(">: ", default=str(default_dir), path_complete=True)
     destination = resolve_storage_pool(Path(custom_dir).expanduser())
     if destination != Path(custom_dir).expanduser():
         console.print(f"[bold yellow]![/] Requested path unusable; using [cyan]{destination}[/].")
