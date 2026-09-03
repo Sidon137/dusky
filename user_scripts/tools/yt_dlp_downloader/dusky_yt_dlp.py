@@ -179,6 +179,19 @@ ABORT_WINDOW_SECS: Final[float] = 3.0
 _SLOT_PGIDS: dict[object, int] = {}
 _SLOT_TITLES: dict[object, str] = {}
 _SLOT_LOCK: Final[threading.Lock] = threading.Lock()
+# One-shot skip flags per worker NUMBER (1-based). Set by digit keys / `s` /
+# single Ctrl-C; consumed at the next spawn gate or discarded when the current
+# occupant ends — the invariant is a flag NEVER survives its occupant, so an
+# innocent later job can never inherit a skip. Guarded by _SLOT_LOCK.
+_SLOT_SKIP: set[int] = set()
+# Worker numbers currently holding a slot (claimed, maybe still probing with
+# no yt-dlp process yet). Lets `s`/Ctrl-C mark starting jobs instead of
+# reporting "nothing active" while they escape. Guarded by _SLOT_LOCK.
+_BUSY_SLOT_NOS: set[int] = set()
+# Fallback one-shot for the truly idle instant (no active pgid, no busy slot
+# — e.g. a lone sequential probe): the next spawn without a slot number
+# consumes it and reports Skipped. Concurrent slots use _SLOT_SKIP instead.
+SKIP_NEXT_ONE_SHOT: Final[threading.Event] = threading.Event()
 
 
 def _sigwrite(msg: str) -> None:
@@ -229,31 +242,75 @@ def request_abort_all() -> None:
 def skip_slot_by_number(slots: list[object], worker_no: int) -> str:
     """Skip worker `worker_no` (1-based); returns a human status message.
 
-    Pure lookup + signal logic (no TTY reads), so it is unit-testable and
-    shared by the key-reader thread. Unknown/idle workers yield a message
-    instead of raising.
+    One-shot and escape-free: the slot number is flagged AND any live process
+    group is SIGTERMed. A job still probing (no pgid yet) hits the flag at
+    its spawn gate and reports Skipped without starting; a live one dies and
+    maps to Skipped. Pure lookup + signal logic (no TTY reads), so it is
+    unit-testable and shared by the key-reader thread.
     """
     if worker_no < 1 or worker_no > len(slots):
         return f"No worker {worker_no} (1–{len(slots)})."
     slot = slots[worker_no - 1]
     with _SLOT_LOCK:
+        _SLOT_SKIP.add(worker_no)  # sticky until this occupant ends
         pgid = _SLOT_PGIDS.get(slot)
         title = _SLOT_TITLES.get(slot, "")
-    if pgid is None:
-        return f"Worker {worker_no} is idle — nothing to skip."
-    n = request_skip_pgids([pgid])
+        busy = worker_no in _BUSY_SLOT_NOS
     label = f" ({title})" if title else ""
-    return f"Skipping worker {worker_no}{label}." if n else f"Worker {worker_no} already finished."
+    if pgid is not None:
+        n = request_skip_pgids([pgid])
+        if n:
+            return f"Skipping worker {worker_no}{label}."
+        # Process vanished between lookup and kill: the sticky flag still
+        # guards the gate, but report honestly.
+        return f"Worker {worker_no}{label} just finished; marked if it restarts."
+    if busy:
+        return f"Worker {worker_no}{label} is starting — will skip it."
+    # Slot idle: nothing to target, so drop the flag we just added.
+    with _SLOT_LOCK:
+        _SLOT_SKIP.discard(worker_no)
+    return f"Worker {worker_no} is idle — nothing to skip."
+
+
+def skip_all_active() -> str:
+    """Skip every active download plus every starting (probing) one.
+
+    Shared by the `s` key and single Ctrl-C. Returns a status message; the
+    multi-skip variant carries the tip about per-worker digits exactly when
+    the user pays for the broadcast (skipped >1) — i.e. precisely when the
+    tip is relevant.
+    """
+    pgids = _snapshot_pgids()
+    with _SLOT_LOCK:
+        busy = sorted(_BUSY_SLOT_NOS)
+        _SLOT_SKIP.update(busy)
+    if pgids:
+        request_skip_pgids(pgids)
+    if not pgids and not busy:
+        SKIP_NEXT_ONE_SHOT.set()
+        return "Nothing running right now — next download will be skipped."
+    bits = []
+    if pgids:
+        bits.append(f"{len(pgids)} active")
+    starting = [b for b in busy]
+    if starting:
+        bits.append(f"{len(starting)} starting")
+    msg = f"Skipping {' + '.join(bits)} download(s)."
+    if len(pgids) > 1:
+        msg += " (Tip: press 1, 2, 3... to skip just one worker.)"
+    return msg
 
 
 def global_signal_handler(signum: int, frame: object) -> None:
-    """Single Ctrl-C skips active downloads; double (within 3s) aborts all.
+    """Single Ctrl-C skips the current wave; double (within 3s) aborts all.
 
     Outside the queue phase (wizard prompts, probing setup) there is nothing
     skippable, so the legacy kill-everything-and-exit-130 applies. Inside the
-    queue phase the handler never calls sys.exit — it only flags + signals,
-    letting run_queue unwind naturally (print partial log, exit 130). This
-    also eliminates the old `SystemExit` noise during interpreter shutdown.
+    queue phase the handler NEVER calls sys.exit — not even when no process
+    group exists yet (all workers probing): it flags starting slots / arms
+    the one-shot instead, letting run_queue unwind naturally (partial log,
+    exit 130 on abort). This closes both the probe-gap kill-all and the old
+    `SystemExit`-during-interpreter-shutdown traceback.
     """
     global _LAST_SIGINT_NS
     now_ns = time.monotonic_ns()
@@ -265,10 +322,9 @@ def global_signal_handler(signum: int, frame: object) -> None:
 
     with _ACTIVE_PG_LOCK:
         running = _QUEUE_RUNNING
-        active = list(ACTIVE_PROCESS_GROUPS)
-    if not running or not active:
-        # Wizard/input phase (or a between-jobs gap): nothing to skip.
-        _kill_pgids(active)
+    if not running:
+        # Wizard/input phase: nothing to skip.
+        _kill_pgids(_snapshot_pgids())
         _sigwrite("\n[!] Interrupted: terminating process tree...")
         sys.exit(130)
 
@@ -278,13 +334,7 @@ def global_signal_handler(signum: int, frame: object) -> None:
         request_abort_all()
         _sigwrite("\n[!] Aborting everything (2nd Ctrl-C)...")
         return
-    with _SKIP_LOCK:
-        USER_SKIPPED_PGIDS.update(active)
-    _kill_pgids(active)
-    _sigwrite(
-        f"\n[!] Skipping {len(active)} active download(s)... "
-        "press Ctrl-C again within 3s to abort all."
-    )
+    _sigwrite(f"\n[!] {skip_all_active()} (Ctrl-C again within 3s aborts all.)")
 
 
 signal.signal(signal.SIGINT, global_signal_handler)
@@ -1119,18 +1169,20 @@ def execute_download(
     timeout_secs: float | None = None,
     progress: Progress | None = None,
     task_id: object | None = None,
+    slot_no: int | None = None,
 ) -> JobReport:
     """Download one job; optionally joins a shared live `Progress` display.
 
     Sequential callers omit `progress` (a private transient bar is created).
-    Concurrent workers pass the shared `progress` plus their claimed worker
-    `task_id` slot. Everything else — parser state, stderr ring, process
-    group — stays per-job local, so any number of threads may run this
-    simultaneously.
+    Concurrent workers pass the shared `progress`, their claimed worker
+    `task_id` slot, and its 1-based `slot_no` (rendered as `W<n>`).
 
-    User-skip awareness: when the slot's process group was SIGTERMed via a
-    skip request (per-worker key / single Ctrl-C), the non-zero exit maps to
-    Skipped, not Failed; a full abort maps to Failed("aborted...").
+    User-skip awareness: a sticky one-shot flag for this slot (digit key /
+    `s` / single Ctrl-C arriving while the job probed) is consumed at the
+    spawn gate — the job reports Skipped without starting yt-dlp. A SIGTERMed
+    live process maps to Skipped; a full abort maps to Failed("aborted...").
+    Completed files are never touched by any skip/abort path (only the
+    child's partial `.part`, which yt-dlp resumes on retry, is left behind).
     """
     runner = YtdlpRunner(job.mode, output_dir, job.url, job.max_height)
     parser = YtdlpProgressParser()
@@ -1143,6 +1195,16 @@ def execute_download(
         before_names: set[str] = {p.name for p in output_dir.iterdir() if p.is_file()}
     except OSError:
         before_names = set()
+
+    if slot_no is not None:
+        with _SLOT_LOCK:
+            gated = slot_no in _SLOT_SKIP
+            _SLOT_SKIP.discard(slot_no)
+        if gated:
+            return JobReport(title=job.title, status="Skipped", error="skipped by user")
+    elif SKIP_NEXT_ONE_SHOT.is_set():
+        SKIP_NEXT_ONE_SHOT.clear()
+        return JobReport(title=job.title, status="Skipped", error="skipped by user")
 
     proc: subprocess.Popen | None = None
     pgid: int | None = None
@@ -1212,7 +1274,7 @@ def execute_download(
     stdout_thread.start()
     stderr_thread.start()
 
-    display_title = _short_title(job.title)
+    display_title = f"W{slot_no} {_short_title(job.title)}" if slot_no else _short_title(job.title)
 
     if progress is None:
         try:
@@ -1478,30 +1540,14 @@ def _spawn_control_thread(
                     request_abort_all()
                     console.print("[bold red][!] Aborting everything (q)...[/]")
                 elif ch in ("s", "S", "x", "X"):
-                    pgids = _snapshot_pgids()
-                    if not pgids:
-                        console.print("[dim]Nothing active to skip.[/]")
-                    else:
-                        request_skip_pgids(pgids)
-                        console.print(
-                            f"[bold yellow][!][/] Skipping {len(pgids)} active download(s)... "
-                            "[dim](press q to abort all)[/]"
-                        )
+                    console.print(f"[bold yellow][!][/] {escape(skip_all_active())}")
                 elif ch.isdigit() and ch != "0":
                     if slots:
                         msg = skip_slot_by_number(slots, int(ch))
-                        style = "yellow" if "ipping" in msg else "dim"
+                        style = "yellow" if "kip" in msg else "dim"
                         console.print(f"[bold {style}][!][/] {escape(msg)}")
-                    else:  # sequential run: no slots, digit == skip active
-                        pgids = _snapshot_pgids()
-                        if not pgids:
-                            console.print("[dim]Nothing active to skip.[/]")
-                        else:
-                            request_skip_pgids(pgids)
-                            console.print(
-                                f"[bold yellow][!][/] Skipping {len(pgids)} active download(s)... "
-                                "[dim](press q to abort)[/]"
-                            )
+                    else:  # sequential run: no slots, digit == skip all
+                        console.print(f"[bold yellow][!][/] {escape(skip_all_active())}")
                 elif ch == "\x03":  # Ctrl-C in cbreak arrives here, not as SIGINT
                     global_signal_handler(signal.SIGINT, None)
         finally:
@@ -1534,8 +1580,11 @@ def run_queue(
     thread-safe `Progress.update`. Full titles print on pickup/completion
     lines (bars stay compact by necessity).
 
-    Live controls on a TTY: `1`–`N` skip that worker, `s` skip all active,
-    `q` abort; single Ctrl-C skips active, double aborts.
+    Live controls on a TTY: `1`–`N` skip exactly that worker's job (bars and
+    pickup lines are tagged `W1`…`WN`), `s` skips the whole current wave,
+    `q` aborts; single Ctrl-C == `s`, double == abort. Skip flags are sticky
+    one-shots: a job still probing is skipped at its spawn gate and can never
+    escape, and a flag never leaks onto the slot's next job.
     """
     global _QUEUE_RUNNING
     workers = clamp_concurrent(max_workers, len(jobs))
@@ -1586,50 +1635,61 @@ def run_queue(
     def _one(idx: int, job: MediaJob, shared: Progress, slots: queue.SimpleQueue) -> JobReport:
         if ABORT_ALL_EVENT.is_set():
             return JobReport(title=job.title, status="Failed", error="aborted by user (Ctrl-C)")
-        slot = slots.get()
+        slot, slot_no = slots.get()
+        with _SLOT_LOCK:
+            _BUSY_SLOT_NOS.add(slot_no)
+            _SLOT_TITLES[slot] = job.title
         try:
             if job.needs_probe:
                 try:
-                    shared.update(slot, title=f"[{idx + 1}/{len(jobs)}] probing…")  # type: ignore[arg-type]
+                    shared.update(slot, title=f"W{slot_no} [{idx + 1}/{len(jobs)}] probing…")  # type: ignore[arg-type]
                 except Exception:
                     pass
                 resolve_job_title(job)
+                with _SLOT_LOCK:
+                    _SLOT_TITLES[slot] = job.title
             if ABORT_ALL_EVENT.is_set():
                 return JobReport(title=job.title, status="Failed", error="aborted by user (Ctrl-C)")
             # Full title to scrollback (bars truncate by necessity); worker
             # print is safe during Live (Rich renders it above the bars).
-            console.print(f"[dim][{idx + 1}/{len(jobs)}] ▶ {escape(job.title)}[/]")
+            # The (W<n>) tag is the digit to press to skip exactly this job.
+            console.print(f"[dim][{idx + 1}/{len(jobs)}] (W{slot_no}) ▶ {escape(job.title)}[/]")
             try:
                 shared.update(  # type: ignore[arg-type]
-                    slot, title=f"[{idx + 1}/{len(jobs)}] {_short_title(job.title)}",
+                    slot, title=f"W{slot_no} [{idx + 1}/{len(jobs)}] {_short_title(job.title)}",
                 )
             except Exception:
                 pass
             return execute_download(
                 job, destination,
-                progress=shared, task_id=slot,
+                progress=shared, task_id=slot, slot_no=slot_no,
             )
         finally:
             try:
                 shared.update(  # type: ignore[arg-type]
-                    slot, title="Worker", description="[idle]",
+                    slot, title=f"W{slot_no}", description="[idle]",
                     completed=0, total=None,
                 )
             except Exception:
                 pass
-            slots.put(slot)
+            with _SLOT_LOCK:
+                # The flag must never survive its occupant: consume here as
+                # the backstop (spawn gate + kill path consume earlier).
+                _SLOT_SKIP.discard(slot_no)
+                _BUSY_SLOT_NOS.discard(slot_no)
+            slots.put((slot, slot_no))
 
     stop_event = threading.Event()
     key_thread: threading.Thread | None = None
     try:
         with make_progress() as shared:
             slot_ids: list[object] = [
-                shared.add_task("[idle]", total=None, title=f"Worker {w + 1}")
+                shared.add_task("[idle]", total=None, title=f"W{w + 1}")
                 for w in range(workers)
             ]
             slots: queue.SimpleQueue = queue.SimpleQueue()
-            for sid in slot_ids:
-                slots.put(sid)
+            for w, sid in enumerate(slot_ids, start=1):
+                slots.put((sid, w))
             key_thread = _spawn_control_thread(stop_event, slot_ids, workers)
             with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dusky-dl") as pool:
                 future_to_idx = {
