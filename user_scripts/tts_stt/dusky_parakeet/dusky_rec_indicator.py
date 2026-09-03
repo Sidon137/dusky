@@ -30,25 +30,28 @@ gi.require_version("Gdk", "3.0")
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gdk, Gtk, GLib  # noqa: E402
 
+# System theme colors only (adw-gtk3-dark here): nothing hardcoded, so the
+# pill follows the user's GTK theme / matugen setup automatically.
+# alpha()/shade()/mix() are GTK3 CSS builtins for deriving variants.
 APP_CSS = b"""
 #dusky-rec {
-    background-color: rgba(24, 24, 28, 0.93);
+    background-color: alpha(@theme_bg_color, 0.94);
     border-radius: 18px;
-    border: 1px solid rgba(255, 255, 255, 0.14);
+    border: 1px solid shade(@theme_bg_color, 0.72);
 }
-#dusky-rec label { color: #f2f2f4; }
+#dusky-rec label { color: @theme_fg_color; }
 #rec-label { font-weight: 800; font-size: 14px; letter-spacing: 2px; }
-#time-label { font-size: 14px; color: #c9c9d1; }
-#dot { font-size: 15px; }
+#time-label { font-size: 14px; color: mix(@theme_fg_color, @theme_bg_color, 0.35); }
+#dot { font-size: 15px; color: @theme_selected_bg_color; }
 #dusky-rec button {
-    background: transparent;
-    border: 1px solid rgba(255, 255, 255, 0.16);
+    background-color: transparent;
+    border: 1px solid shade(@theme_bg_color, 0.72);
     border-radius: 10px;
-    color: #f2f2f4;
+    color: @theme_fg_color;
     padding: 4px 12px;
     font-size: 13px;
 }
-#dusky-rec button:hover { background: rgba(255, 255, 255, 0.12); }
+#dusky-rec button:hover { background-color: alpha(@theme_fg_color, 0.1); }
 """
 
 MAX_PACKET = 65536
@@ -186,13 +189,14 @@ class Indicator:
         return False
 
     def _paint(self) -> None:
+        # Pulse via widget opacity against the theme accent dot: no
+        # hardcoded colors anywhere, full opacity when paused.
         if self.paused:
-            self.dot.set_markup('<span color="#ffb340">●</span>')
+            self.dot.set_opacity(1.0)
             self.rec.set_text("PAUSED")
             self.pause_btn.set_label("▶")
         else:
-            color = "#ff453a" if self._pulse_on else "#7a2622"
-            self.dot.set_markup(f'<span color="{color}">●</span>')
+            self.dot.set_opacity(1.0 if self._pulse_on else 0.3)
             self.rec.set_text("REC")
             self.pause_btn.set_label("❚❚")
 
