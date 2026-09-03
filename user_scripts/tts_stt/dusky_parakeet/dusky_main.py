@@ -582,6 +582,10 @@ class RecordingSession:
         self.typer = StableSuffixTyper(int(self.config.get("stable_holdback_words", 2))) if realtime else None
         self.phrases: list[str] = []
         self.phrase_id = 0
+        # Set by the "pause" control command (indicator pause button):
+        # while set, mic frames are read-and-discarded so the stream never
+        # overflows, and VAD restarts fresh on resume.
+        self.paused = threading.Event()
         # Live-typing state is touched from the capture thread (interim) and
         # the finalizer thread (final): always hold this around typer calls.
         self._typer_lock = threading.Lock()
@@ -597,6 +601,15 @@ class RecordingSession:
 
     def _publish(self, final_text: str) -> str:
         if not final_text:
+            # A tap with no detected speech previously ended in total
+            # silence, which reads as "the keybind is broken". Say so.
+            if self.config.get("notifications", True):
+                try:
+                    subprocess.run(["notify-send", "-a", "Dusky STT", "-t", "2500",
+                                    "Nothing transcribed", "No speech detected — try again, speaking clearly."],
+                                   check=False, timeout=5)
+                except (OSError, subprocess.SubprocessError) as exc:
+                    LOG.warning("notify-send failed: %s", exc)
             return ""
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         out_dir = Path(str(self.config.get("state_dir", "~/.local/state/dusky-stt"))).expanduser() / "transcripts"
@@ -664,14 +677,17 @@ class RecordingSession:
                 LOG.error("Phrase %d skipped after retries; continuing session.", phrase_id)
 
     def _offer_final(self, phrase_id: int, pcm: np.ndarray) -> None:
-        """Hand a snapshot to the finalizer without stalling the mic."""
-        while not self.stop_event.is_set():
-            try:
-                self._final_q.put((phrase_id, pcm), timeout=0.2)
-                return
-            except queue.Full:
-                continue
-        LOG.warning("Phrase %d dropped: session stopping with a full final queue.", phrase_id)
+        """Hand a snapshot to the finalizer without stalling the mic.
+
+        Bounded blocking put (never endless): dropping a phrase after 10 s
+        against a wedged worker is better than wedging capture forever.
+        Deliberately stop-agnostic so the trailing-phrase flush on --stop
+        still lands in the queue for the drain.
+        """
+        try:
+            self._final_q.put((phrase_id, pcm), timeout=10.0)
+        except queue.Full:
+            LOG.warning("Phrase %d dropped: final queue full (worker wedged?).", phrase_id)
 
     def run(self) -> str:
         self._final_thread = threading.Thread(target=self._finalizer_loop,
@@ -711,6 +727,22 @@ class RecordingSession:
                 if overflowed:
                     LOG.warning("PortAudio input overflow: audio lost before VAD (system under load?).")
                 frame = np.frombuffer(raw, dtype="<i2").copy()
+                if self.paused.is_set():
+                    # Keep the stream flowing (no overflow) but drop everything.
+                    if active or pending_interim is not None:
+                        if pending_interim is not None:
+                            self.daemon.worker.cancel(pending_interim)
+                            pending_interim = None
+                        if active and len(self.ring) >= min_speech:
+                            self._offer_final(self.phrase_id, self.ring.read())
+                        active = False
+                        onset = silence = 0
+                        self.pre_roll.clear()
+                        self.vad.reset()
+                        if self.typer:
+                            with self._typer_lock:
+                                self.typer.reset()
+                    continue
                 prob = self.vad.probability(frame)
                 # Collect any finished interim result without blocking: the
                 # mic stalls for exactly 0 s waiting on inference now.
@@ -759,6 +791,15 @@ class RecordingSession:
                         self.vad.reset()
                         if self.ring.dropped_samples:
                             LOG.warning("Ring overflow dropped %d samples", self.ring.dropped_samples)
+            # Trailing speech: stopping mid-utterance (before 0.8 s of
+            # silence elapse) must not delete the last sentence. Flush
+            # whatever is still in the ring; the finalizer drains it before
+            # publish, so --stop preserves the final words.
+            if active:
+                if pending_interim is not None:
+                    self.daemon.worker.cancel(pending_interim)
+                if len(self.ring) >= min_speech:
+                    self._offer_final(self.phrase_id, self.ring.read())
 
     def run_file(self, path: Path) -> str:
         chunk_seconds = float(self.config.get("file_chunk_seconds", 20.0))
@@ -851,11 +892,13 @@ class DuskyDaemon:
 
     def status(self) -> JsonObject:
         with self._lock:
+            sess = self._session
             return {"ok": True, "state": self.state, "pid": os.getpid(), "worker_pid": self.worker.pid,
                     "hardware": self.config.get("hardware", "cpu"),
+                    "paused": bool(sess.paused.is_set()) if sess is not None else False,
                     "uptime_seconds": round(time.monotonic() - self._start_time, 1),
                     "rss_kib": self._rss(), "cuda_maps": cuda_maps(),
-                    "dropped_samples": self._session.ring.dropped_samples if self._session else 0}
+                    "dropped_samples": sess.ring.dropped_samples if sess else 0}
 
     @staticmethod
     def _rss() -> int:
@@ -916,6 +959,10 @@ class DuskyDaemon:
                 return
             cmd = req.get("command")
             resp: JsonObject = {"ok": False, "error": f"unknown command {cmd!r}"}
+            # No mid-session toasts here by design: the on-screen recording
+            # pill already covers the session lifetime (recording/paused
+            # states included). Notifications fire only for outcomes
+            # (transcription complete / nothing detected / capture failed).
             with self._lock:
                 if cmd == "status":
                     resp = self.status()
@@ -937,6 +984,17 @@ class DuskyDaemon:
                     if self._session:
                         self._session.stop_event.set()
                         resp = {"ok": True, "state": "finalizing"}
+                    else:
+                        resp = {"ok": False, "error": "not recording", "state": self.state}
+                elif cmd == "pause":
+                    sess = self._session
+                    if sess is not None and self.state == "recording":
+                        if sess.paused.is_set():
+                            sess.paused.clear()
+                            resp = {"ok": True, "event": "resumed", "state": self.state}
+                        else:
+                            sess.paused.set()
+                            resp = {"ok": True, "event": "paused", "state": self.state}
                     else:
                         resp = {"ok": False, "error": "not recording", "state": self.state}
                 elif cmd == "unload":
@@ -979,15 +1037,47 @@ class DuskyDaemon:
     def _run_session(self, sess: RecordingSession, is_file: bool, path: Path | None) -> None:
         self.state = "transcribing" if is_file else "recording"
         systemd_notify(f"STATUS=Dusky STT: {self.state}")
+        indicator: subprocess.Popen | None = None
+        if not is_file:
+            indicator = self._spawn_indicator(sess)
         try:
             sess.run_file(path) if (is_file and path) else sess.run()
         except Exception as exc:
             LOG.error("Session failed: %s", exc)
+            if self.config.get("notifications", True):
+                try:
+                    subprocess.run(["notify-send", "-a", "Dusky STT", "-t", "5000",
+                                    "Capture failed", str(exc)[:220]], check=False, timeout=5)
+                except (OSError, subprocess.SubprocessError):
+                    pass
         finally:
+            if indicator is not None:
+                try:
+                    indicator.terminate()
+                    indicator.wait(timeout=2.0)
+                except (OSError, subprocess.TimeoutExpired):
+                    try:
+                        indicator.kill()
+                    except OSError:
+                        pass
             with self._lock:
                 self.state = "idle"
                 self._session = None
             systemd_notify("STATUS=Dusky STT: idle")
+
+    @staticmethod
+    def _spawn_indicator(sess: RecordingSession) -> "subprocess.Popen[bytes] | None":
+        """Show the on-screen recording pill (best effort, never fatal)."""
+        try:
+            script = APP_DIR / "dusky_rec_indicator.py"
+            if not script.is_file():
+                return None
+            return subprocess.Popen(["/usr/bin/python3", str(script), "--session", sess.session_id],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError as exc:
+            LOG.warning("Recording indicator unavailable: %s", exc)
+            return None
 
 
 def main() -> int:

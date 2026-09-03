@@ -145,6 +145,7 @@ ACTIONS
   (none) / --toggle   start realtime if idle, else stop and finalize
   --start [--realtime|--push]   begin capture (realtime live-types as you speak)
   --stop              stop capture and finalize (waits for the last phrase)
+  --pause             pause / resume capture (keeps the session)
   --status            daemon status
   --file PATH         transcribe any ffmpeg-readable file (2 h+ supported)
   --wait              with --file: block until idle, then print the transcript
@@ -160,6 +161,7 @@ HOTKEY EXAMPLES
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--start", action="store_true")
     g.add_argument("--stop", action="store_true")
+    g.add_argument("--pause", action="store_true", help="Pause / resume the current capture")
     g.add_argument("--toggle", action="store_true")
     g.add_argument("--status", action="store_true")
     g.add_argument("--file", type=Path, default=None, help="Transcribe audio/video file")
@@ -196,6 +198,8 @@ HOTKEY EXAMPLES
         resp = send_command({"command": "start", "mode": mode}, timeout=args.timeout)
     elif args.stop:
         resp = send_command({"command": "stop"}, timeout=max(args.timeout, 180.0))
+    elif args.pause:
+        resp = send_command({"command": "pause"}, timeout=args.timeout)
     elif args.file is not None:
         src = args.file.expanduser()
         if not src.is_file():

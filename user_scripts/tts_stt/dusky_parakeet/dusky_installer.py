@@ -46,7 +46,7 @@ DEFAULT_STATE_DIR = Path.home() / ".local" / "state" / "dusky-stt"
 DEFAULT_MODEL_ROOT = Path.home() / ".local" / "share" / "dusky-stt" / "models"
 
 SOURCE_DIR = Path(__file__).resolve().parent
-REQUIRED_SOURCES = ("dusky_main.py", "dusky_worker.py", "dusky_trigger.py", "dusky_verify.sh", UNIT_NAME)
+REQUIRED_SOURCES = ("dusky_main.py", "dusky_worker.py", "dusky_trigger.py", "dusky_rec_indicator.py", "dusky_verify.sh", UNIT_NAME)
 
 BASE_PACKAGES = (
     "pipewire",
@@ -576,7 +576,7 @@ def main(argv: list[str]) -> int:
     try:
         for name in REQUIRED_SOURCES:
             shutil.copy2(SOURCE_DIR / name, stage / name)
-        for name in ("dusky_main.py", "dusky_worker.py", "dusky_trigger.py", "dusky_verify.sh"):
+        for name in ("dusky_main.py", "dusky_worker.py", "dusky_trigger.py", "dusky_rec_indicator.py", "dusky_verify.sh"):
             os.chmod(stage / name, 0o755)
         main_py, worker_py = install_python_environments(stage, hardware)
         silero_hash = download_silero(stage, args.silero_sha256)
