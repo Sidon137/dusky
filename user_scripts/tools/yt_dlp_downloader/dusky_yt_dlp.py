@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import queue
 from pathlib import Path
 import re
 import shutil
@@ -97,8 +98,10 @@ bootstrap_dependencies()
 # ==============================================================================
 
 import argparse
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from enum import StrEnum
+from urllib.parse import unquote, urlsplit
 
 import yt_dlp
 from rich import box
@@ -138,24 +141,150 @@ except ImportError:  # pragma: no cover — bootstrap installs it via pacman
 
 console: Final[Console] = Console()
 
+# ==============================================================================
+# USER CONFIG — tune these defaults to taste (wizard prompt + CLI flags can
+# still override per run).
+# ==============================================================================
+# How many files download at once when the queue holds several items
+# (playlist / multi-URL / batch file). The wizard asks each time; `-N` /
+# `--concurrent` overrides non-interactively. Capped interactively at
+# MAX_CONCURRENT_DOWNLOADS to protect ZRAM/RAM (each job holds its own
+# yt-dlp + FFmpeg children); an explicit CLI flag may exceed the cap up to
+# the queue length.
+DEFAULT_CONCURRENT_DOWNLOADS: Final[int] = 3
+MAX_CONCURRENT_DOWNLOADS: Final[int] = 8
+
 PRIMARY_ZRAM_TARGET: Final[Path] = Path("/mnt/zram1/dusky_ytdlp")
 RAM_TMPFS_FALLBACK: Final[Path] = Path("/dev/shm/dusky_ytdlp")
 
 ACTIVE_PROCESS_GROUPS: set[int] = set()
 _ACTIVE_PG_LOCK: Final[threading.Lock] = threading.Lock()
 
+# --- Mid-run skip/abort state (see run_queue + control thread below) ---
+# pgids the user asked to skip (per-worker keys or single Ctrl-C). Workers
+# whose process dies with their pgid in this set report Skipped, not Failed.
+USER_SKIPPED_PGIDS: set[int] = set()
+_SKIP_LOCK: Final[threading.Lock] = threading.Lock()
+# Set on double Ctrl-C / `q` key: running jobs are killed, pending futures
+# cancelled, and main exits 130 after printing the partial Extraction Log.
+ABORT_ALL_EVENT: Final[threading.Event] = threading.Event()
+# True only inside run_queue's download phase (wizard prompts keep the old
+# kill-everything-and-exit behaviour). Guarded by _ACTIVE_PG_LOCK.
+_QUEUE_RUNNING: bool = False
+_LAST_SIGINT_NS: int = 0
+# Double Ctrl-C window: second SIGINT within this many seconds aborts all.
+ABORT_WINDOW_SECS: Final[float] = 3.0
+# Live slot bookkeeping for per-worker skip keys: ordered task ids (worker
+# number = position+1) plus pgid/title per slot. Guarded by _SLOT_LOCK.
+_SLOT_PGIDS: dict[object, int] = {}
+_SLOT_TITLES: dict[object, str] = {}
+_SLOT_LOCK: Final[threading.Lock] = threading.Lock()
 
-def global_signal_handler(signum: int, frame: object) -> None:
-    """Kills the entire process group (yt-dlp + FFmpeg children) on SIGINT/SIGTERM."""
-    console.print("\n\n[bold red][!] Interrupted: Terminating process tree...[/]")
+
+def _sigwrite(msg: str) -> None:
+    """Write to stderr without touching Rich locks (async-signal-safe).
+
+    A signal handler runs in the main thread at an arbitrary bytecode — the
+    main thread may be *inside* `console.print` holding its lock, so the
+    handler must never call `console.print` (deadlock). `os.write` is safe.
+    """
+    try:
+        os.write(2, (msg + "\n").encode("utf-8", errors="replace"))
+    except OSError:
+        pass
+
+
+def _snapshot_pgids() -> list[int]:
     with _ACTIVE_PG_LOCK:
-        pgids = list(ACTIVE_PROCESS_GROUPS)
+        return list(ACTIVE_PROCESS_GROUPS)
+
+
+def _kill_pgids(pgids: list[int], sig: int = signal.SIGTERM) -> int:
+    """SIGTERM a list of process groups; returns how many signals were sent."""
+    sent = 0
     for pgid in pgids:
         try:
-            os.killpg(pgid, signal.SIGTERM)
+            os.killpg(pgid, sig)
+            sent += 1
         except OSError:
             pass
-    sys.exit(130)
+    return sent
+
+
+def request_skip_pgids(pgids: list[int]) -> int:
+    """Mark pgids as user-skipped and SIGTERM them. Returns signals sent."""
+    with _SKIP_LOCK:
+        USER_SKIPPED_PGIDS.update(pgids)
+    return _kill_pgids(pgids)
+
+
+def request_abort_all() -> None:
+    """Flag a full abort and SIGTERM everything currently downloading."""
+    ABORT_ALL_EVENT.set()
+    with _SKIP_LOCK:
+        USER_SKIPPED_PGIDS.update(_snapshot_pgids())
+    _kill_pgids(_snapshot_pgids())
+
+
+def skip_slot_by_number(slots: list[object], worker_no: int) -> str:
+    """Skip worker `worker_no` (1-based); returns a human status message.
+
+    Pure lookup + signal logic (no TTY reads), so it is unit-testable and
+    shared by the key-reader thread. Unknown/idle workers yield a message
+    instead of raising.
+    """
+    if worker_no < 1 or worker_no > len(slots):
+        return f"No worker {worker_no} (1–{len(slots)})."
+    slot = slots[worker_no - 1]
+    with _SLOT_LOCK:
+        pgid = _SLOT_PGIDS.get(slot)
+        title = _SLOT_TITLES.get(slot, "")
+    if pgid is None:
+        return f"Worker {worker_no} is idle — nothing to skip."
+    n = request_skip_pgids([pgid])
+    label = f" ({title})" if title else ""
+    return f"Skipping worker {worker_no}{label}." if n else f"Worker {worker_no} already finished."
+
+
+def global_signal_handler(signum: int, frame: object) -> None:
+    """Single Ctrl-C skips active downloads; double (within 3s) aborts all.
+
+    Outside the queue phase (wizard prompts, probing setup) there is nothing
+    skippable, so the legacy kill-everything-and-exit-130 applies. Inside the
+    queue phase the handler never calls sys.exit — it only flags + signals,
+    letting run_queue unwind naturally (print partial log, exit 130). This
+    also eliminates the old `SystemExit` noise during interpreter shutdown.
+    """
+    global _LAST_SIGINT_NS
+    now_ns = time.monotonic_ns()
+    if signum == signal.SIGTERM:
+        pgids = _snapshot_pgids()
+        _kill_pgids(pgids)
+        _sigwrite("\n[!] Terminated: process tree killed.")
+        sys.exit(130)
+
+    with _ACTIVE_PG_LOCK:
+        running = _QUEUE_RUNNING
+        active = list(ACTIVE_PROCESS_GROUPS)
+    if not running or not active:
+        # Wizard/input phase (or a between-jobs gap): nothing to skip.
+        _kill_pgids(active)
+        _sigwrite("\n[!] Interrupted: terminating process tree...")
+        sys.exit(130)
+
+    elapsed = (now_ns - _LAST_SIGINT_NS) / 1e9
+    _LAST_SIGINT_NS = now_ns
+    if elapsed < ABORT_WINDOW_SECS:
+        request_abort_all()
+        _sigwrite("\n[!] Aborting everything (2nd Ctrl-C)...")
+        return
+    with _SKIP_LOCK:
+        USER_SKIPPED_PGIDS.update(active)
+    _kill_pgids(active)
+    _sigwrite(
+        f"\n[!] Skipping {len(active)} active download(s)... "
+        "press Ctrl-C again within 3s to abort all."
+    )
 
 
 signal.signal(signal.SIGINT, global_signal_handler)
@@ -199,6 +328,76 @@ def fzf_pick(prompt: str, choices: list[str], default: str) -> str:
         choices=choices,
         default=default,
     )
+
+
+def fzf_multi_pick(prompt: str, choices: list[str]) -> list[str] | None:
+    """Multi-select via `fzf --multi`; None when fzf/TTY is unavailable.
+
+    Returns the subset of `choices` the user picked (possibly empty when
+    they confirm with nothing selected). Returns None when fzf cannot run
+    (missing binary, no TTY) or crashes — caller falls back to typed
+    range syntax. Esc (empty output + non-zero exit) yields [] meaning
+    "nothing picked", which callers treat as "skip nothing".
+
+    Matching is whitespace-tolerant: fzf echoes lines verbatim, but callers
+    must not depend on exact padding (a past bug stripped the pick while the
+    choice kept its `str.format` padding, silently discarding every mark).
+    """
+    if not (has_fzf() and sys.stdin.isatty() and sys.stdout.isatty()):
+        return None
+    try:
+        proc = subprocess.run(
+            ["fzf", "--prompt", f"{prompt}> ", "--height", "60%",
+             "--reverse", "--multi", "--ansi",
+             "--header", "TAB to mark, ENTER to confirm, ESC for none"],
+            input="\n".join(choices) + "\n",
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        # Keep lines verbatim (only drop blanks); match tolerantly below.
+        picked = [ln for ln in (proc.stdout or "").splitlines() if ln.strip()]
+        by_exact = set(choices)
+        by_stripped: dict[str, str] = {}
+        for c in choices:
+            by_stripped.setdefault(c.strip(), c)
+        out: list[str] = []
+        for p in picked:
+            if p in by_exact:
+                out.append(p)
+            elif p.strip() in by_stripped:
+                out.append(by_stripped[p.strip()])
+        # De-dupe, preserve fzf order.
+        return list(dict.fromkeys(out))
+    except Exception:
+        return None
+
+
+def label_from_url(url: str) -> str:
+    """Human-readable label derived from a URL slug (no network needed).
+
+    Batch entries skip upfront probing (700 probes would take forever), so
+    their titles would otherwise read "Batch Item N". The URL slug usually
+    carries the real name (`.../v7eyp8a-america-first-ep.-1742.html` →
+    "america first ep. 1742"): use it. Rumble-style leading video ids
+    (`v<id>-`) are stripped; generic URLs fall back to host + path.
+    """
+    try:
+        parts = urlsplit(url)
+        seg = (parts.path or "").rstrip("/").rsplit("/", 1)[-1]
+        seg = unquote(seg)
+        seg = re.sub(r"\.(html?|php|aspx?|m3u8|mpd)$", "", seg, flags=re.IGNORECASE)
+        m = re.match(r"^[A-Za-z]?\d+[A-Za-z0-9]*-(.+)$", seg)
+        if m and m.group(1).strip(" -_."):
+            seg = m.group(1)
+        label = re.sub(r"[-_+]+", " ", seg).strip()
+        label = re.sub(r"\s+", " ", label)
+        if label and label.lower() not in ("watch", "video", "embed", "v"):
+            return label
+        host = parts.netloc or url
+        return f"{host}{parts.path[:60]}".rstrip()
+    except Exception:
+        return url
 
 
 # ==============================================================================
@@ -819,23 +1018,146 @@ def resolve_job_title(job: MediaJob) -> None:
         job.title = found[0][0]
 
 
+def _short_title(title: str, width: int = 45) -> str:
+    """Truncate a job title for the live progress bar (full title stays in logs).
+
+    Bars must stay compact or multi-worker rows overflow the terminal; the
+    full title is always printed on pickup/completion lines and the final log.
+    """
+    return (title[: width - 2] + "..") if len(title) > width else title
+
+
+def make_progress() -> Progress:
+    """Shared factory so sequential and concurrent runs render identically."""
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("[bold yellow]{task.fields[title]}[/]"),
+        BarColumn(bar_width=24),
+        DownloadColumn(),
+        TransferSpeedColumn(),
+        TimeRemainingColumn(),
+        TextColumn("[bold cyan]{task.description}[/]"),
+        console=console,
+        transient=True,
+    )
+
+
+def _pump_progress_loop(
+    proc: subprocess.Popen,
+    pgid: int,
+    progress_ui: Progress,
+    task_id: object,
+    progress_state: MediaProgress,
+    started_ns: int,
+    timeout_secs: float | None,
+) -> None:
+    """Drives one live bar until the yt-dlp process exits (thread-safe).
+
+    Shared by the sequential path (own Progress) and the concurrent path
+    (shared Progress): `Progress.update` holds its own lock, so any number
+    of worker threads may pump their own task_id concurrently.
+
+    Also honours ABORT_ALL_EVENT (double Ctrl-C / `q` key): kills the child
+    promptly instead of waiting out the download.
+    """
+    while proc.poll() is None:
+        if ABORT_ALL_EVENT.is_set():
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except OSError:
+                    pass
+                proc.wait()
+            break
+        if timeout_secs is not None and (time.monotonic_ns() - started_ns) / 1e9 > timeout_secs:
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except OSError:
+                    pass
+                proc.wait()
+            break
+        # Prefer byte-accurate totals; fall back to OVD-derived % for
+        # fragment-only (HLS) streams where no total exists.
+        if progress_state.total_bytes:
+            completed: float | int = progress_state.downloaded_bytes
+            total: float | None = float(progress_state.total_bytes)
+        elif progress_state.percentage > 0:
+            completed = progress_state.percentage
+            total = 100.0
+        else:
+            completed = progress_state.downloaded_bytes
+            total = None
+        try:
+            progress_ui.update(
+                task_id,  # type: ignore[arg-type]
+                completed=completed,
+                total=total,
+                description=f"[{progress_state.stage}]",
+            )
+        except Exception:
+            pass
+        time.sleep(0.1)
+
+
 def execute_download(
     job: MediaJob,
     output_dir: Path,
     *,
     timeout_secs: float | None = None,
+    progress: Progress | None = None,
+    task_id: object | None = None,
 ) -> JobReport:
+    """Download one job; optionally joins a shared live `Progress` display.
+
+    Sequential callers omit `progress` (a private transient bar is created).
+    Concurrent workers pass the shared `progress` plus their claimed worker
+    `task_id` slot. Everything else — parser state, stderr ring, process
+    group — stays per-job local, so any number of threads may run this
+    simultaneously.
+
+    User-skip awareness: when the slot's process group was SIGTERMed via a
+    skip request (per-worker key / single Ctrl-C), the non-zero exit maps to
+    Skipped, not Failed; a full abort maps to Failed("aborted...").
+    """
     runner = YtdlpRunner(job.mode, output_dir, job.url, job.max_height)
     parser = YtdlpProgressParser()
     progress_state = MediaProgress()
     started_ns = time.monotonic_ns()
+    # Snapshot before spawn so the post-run file search can diff "what this
+    # job created" instead of trusting mtimes — mandatory under concurrency
+    # where several jobs land files in the same second.
+    try:
+        before_names: set[str] = {p.name for p in output_dir.iterdir() if p.is_file()}
+    except OSError:
+        before_names = set()
 
+    proc: subprocess.Popen | None = None
+    pgid: int | None = None
     try:
         proc, pgid = runner.spawn()
     except FileNotFoundError:
         return JobReport(title=job.title, status="Failed", error="yt-dlp binary not found in PATH")
     except Exception as err:
         return JobReport(title=job.title, status="Failed", error=str(err))
+
+    assert proc is not None and pgid is not None
+    if progress is not None and task_id is not None:
+        with _SLOT_LOCK:
+            _SLOT_PGIDS[task_id] = pgid
+            _SLOT_TITLES[task_id] = job.title
 
     assert proc.stdout is not None and proc.stderr is not None
     stderr_lines: list[str] = []
@@ -890,63 +1212,61 @@ def execute_download(
     stdout_thread.start()
     stderr_thread.start()
 
-    display_title = (job.title[:30] + "..") if len(job.title) > 32 else job.title
+    display_title = _short_title(job.title)
 
-    try:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold yellow]{task.fields[title]}[/]"),
-            BarColumn(bar_width=24),
-            DownloadColumn(),
-            TransferSpeedColumn(),
-            TimeRemainingColumn(),
-            TextColumn("[bold cyan]{task.description}[/]"),
-            console=console,
-            transient=True,
-        ) as progress_ui:
-            task_id = progress_ui.add_task("Initializing", total=None, title=display_title)
-
-            while proc.poll() is None:
-                if timeout_secs is not None and (time.monotonic_ns() - started_ns) / 1e9 > timeout_secs:
-                    try:
-                        os.killpg(pgid, signal.SIGTERM)
-                    except OSError:
-                        pass
-                    try:
-                        proc.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        try:
-                            os.killpg(pgid, signal.SIGKILL)
-                        except OSError:
-                            pass
-                        proc.wait()
-                    break
-                # Prefer byte-accurate totals; fall back to OVD-derived % for
-                # fragment-only (HLS) streams where no total exists.
-                if progress_state.total_bytes:
-                    completed = progress_state.downloaded_bytes
-                    total: float | None = float(progress_state.total_bytes)
-                elif progress_state.percentage > 0:
-                    completed = progress_state.percentage
-                    total = 100.0
-                else:
-                    completed = progress_state.downloaded_bytes
-                    total = None
-                progress_ui.update(
-                    task_id,
-                    completed=completed,
-                    total=total,
-                    description=f"[{progress_state.stage}]",
-                )
-                time.sleep(0.1)
-    finally:
-        stdout_thread.join(timeout=2.0)
-        stderr_thread.join(timeout=2.0)
-        with _ACTIVE_PG_LOCK:
-            ACTIVE_PROCESS_GROUPS.discard(pgid)
+    if progress is None:
+        try:
+            with make_progress() as progress_ui:
+                owned_task = progress_ui.add_task("Initializing", total=None, title=display_title)
+                _pump_progress_loop(proc, pgid, progress_ui, owned_task, progress_state, started_ns, timeout_secs)
+        finally:
+            stdout_thread.join(timeout=2.0)
+            stderr_thread.join(timeout=2.0)
+            with _ACTIVE_PG_LOCK:
+                ACTIVE_PROCESS_GROUPS.discard(pgid)
+    else:
+        try:
+            if task_id is None:
+                task_id = progress.add_task("Initializing", total=None, title=display_title)
+            else:
+                try:
+                    progress.update(task_id, title=display_title)  # type: ignore[arg-type]
+                except Exception:
+                    pass
+            _pump_progress_loop(proc, pgid, progress, task_id, progress_state, started_ns, timeout_secs)
+        finally:
+            stdout_thread.join(timeout=2.0)
+            stderr_thread.join(timeout=2.0)
+            with _ACTIVE_PG_LOCK:
+                ACTIVE_PROCESS_GROUPS.discard(pgid)
+            if task_id is not None:
+                with _SLOT_LOCK:
+                    _SLOT_PGIDS.pop(task_id, None)
+                    _SLOT_TITLES.pop(task_id, None)
+                try:
+                    progress.update(task_id, description=f"[{progress_state.stage}]")  # type: ignore[arg-type]
+                except Exception:
+                    pass
 
     exit_code = proc.returncode if proc.returncode is not None else 1
     if exit_code != 0:
+        if ABORT_ALL_EVENT.is_set():
+            for stream in (proc.stdout, proc.stderr):
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            return JobReport(title=job.title, status="Failed", error="aborted by user (Ctrl-C)")
+        with _SKIP_LOCK:
+            was_skip = pgid in USER_SKIPPED_PGIDS
+            USER_SKIPPED_PGIDS.discard(pgid)
+        if was_skip:
+            for stream in (proc.stdout, proc.stderr):
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            return JobReport(title=job.title, status="Skipped", error="skipped by user")
         with stderr_lock:
             tail = [ln for ln in stderr_lines if ln.strip()][-3:]
         if tail:
@@ -981,19 +1301,19 @@ def execute_download(
             title=job.title, status="Skipped", saved_file="--", error="already in archive",
         )
 
-    # Locate output: prefer parser-tracked destination; else the newest file
-    # created after this job started (never an unrelated older file).
+    # Locate output: prefer parser-tracked destination; else diff against the
+    # pre-spawn snapshot so concurrent jobs never claim each other's files.
     dest_file = progress_state.destination_file or "--"
     size_mb = 0.0
     actual_path: Path | None = None
     if dest_file != "--":
         actual_path = output_dir / dest_file
         if not actual_path.exists():
-            actual_path = _newest_file_since(output_dir, started_ns) or actual_path
+            actual_path = _resolve_output_file(output_dir, started_ns, dest_file, before_names) or actual_path
             if actual_path is not None and actual_path.exists():
                 dest_file = actual_path.name
     else:
-        actual_path = _newest_file_since(output_dir, started_ns)
+        actual_path = _resolve_output_file(output_dir, started_ns, None, before_names)
         if actual_path is not None:
             dest_file = actual_path.name
 
@@ -1056,6 +1376,298 @@ def _newest_file_since(directory: Path, started_ns: int) -> Path | None:
             except OSError:
                 return None
     return newest
+
+
+def _resolve_output_file(
+    directory: Path,
+    started_ns: int,
+    destination_file: str | None,
+    before_names: set[str],
+) -> Path | None:
+    """Find the file this job produced, safe under concurrent downloads.
+
+    Strategy: diff the directory against the pre-spawn snapshot and consider
+    only genuinely new files (ignoring `.part`/`.ytdl`/probe files). When the
+    parser-tracked name is known, prefer the new file sharing its stem (the
+    merge/remux step often only swaps the extension, e.g. `.webm` → `.mp4`);
+    otherwise take the newest new file. Falls back to the legacy
+    mtime-based `_newest_file_since` when no new file exists (e.g. the
+    "already downloaded" fast path where yt-dlp wrote nothing).
+    """
+    try:
+        current = [p for p in directory.iterdir() if p.is_file()]
+    except OSError:
+        return None
+    new_files = [
+        p for p in current
+        if p.name not in before_names
+        and not p.name.startswith(".probe_")
+        and p.suffix not in (".part", ".ytdl")
+    ]
+    if new_files:
+        if destination_file:
+            want_stem = Path(destination_file).stem
+            for p in new_files:
+                if p.stem == want_stem:
+                    return p
+        try:
+            return max(new_files, key=lambda p: p.stat().st_mtime)
+        except OSError:
+            return new_files[0]
+    return _newest_file_since(directory, started_ns)
+
+
+def clamp_concurrent(requested: int, n_jobs: int) -> int:
+    """Clamp an explicit concurrency request to the sane range 1..n_jobs."""
+    if n_jobs <= 0:
+        return 1
+    return max(1, min(int(requested), n_jobs))
+
+
+def _spawn_control_thread(
+    stop_event: threading.Event, slots: list[object], workers: int
+) -> threading.Thread | None:
+    """Single-key live controls while the queue runs (TTY only, best effort).
+
+    Keys (no Enter needed): `1`–`N` skip that worker's current download,
+    `s` skip ALL active downloads, `q` abort everything, `h` reprint help.
+    Ctrl-C once == `s`, twice (within 3s) == abort — same semantics for
+    pipes/SSH where raw keys are unavailable.
+
+    Implemented with termios cbreak + select on stdin in a daemon thread;
+    Rich's live display never reads stdin, so there is no contention, and
+    terminal attributes are always restored (try/finally + daemon fallback).
+    Returns None when no TTY/control is possible — the queue runs the same.
+    """
+    if not sys.stdin.isatty():
+        return None
+    try:
+        import select
+        import termios
+        import tty as _tty
+
+        fd = sys.stdin.fileno()
+        orig = termios.tcgetattr(fd)
+    except Exception:
+        return None
+
+    help_line = (
+        f"Keys: 1–{workers} skip worker · s skip active · q abort · "
+        "Ctrl-C once/twice = same"
+    )
+
+    def _loop() -> None:
+        try:
+            _tty.setcbreak(fd)
+            while not stop_event.is_set():
+                try:
+                    ready, _, _ = select.select([fd], [], [], 0.2)
+                except (OSError, ValueError):
+                    break
+                if not ready:
+                    continue
+                try:
+                    ch = os.read(fd, 1).decode("utf-8", errors="ignore")
+                except OSError:
+                    break
+                if not ch or stop_event.is_set():
+                    continue
+                if ch in ("h", "H", "?"):
+                    console.print(f"[dim]{help_line}[/]")
+                elif ch in ("q", "Q"):
+                    request_abort_all()
+                    console.print("[bold red][!] Aborting everything (q)...[/]")
+                elif ch in ("s", "S", "x", "X"):
+                    pgids = _snapshot_pgids()
+                    if not pgids:
+                        console.print("[dim]Nothing active to skip.[/]")
+                    else:
+                        request_skip_pgids(pgids)
+                        console.print(
+                            f"[bold yellow][!][/] Skipping {len(pgids)} active download(s)... "
+                            "[dim](press q to abort all)[/]"
+                        )
+                elif ch.isdigit() and ch != "0":
+                    if slots:
+                        msg = skip_slot_by_number(slots, int(ch))
+                        style = "yellow" if "ipping" in msg else "dim"
+                        console.print(f"[bold {style}][!][/] {escape(msg)}")
+                    else:  # sequential run: no slots, digit == skip active
+                        pgids = _snapshot_pgids()
+                        if not pgids:
+                            console.print("[dim]Nothing active to skip.[/]")
+                        else:
+                            request_skip_pgids(pgids)
+                            console.print(
+                                f"[bold yellow][!][/] Skipping {len(pgids)} active download(s)... "
+                                "[dim](press q to abort)[/]"
+                            )
+                elif ch == "\x03":  # Ctrl-C in cbreak arrives here, not as SIGINT
+                    global_signal_handler(signal.SIGINT, None)
+        finally:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, orig)
+            except Exception:
+                pass
+
+    thread = threading.Thread(target=_loop, name="dusky-keys", daemon=True)
+    thread.start()
+    return thread
+
+
+def run_queue(
+    jobs: list[MediaJob],
+    destination: Path,
+    max_workers: int = 1,
+) -> list[JobReport]:
+    """Download the whole queue, sequentially or with N concurrent workers.
+
+    Native `ThreadPoolExecutor` model: jobs are I/O-bound subprocesses
+    (yt-dlp + FFmpeg), so threads — not processes — are the correct native
+    primitive (no pickling, shared Rich display, GIL released during I/O).
+    Per-format `--download-archive` appends are small O_APPEND writes, safe
+    across the worker processes. Reports return in queue order.
+
+    Display uses one bar per *worker slot* (not per job), so a 700-item
+    batch shows 3 live bars — never 700 rows. Slots are pre-created on the
+    main thread and claimed via a queue; workers only ever call the
+    thread-safe `Progress.update`. Full titles print on pickup/completion
+    lines (bars stay compact by necessity).
+
+    Live controls on a TTY: `1`–`N` skip that worker, `s` skip all active,
+    `q` abort; single Ctrl-C skips active, double aborts.
+    """
+    global _QUEUE_RUNNING
+    workers = clamp_concurrent(max_workers, len(jobs))
+    if workers <= 1 or len(jobs) <= 1:
+        ABORT_ALL_EVENT.clear()
+        _QUEUE_RUNNING = True
+        stop = threading.Event()
+        key_thread = _spawn_control_thread(stop, [], 1)
+        if key_thread is not None:
+            console.print("[dim]Keys: s skip · q abort (Ctrl-C once/twice = same)[/]")
+        try:
+            reports: list[JobReport] = []
+            for idx, job in enumerate(jobs):
+                if ABORT_ALL_EVENT.is_set():
+                    reports.append(JobReport(title=job.title, status="Failed", error="aborted by user (Ctrl-C)"))
+                    continue
+                if job.needs_probe:
+                    resolve_job_title(job)
+                console.print(
+                    f"[bold blue]•[/] [{idx + 1}/{len(jobs)}] Processing: "
+                    f"[bold yellow]{escape(job.title)}[/]"
+                )
+                reports.append(execute_download(job, destination))
+            return reports
+        finally:
+            stop.set()
+            if key_thread is not None:
+                # Block briefly so the thread restores termios BEFORE any
+                # sys.exit unwinds the interpreter (else the shell keeps
+                # cbreak/no-echo). Daemon flag is only a crash fallback.
+                key_thread.join(timeout=2.0)
+            with _ACTIVE_PG_LOCK:
+                _QUEUE_RUNNING = False
+
+    ABORT_ALL_EVENT.clear()
+    _QUEUE_RUNNING = True
+    console.print(
+        f"[bold green]➜[/] Downloading [yellow]{len(jobs)}[/] items "
+        f"with [cyan]{workers}[/] concurrent workers…"
+    )
+    console.print(
+        f"[dim]Keys: 1–{workers} skip worker · s skip active · q abort · "
+        "Ctrl-C once/twice = same (TTY only)[/]" if sys.stdin.isatty()
+        else "[dim]Tip: Ctrl-C once skips active downloads, twice aborts.[/]"
+    )
+    ordered: list[JobReport | None] = [None] * len(jobs)
+
+    def _one(idx: int, job: MediaJob, shared: Progress, slots: queue.SimpleQueue) -> JobReport:
+        if ABORT_ALL_EVENT.is_set():
+            return JobReport(title=job.title, status="Failed", error="aborted by user (Ctrl-C)")
+        slot = slots.get()
+        try:
+            if job.needs_probe:
+                try:
+                    shared.update(slot, title=f"[{idx + 1}/{len(jobs)}] probing…")  # type: ignore[arg-type]
+                except Exception:
+                    pass
+                resolve_job_title(job)
+            if ABORT_ALL_EVENT.is_set():
+                return JobReport(title=job.title, status="Failed", error="aborted by user (Ctrl-C)")
+            # Full title to scrollback (bars truncate by necessity); worker
+            # print is safe during Live (Rich renders it above the bars).
+            console.print(f"[dim][{idx + 1}/{len(jobs)}] ▶ {escape(job.title)}[/]")
+            try:
+                shared.update(  # type: ignore[arg-type]
+                    slot, title=f"[{idx + 1}/{len(jobs)}] {_short_title(job.title)}",
+                )
+            except Exception:
+                pass
+            return execute_download(
+                job, destination,
+                progress=shared, task_id=slot,
+            )
+        finally:
+            try:
+                shared.update(  # type: ignore[arg-type]
+                    slot, title="Worker", description="[idle]",
+                    completed=0, total=None,
+                )
+            except Exception:
+                pass
+            slots.put(slot)
+
+    stop_event = threading.Event()
+    key_thread: threading.Thread | None = None
+    try:
+        with make_progress() as shared:
+            slot_ids: list[object] = [
+                shared.add_task("[idle]", total=None, title=f"Worker {w + 1}")
+                for w in range(workers)
+            ]
+            slots: queue.SimpleQueue = queue.SimpleQueue()
+            for sid in slot_ids:
+                slots.put(sid)
+            key_thread = _spawn_control_thread(stop_event, slot_ids, workers)
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dusky-dl") as pool:
+                future_to_idx = {
+                    pool.submit(_one, idx, job, shared, slots): idx
+                    for idx, job in enumerate(jobs)
+                }
+                done = 0
+                try:
+                    for fut in as_completed(future_to_idx):
+                        idx = future_to_idx[fut]
+                        try:
+                            ordered[idx] = fut.result()
+                        except CancelledError:
+                            ordered[idx] = JobReport(title=jobs[idx].title, status="Failed", error="aborted by user (Ctrl-C)")
+                        except Exception as err:  # never let one job kill the queue
+                            ordered[idx] = JobReport(title=jobs[idx].title, status="Failed", error=str(err))
+                        done += 1
+                        rep = ordered[idx]
+                        console.print(
+                            f"[dim][{done}/{len(jobs)}] {escape(rep.title if rep else jobs[idx].title)} "
+                            f"— {rep.status if rep else 'Failed'}[/]"
+                        )
+                        if ABORT_ALL_EVENT.is_set():
+                            for f2 in future_to_idx:
+                                f2.cancel()
+                finally:
+                    # Prompt handoff: the pool's context shutdown(wait=True)
+                    # reaps killed workers (fast — their procs are SIGTERMed).
+                    pass
+    finally:
+        stop_event.set()
+        if key_thread is not None:
+            # Restore the terminal before unwinding to the partial log /
+            # sys.exit(130) — otherwise the shell inherits cbreak/no-echo.
+            key_thread.join(timeout=2.0)
+        with _ACTIVE_PG_LOCK:
+            _QUEUE_RUNNING = False
+    return [r if r is not None else JobReport(title=jobs[i].title, status="Failed", error="worker lost") for i, r in enumerate(ordered)]
 
 
 # ==============================================================================
@@ -1240,6 +1852,251 @@ def _expand_item_spec(chunk: str, total: int) -> list[int]:
     return [i for i in range(start, stop, step) if 0 <= i < total]
 
 
+def parse_skip_indices(spec: str, total: int) -> set[int]:
+    """Parse a skip spec (same `-I` flavour as ranges) into 0-based indices.
+
+    `""`/`"none"` → empty (skip nothing); `"all"`/`"*"` → everything.
+    Invalid chunks are ignored; out-of-range indices are dropped.
+    """
+    text = (spec or "").strip().lower()
+    if not text or text in ("none", "no", "skip-none", "-"):
+        return set()
+    if text in ("all", "*"):
+        return set(range(total))
+    skipped: set[int] = set()
+    for chunk in text.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "-" in chunk and ":" not in chunk:
+            a, _, b = chunk.partition("-")
+            chunk = f"{a}:{b}"
+        try:
+            skipped.update(_expand_item_spec(chunk, total))
+        except ValueError:
+            continue
+    return {i for i in skipped if 0 <= i < total}
+
+
+def filter_skipped_items(
+    items: list[tuple[str, str]], skip_spec: str
+) -> tuple[list[tuple[str, str]], set[int]]:
+    """Split `items` into (kept, skipped_indices) per a skip spec."""
+    skip_idx = parse_skip_indices(skip_spec, len(items))
+    kept = [it for i, it in enumerate(items) if i not in skip_idx]
+    return kept, skip_idx
+
+
+def show_queue_preview(items: list[tuple[str, str]], *, limit: int = 50) -> None:
+    """Print a numbered preview of the queue (capped for huge playlists).
+
+    Full titles/URLs are passed to Rich (which ellipsizes per terminal
+    width) — never pre-truncated, so nothing is silently hidden.
+    """
+    total = len(items)
+    table = Table(box=box.ROUNDED, header_style="bold cyan", expand=True, show_header=True)
+    table.add_column("#", justify="right", width=6)
+    table.add_column("Title", style="yellow", ratio=3, overflow="ellipsis")
+    table.add_column("URL", style="dim", ratio=4, overflow="ellipsis")
+    if total <= limit:
+        rows = list(enumerate(items, start=1))
+    else:
+        head = list(enumerate(items[:20], start=1))
+        tail_start = total - 10 + 1
+        tail = list(enumerate(items[-10:], start=tail_start))
+        rows = head + [(-1, ("…", f"{total - 30} more items hidden — use ranges or fzf"))] + tail  # type: ignore[list-item]
+    for num, (title, url) in rows:
+        if num == -1:
+            table.add_row("…", f"[dim]{escape(title)}[/]", f"[dim]{escape(url)}[/]")
+        else:
+            table.add_row(str(num), escape(title), escape(url))
+    console.print(table)
+    console.print(f"[dim]{total} item(s). Numbers are 1-based for skip ranges.[/]")
+
+
+def fzf_skip_choices(items: list[tuple[str, str]]) -> tuple[list[str], dict[str, int]]:
+    """Build fzf lines plus a tolerant line→index map for skip selection.
+
+    The informative label comes FIRST (episode names live at the END of
+    URLs, exactly where terminal truncation would eat them). Lines are never
+    truncated here — fzf scrolls. Numbering is zero-padded without leading
+    blanks so strip-tolerant matching cannot desync (regression test covers
+    the bug where TAB marks were silently discarded).
+    """
+    width = len(str(len(items)))
+    choices = [f"{i:0{width}d}. {t} — {u}" for i, (t, u) in enumerate(items, start=1)]
+    mapping = {c.strip(): i - 1 for i, c in enumerate(choices, start=1)}
+    return choices, mapping
+
+
+def interactive_skip_prompt(
+    items: list[tuple[str, str]], *, context: str = "queue",
+) -> tuple[list[tuple[str, str]], set[int]]:
+    """Let the user drop items from a playlist/batch/multi-URL queue.
+
+    Most native available UX wins: `fzf --multi` (fuzzy checklist) when a TTY
+    + fzf exists, otherwise the typed `-I`-flavour range syntax (`1,3,5-7`,
+    `1:10:2`, `-3:`) — the same language the range picker already speaks.
+    Empty input / Esc keeps everything. Loops until the spec parses; typing
+    `list` re-prints the preview. Never returns an empty kept list without an
+    explicit confirmation (avoids nuking a 700-item queue by typo).
+    """
+    total = len(items)
+    if total <= 1:
+        return list(items), set()
+    show_queue_preview(items)
+
+    while True:  # fzf round (re-loops instead of recursing on decline)
+        display_choices, mapping = fzf_skip_choices(items)
+        picked = fzf_multi_pick(f"Mark items to SKIP ({context})", display_choices)
+        if picked is None:
+            break  # no fzf/TTY (or crashed) -> typed ranges below
+        skip_idx = {mapping[p.strip()] for p in picked if p.strip() in mapping}
+        kept = [it for i, it in enumerate(items) if i not in skip_idx]
+        if not kept and skip_idx:
+            console.print("[bold red]That skips everything.[/]")
+            if ask_confirm("Really skip ALL items and exit?", default=False):
+                return kept, skip_idx
+            continue  # re-run fzf instead of recursing
+        if skip_idx:
+            skipped_names = ", ".join(f"#{i + 1}" for i in sorted(skip_idx)[:10])
+            more = f" +{len(skip_idx) - 10} more" if len(skip_idx) > 10 else ""
+            console.print(
+                f"[yellow]![/] Skipping [yellow]{len(skip_idx)}[/] item(s) "
+                f"({escape(skipped_names)}{more}), keeping [green]{len(kept)}[/]."
+            )
+        else:
+            console.print("[green]✓[/] Keeping everything.")
+        return kept, skip_idx
+
+    while True:
+        console.print(
+            f"[bold green]?[/] Skip any {escape(context)} items? "
+            "[dim](ranges like '1,3,5-7' / '-3:' / 'none', 'list' to re-show)[/]"
+        )
+        spec = ask_text(">: ", default="none")
+        if spec.strip().lower() == "list":
+            show_queue_preview(items)
+            continue
+        skip_idx = parse_skip_indices(spec, total)
+        # Detect garbage specs: non-empty text that parsed to nothing and is
+        # not an explicit "none" — almost certainly a typo worth re-asking.
+        txt = spec.strip().lower()
+        if txt and txt not in ("none", "no", "-", "all", "*") and not skip_idx:
+            # Check whether ANY chunk parsed; reuse the filter to decide.
+            kept_test, _ = filter_skipped_items(items, spec)
+            if len(kept_test) == total:
+                console.print(f"[bold red]No items matched {spec!r} — nothing skipped. Re-type or 'none'.[/]")
+                continue
+        kept = [it for i, it in enumerate(items) if i not in skip_idx]
+        if not kept:
+            console.print("[bold red]That skips everything.[/]")
+            if ask_confirm("Really skip ALL items and exit?", default=False):
+                return kept, skip_idx
+            continue
+        if skip_idx:
+            console.print(f"[yellow]![/] Skipping [yellow]{len(skip_idx)}[/] item(s), keeping [green]{len(kept)}[/].")
+        else:
+            console.print("[green]✓[/] Keeping everything.")
+        return kept, skip_idx
+
+
+def batch_url_line_numbers(path: Path) -> list[int]:
+    """1-based file line numbers holding URLs, in `parse_batch_file` order."""
+    linenos: list[int] = []
+    try:
+        with path.open("r", encoding="utf-8-sig") as f:
+            for lineno, line in enumerate(f, start=1):
+                clean = line.strip()
+                if not clean or clean.startswith(_BATCH_COMMENT_PREFIXES):
+                    continue
+                linenos.append(lineno)
+    except OSError:
+        pass
+    return linenos
+
+
+def persist_batch_skips(path: Path, skipped_parsed_idx: set[int]) -> int:
+    """Comment out skipped entries in a batch file so they stay skipped.
+
+    Mapping is positional (parsed-URL index → file URL-line), so duplicate
+    URLs are handled exactly — only the lines the user skipped get `# `.
+    Already-commented lines are never touched. Returns lines commented.
+    """
+    if not skipped_parsed_idx:
+        return 0
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except OSError as err:
+        console.print(f"[bold red]Cannot update batch file:[/] {err}")
+        return 0
+    lines = text.splitlines(keepends=True)
+    url_linenos = batch_url_line_numbers(path)
+    targets = {url_linenos[i] for i in skipped_parsed_idx if 0 <= i < len(url_linenos)}
+    if not targets:
+        return 0
+    changed = 0
+    for lineno in targets:
+        idx = lineno - 1
+        if 0 <= idx < len(lines) and not lines[idx].lstrip().startswith(("#", ";", "]", "//")):
+            stripped = lines[idx].lstrip()
+            indent = lines[idx][: len(lines[idx]) - len(stripped)]
+            lines[idx] = f"{indent}# SKIPPED {stripped}"
+            changed += 1
+    if changed:
+        try:
+            path.write_text("".join(lines), encoding="utf-8")
+        except OSError as err:
+            console.print(f"[bold red]Cannot write batch file:[/] {err}")
+            return 0
+    return changed
+
+
+def ask_concurrent_downloads(n_jobs: int, explicit: int | None = None) -> int:
+    """Resolve how many files download at once (1..n_jobs).
+
+    An explicit CLI `--concurrent` value wins (clamped to the queue). Without
+    one, a TTY gets asked (default min(DEFAULT, n)); pipes/scripts take the
+    default silently so automation never blocks.
+    """
+    if explicit is not None:
+        try:
+            return clamp_concurrent(int(explicit), n_jobs)
+        except (TypeError, ValueError):
+            pass
+    default = max(1, min(DEFAULT_CONCURRENT_DOWNLOADS, n_jobs))
+    cap = max(1, min(MAX_CONCURRENT_DOWNLOADS, n_jobs))
+    if n_jobs <= 1:
+        return 1
+    if not sys.stdin.isatty():
+        return default
+    console.print(
+        f"[bold green]?[/] Concurrent downloads? "
+        f"[dim](1–{cap}, default {default}; {n_jobs} queued)[/]"
+    )
+    while True:
+        raw = ask_text(">: ", default=str(default)).strip()
+        if not raw:
+            return default
+        try:
+            n = int(raw)
+        except ValueError:
+            console.print(f"[bold red]Enter a number 1–{cap}.[/]")
+            continue
+        if 1 <= n <= cap:
+            return n
+        # Above the interactive cap but within the queue: confirm (ZRAM guard).
+        if cap < n <= n_jobs:
+            console.print(
+                f"[bold yellow]![/] {n} exceeds the safe interactive cap ({cap}) "
+                "for RAM/ZRAM pools."
+            )
+            if ask_confirm(f"Use {n} concurrent downloads anyway?", default=False):
+                return n
+            continue
+        console.print(f"[bold red]Enter a number 1–{n_jobs}.[/]")
+
+
 _COMMA_BEFORE_URL: Final[re.Pattern] = re.compile(r",\s*(?=https?://)", re.IGNORECASE)
 
 
@@ -1278,7 +2135,7 @@ def collect_targets(
     return items, errors
 
 
-def run_interactive_wizard() -> tuple[list[MediaJob], Path]:
+def run_interactive_wizard() -> tuple[list[MediaJob], Path, int]:
     console.print(
         Panel.fit(
             Align.center("[bold cyan]Dusky YT-DLP[/]"),
@@ -1293,6 +2150,7 @@ def run_interactive_wizard() -> tuple[list[MediaJob], Path]:
     #    batch file. Each link is probed on its own: one dead URL never kills
     #    the rest of the queue.
     batch_urls: list[str] | None = None
+    batch_source_path: Path | None = None
     discovered: list[tuple[str, str]] = []
     is_collection = False
     label = ""
@@ -1319,6 +2177,7 @@ def run_interactive_wizard() -> tuple[list[MediaJob], Path]:
                 continue
             if urls:
                 batch_urls = urls
+                batch_source_path = local_file
                 break
             console.print("[bold red]Batch file contained no valid URLs.[/]")
             continue
@@ -1405,15 +2264,39 @@ def run_interactive_wizard() -> tuple[list[MediaJob], Path]:
         q_pick = fzf_pick("Select video quality", q_labels, q_labels[0])
         max_height = dict(q_choices)[q_pick]
 
-    # 5. Build the queue.
+    # 5. Build the queue (skip-aware).
     jobs: list[MediaJob] = []
+    skipped_parsed_idx: set[int] = set()
     if batch_urls is not None:
+        # Slug-derived labels (no network): "Batch Item N" tells the user
+        # nothing when picking skips — the URL slug usually holds the real
+        # episode name. JIT probing still replaces these with exact titles.
+        batch_items = [(label_from_url(u) or f"Batch Item {idx}", u) for idx, u in enumerate(batch_urls, start=1)]
+        if len(batch_items) > 1:
+            kept, skipped_parsed_idx = interactive_skip_prompt(batch_items, context="batch file")
+            if not kept:
+                console.print("[bold red]All batch items skipped — nothing to do.[/]")
+                sys.exit(0)
+            batch_items = kept
+            if skipped_parsed_idx and batch_source_path is not None:
+                # Native batch-file skip memory: `#`-comments are yt-dlp's own
+                # ignore convention (parse_batch_file already skips them), so
+                # commenting lines doubles as "mark as already downloaded".
+                if ask_confirm("Remember skips in the batch file (comment out those lines)?", default=False):
+                    n = persist_batch_skips(batch_source_path, skipped_parsed_idx)
+                    console.print(f"[green]✓[/] Commented out [yellow]{n}[/] line(s) in {escape(str(batch_source_path))}.")
         jobs = [
-            MediaJob(title=f"Batch Item {idx}", url=u, mode=mode, max_height=max_height, needs_probe=True)
-            for idx, u in enumerate(batch_urls, start=1)
+            MediaJob(title=t, url=u, mode=mode, max_height=max_height, needs_probe=True)
+            for t, u in batch_items
         ]
         console.print(f"[green]✓[/] Queued [yellow]{len(jobs)}[/] item(s) from batch file.")
     elif multi_mode:
+        if len(discovered) > 1:
+            kept, _ = interactive_skip_prompt(discovered, context="link list")
+            if not kept:
+                console.print("[bold red]All items skipped — nothing to do.[/]")
+                sys.exit(0)
+            discovered = kept
         jobs = [MediaJob(title=item[0], url=item[1], mode=mode, max_height=max_height) for item in discovered]
         console.print(f"[green]✓[/] Queued [yellow]{len(jobs)}[/] item(s).")
     elif not is_collection:
@@ -1433,8 +2316,20 @@ def run_interactive_wizard() -> tuple[list[MediaJob], Path]:
             except ValueError as err:
                 console.print(f"[bold red]{escape(str(err))}[/]")
 
+        if len(picked) > 1:
+            kept, _ = interactive_skip_prompt(picked, context="playlist")
+            if not kept:
+                console.print("[bold red]All playlist items skipped — nothing to do.[/]")
+                sys.exit(0)
+            picked = kept
         jobs = [MediaJob(title=item[0], url=item[1], mode=mode, max_height=max_height) for item in picked]
         console.print(f"[green]✓[/] Queued [yellow]{len(jobs)}[/] item(s).")
+
+    # 6. Concurrency: only meaningful for multi-item queues; single items
+    #    always run alone. The prompt defaults to min(DEFAULT, n).
+    max_workers = ask_concurrent_downloads(len(jobs)) if len(jobs) > 1 else 1
+    if max_workers > 1:
+        console.print(f"[green]✓[/] [cyan]{max_workers}[/] concurrent download(s).")
 
     default_dir = resolve_storage_pool()
     console.print(f"[bold green]?[/] Target directory (ZRAM) [dim](default: {escape(str(default_dir))})[/]")
@@ -1443,7 +2338,7 @@ def run_interactive_wizard() -> tuple[list[MediaJob], Path]:
     if destination != Path(custom_dir).expanduser():
         console.print(f"[bold yellow]![/] Requested path unusable; using [cyan]{destination}[/].")
 
-    return jobs, destination
+    return jobs, destination, max_workers
 
 
 def main() -> None:
@@ -1474,11 +2369,24 @@ def main() -> None:
         default="all",
         help="Playlist selection: 'all', '5', '1-3', '1:10:2', '1,3,5-7' (default: all)",
     )
+    parser.add_argument(
+        "-N", "--concurrent",
+        type=int,
+        default=None,
+        help=f"Concurrent downloads for multi-item queues (default: prompt when TTY, else {DEFAULT_CONCURRENT_DOWNLOADS})",
+    )
+    parser.add_argument(
+        "--skip-items",
+        default=None,
+        help="Skip queue positions using -I syntax: '1,3,5-7', '-3:' (default: none). "
+             "Applies to the final combined queue order.",
+    )
 
     args = parser.parse_args()
 
+    max_workers = 1
     if not args.target:
-        jobs, destination = run_interactive_wizard()
+        jobs, destination, max_workers = run_interactive_wizard()
     else:
         destination = resolve_storage_pool(args.output_dir.expanduser() if args.output_dir else None)
         mode = TargetFormat(args.format)
@@ -1519,6 +2427,21 @@ def main() -> None:
             if job.title.startswith("Item "):
                 job.title = f"Item {idx}"
 
+        # CLI-side skipping: same -I syntax, applied to final queue order.
+        if args.skip_items and jobs:
+            skip_idx = parse_skip_indices(args.skip_items, len(jobs))
+            if skip_idx:
+                kept_jobs = [j for i, j in enumerate(jobs) if i not in skip_idx]
+                console.print(
+                    f"[yellow]![/] --skip-items drops [yellow]{len(skip_idx)}[/] item(s), "
+                    f"keeping [green]{len(kept_jobs)}[/]."
+                )
+                jobs = kept_jobs
+
+        # CLI-side concurrency: explicit flag wins; otherwise prompt on TTY
+        # when the queue is multi-item (mirrors the wizard), else default.
+        max_workers = ask_concurrent_downloads(len(jobs), explicit=args.concurrent)
+
     if not jobs:
         console.print("[bold red]No download targets queued.[/]")
         sys.exit(1)
@@ -1526,23 +2449,18 @@ def main() -> None:
     fmt_label = jobs[0].mode.upper()
     if jobs[0].mode == TargetFormat.VIDEO and jobs[0].max_height is not None:
         fmt_label += f" ≤{jobs[0].max_height}P"
+    workers_label = f" | Workers: [cyan]{max_workers}[/]" if len(jobs) > 1 else ""
     console.print(
-        f"\n[bold green]➜[/] Storage Pool: [cyan]{destination}[/] | Queue: [yellow]{len(jobs)}[/] | Format: [magenta]{fmt_label}[/]\n"
+        f"\n[bold green]➜[/] Storage Pool: [cyan]{destination}[/] | Queue: [yellow]{len(jobs)}[/] | Format: [magenta]{fmt_label}[/]{workers_label}\n"
     )
 
-    reports: list[JobReport] = []
-    for job in jobs:
-        if job.needs_probe:
-            resolve_job_title(job)
-        console.print(f"[bold blue]•[/] Processing: [bold yellow]{escape(job.title)}[/]")
-        res = execute_download(job, destination)
-        reports.append(res)
+    reports: list[JobReport] = run_queue(jobs, destination, max_workers)
 
     n_ok = sum(1 for r in reports if r.status == "Success")
     n_skip = sum(1 for r in reports if r.status == "Skipped")
     n_fail = sum(1 for r in reports if r.status not in ("Success", "Skipped"))
     console.print(
-        f"[green]✓[/] {n_ok} downloaded · [yellow]{n_skip} already done[/] · "
+        f"[green]✓[/] {n_ok} downloaded · [yellow]{n_skip} skipped[/] · "
         f"[{'green' if not n_fail else 'red'}]{n_fail} failed[/]"
     )
 
@@ -1573,6 +2491,8 @@ def main() -> None:
     console.print(table)
     archive = download_archive_path(jobs[0].mode)
     skip_line = f"\n[dim]Skip-state: {escape(str(archive))}[/]" if archive else ""
+    if ABORT_ALL_EVENT.is_set():
+        skip_line += "\n[dim]Queue aborted by user — pending items were not attempted.[/]"
     console.print(
         Panel(
             f"[bold green]Location:[/] [cyan]{escape(str(destination))}[/]{skip_line}\n"
@@ -1581,6 +2501,8 @@ def main() -> None:
         )
     )
 
+    if ABORT_ALL_EVENT.is_set():
+        sys.exit(130)
     if any(r.status not in ("Success", "Skipped") for r in reports):
         sys.exit(1)
 
