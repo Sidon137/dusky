@@ -989,7 +989,6 @@ def do_apply(args: argparse.Namespace, source_name: str) -> int:
     if not apply_all(THEME_NAME, size, nudge=already):
         notify("Dusky Cursor", f"{THEME_NAME} partially applied (see {HOOK_LOG})", "critical")
         return 1
-    notify("Dusky Cursor", f"{THEME_NAME} {pal.accent} @ {size}px")
     return 0
 
 
@@ -1004,7 +1003,6 @@ def do_restore(args: argparse.Namespace, source_name: str) -> int:
     cur_theme, cur_size = current_state()
     if not apply_all(source_name, size, nudge=(cur_theme == source_name and cur_size == size)):
         return 1
-    notify("Cursor", f"restored to {source_name} @ {size}px")
     return 0
 
 
