@@ -137,7 +137,7 @@ tasks = [
     # "U | 365_cache_purge.sh",
     # "S | once | 370_arch_install_scripts_cleanup.sh",
     "U | once | 375_cursor_theme_bibata_classic_modern.sh",
-    "U | | once | dusky_cursor.py --apply",
+    "U | once | dusky_cursor.py --apply",
     # "S | 380_nvidia_open_source.sh",
     "U | once | 383_configure_hyprland_gpu.py --auto",
     # "S | 385_waydroid_setup.sh",
