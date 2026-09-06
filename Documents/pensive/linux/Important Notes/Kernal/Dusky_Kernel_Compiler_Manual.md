@@ -30,8 +30,9 @@ If you have never compiled a kernel, read in this order and skip nothing:
 
 ## Quick Navigation
 
+- [[#0. Audit Report v6.0.0 → v6.1.0|0. Audit Report v6.0.0 → v6.1.0 (Findings Register F-01–F-40 & 6 Mandated Deep Dives)]]
 - [[#1. Engine Pipeline & Filesystem Topology|1. Engine Pipeline & Filesystem Topology]]
-- [[#2. Kernel Primer — The Four Configuration Scopes|2. Kernel Primer — The Four Configuration Scopes]]
+- [[#2. Kernel Primer — Internals, Scopes & Mental Models|2. Kernel Primer — Internals, Scopes & Mental Models]]
 - [[#3. Subsystem Architecture Map & The 7.2 Baseline|3. Subsystem Architecture Map & The 7.2 Baseline]]
 - [[#4. The Kernel Optimization Trilemma|4. The Kernel Optimization Trilemma]]
 - [[#5. The Four Archetypes — Deep Architectural Breakdowns|5. The Four Archetypes — Deep Architectural Breakdowns]]
@@ -46,6 +47,200 @@ If you have never compiled a kernel, read in this order and skip nothing:
 - [[#Appendix A — Audit Errata|Appendix A — Audit Errata (What Changed and Why)]]
 - [[#Appendix B — Kconfig Symbol Index|Appendix B — Kconfig Symbol Index]]
 - [[#Appendix C — Glossary|Appendix C — Glossary]]
+- [[#Appendix D — Version-Drift Verification Protocol|Appendix D — Version-Drift Verification Protocol]]
+
+---
+
+## 0. Audit Report v6.0.0 → v6.1.0
+
+### 0.1. Findings Register
+
+Severity legend: 🔴 **Critical** — the built kernel silently does *not* do what the profile claims, or the build breaks. 🟠 **Major** — misleading guidance, measurable performance/robustness loss, or missing dependency. 🟡 **Minor** — numerically wrong claim or imprecise wording. 🔵 **Gap** — missing information the user needs.
+
+| # | Sev | Location in v6.0.0 | Defect | Correction applied in v6.1.0 |
+| :--- | :---: | :--- | :--- | :--- |
+| F-01 | 🔴 | `[compiler].debug_info = "reduced"` (default) | Upstream `lib/Kconfig.debug`: `config DEBUG_INFO_BTF … depends on !DEBUG_INFO_SPLIT && !DEBUG_INFO_REDUCED`. With `reduced`, **BTF cannot be generated**, so `sched_ext`, CO-RE eBPF, `bpftrace` and `verify.require_btf` all die. `reduced` was also described as "required for BTF/eBPF" — the exact inverse of reality. | Default changed to **`full`**. `debug_info` semantics rewritten in §7.9. `verify` now cross-checks `debug_info != "reduced"` whenever BTF is required. |
+| F-02 | 🔴 | `[cpu] amd_pstate="active"` + `governor="schedutil"` | Under `amd_pstate=active` the driver is `amd-pstate-epp` and the **only** governors the policy exposes are `performance` and `powersave`; `schedutil`, `ondemand`, `conservative` do not exist on that policy. Every profile pairing `active` + `schedutil` silently boots `powersave` + EPP. | New invariant **I-17** (§8.2). §7.6 documents the three amd_pstate modes and which governor set each exposes. |
+| F-03 | 🔴 | `[memory].mglru_mask` — "1 = anon, 2 = file, 4 = page-table scan" | Wrong. `/sys/kernel/mm/lru_gen/enabled` is: `0x0001` MGLRU core, `0x0002` batched clearing of the **accessed bit in leaf PTEs via page-table walks**, `0x0004` clearing the accessed bit in **non-leaf PMD** entries. Nothing to do with anon/file. | Corrected and explained mechanically in §7.8. |
+| F-04 | 🔴 | "`CONFIG_LRU_GEN=y`. Multi-Gen LRU replacement…" | `LRU_GEN=y` only **builds** MGLRU. It is **off at runtime** unless `CONFIG_LRU_GEN_ENABLED=y` (the "Enable by default" symbol) or userspace writes `y` to `/sys/kernel/mm/lru_gen/enabled`. | `memory.mglru = true` now documented to set **both** `LRU_GEN=y` **and** `LRU_GEN_ENABLED=y`. |
+| F-05 | 🔴 | `[memory].zram_algo` / `zram_recomp_algo` | Modern ZRAM splits algorithms into per-backend symbols (`ZRAM_BACKEND_ZSTD`, `ZRAM_BACKEND_LZ4`, `ZRAM_BACKEND_LZ4HC`, `ZRAM_BACKEND_LZO`, `ZRAM_BACKEND_DEFLATE`, `ZRAM_BACKEND_842`). `ZRAM_DEF_COMP_ZSTD` is **unselectable** unless its backend is enabled. Idle-page recompression additionally needs `ZRAM_TRACK_ENTRY_ACTIME`. | §7.8 documents the full ZRAM symbol chain, plus `ZRAM_WRITEBACK` for incompressible pages. |
+| F-06 | 🔴 | Shipped `battery_efficiency.toml`: `swap_backend="zram"` + `hibernation=true` | You **cannot hibernate into ZRAM** — the image must survive power loss, and the resume device must be block-addressable at resume time. A ZRAM-only machine with `hibernation=true` builds a hibernation-capable kernel that can never hibernate (no `resume=`). | New invariant **I-18** (warn + guidance). Template rewritten in §9.3 with an explicit swapfile note. |
+| F-07 | 🔴 | `[compiler].optimize = "o3"` description | The flag list mixes toolchains: `-fmodulo-sched`, `-fmodulo-sched-allow-regmoves`, `-fivopts` are **GCC-only** and make Clang fail (`-Werror=unknown-argument`). `-mllvm -enable-pipeliner` targets VLIW back-ends and is a no-op on x86-64. `-mno-avx2 -fno-tree-vectorize` are redundant: kbuild already forces `-mno-sse -mno-mmx -mno-sse2 -mno-3dnow -mno-avx` for all kernel C code. Upstream x86 has **no** `CC_OPTIMIZE_FOR_PERFORMANCE_O3` choice. | §7.9 rewritten: `o3` = out-of-tree kbuild patch **or** plain `KCFLAGS=-O3`, with realistic expectations (±1%, occasionally negative) and the correct Clang-only flag set. |
+| F-08 | 🟠 | `[storage].io_scheduler` "sets Kconfig defaults" | blk-mq has **no** upstream "default elevator" Kconfig. The kernel picks `none` for multi-queue devices and `mq-deadline` for single-queue ones; changing it is a **udev** job (`ELEVATOR`/`queue/scheduler`). | Redefined: the key **compiles the elevators** (`IOSCHED_BFQ`, `MQ_IOSCHED_KYBER`, `MQ_IOSCHED_DEADLINE`) and records the desired default for the runtime layer. Optional out-of-tree `MQ_IOSCHED_DEFAULT_*` noted. |
+| F-09 | 🟠 | `[memory].thp="never"`, `thp_shmem` | `thp="never"` still **compiles** THP (`TRANSPARENT_HUGEPAGE=y` + `_NEVER` default); it does not remove the code. `thp_shmem` has **no Kconfig** — it is `/sys/kernel/mm/transparent_hugepage/shmem_enabled` or the `transparent_hugepage_shmem=` / `thp_shmem=` boot parameters. | Both corrected; §7.8 adds "how to actually remove THP" and the mTHP boot-parameter family. |
+| F-10 | 🟠 | `[power].rcu_lazy` | `RCU_LAZY` only acts on **offloaded (NOCB)** callbacks. Without `RCU_NOCB_CPU=y` **and** offloading active (`RCU_NOCB_CPU_DEFAULT_ALL=y` or `rcu_nocbs=all`), it saves exactly nothing. | Dependency chain documented; the engine now emits `rcu_nocbs=all` alongside `rcutree.enable_rcu_lazy=1`. |
+| F-11 | 🟠 | `[security].apparmor` / `selinux` | Building an LSM does not activate it. The LSM must appear in `CONFIG_LSM="…"` (or the `lsm=` cmdline), and AppArmor additionally honours `SECURITY_APPARMOR_BOOTPARAM_VALUE` / `apparmor=1`. | §7.10 documents the ordered LSM stack and the exact `CONFIG_LSM` string Arch expects. |
+| F-12 | 🟠 | `[compiler].kcfi` | Missing three real constraints: (1) proprietary blobs (`nvidia.ko`'s pre-compiled `nv-kernel.o_binary`) lack kCFI preambles → indirect-call violations; (2) upstream `RUST` `depends on !CFI_CLANG \|\| HAVE_CFI_ICALL_NORMALIZE_INTEGERS_RUSTC`; (3) FineIBT pulls in `CALL_PADDING`, and `RUST depends on !CALL_PADDING \|\| RUSTC_VERSION >= 108100`. | All three added as invariants **I-19/I-20** and explained in §7.9/§7.10. |
+| F-13 | 🟠 | `[network].nf_conntrack_procfs` "eliminating lock contention on gigabit links" | False. The `/proc/net/nf_conntrack` file costs nothing while unread; the expense is in *reading* it (a full hash-table walk). Disabling it removes an interface, not contention. | Rewritten as an attack-surface/compat item. |
+| F-14 | 🟠 | `gaming.toml` `qdisc = "cake"` | CAKE is a **shaper**. On an endpoint whose NIC link (1/2.5 GbE) is far faster than the WAN, it cannot control the bottleneck queue, which lives in the ISP router. It adds per-packet cost for no latency gain. FQ is the correct endpoint qdisc and provides the pacing BBR wants. | `gaming` template switched to `fq`; CAKE guidance moved to "this box is the router" in §7.14. |
+| F-15 | 🟠 | `[scheduler].sched_core` "incurs 10–25% throughput loss" | Only when core scheduling is **actively used** (tasks tagged via `prctl(PR_SCHED_CORE)`). Compiled-in-but-unused costs ~0 (static key off) plus a small `struct rq` growth. | Reworded with both numbers. |
+| F-16 | 🟠 | `[gaming].uclamp` | `uclamp` influences **frequency selection through schedutil** and EAS placement. Under `amd_pstate=active`/`intel_pstate` HWP the hardware chooses the P-state and uclamp has no frequency effect. | Documented; §5.4 explains the correct pairing (`passive`/`guided` + `schedutil` + uclamp, or `active` + EPP and skip uclamp). |
+| F-17 | 🟠 | `gaming.toml` `energy_model = true` | EAS requires **asymmetric CPU capacity** plus a populated Energy Model. On a symmetric x86 desktop it is inert; it only matters on ARM big.LITTLE and (partially) Intel hybrid P/E parts. | Set to `false` in the gaming template; explained in §7.13. |
+| F-18 | 🟠 | `[scheduler]` BORE + SCX | Not a conflict, but **functionally redundant**: when an SCX scheduler attaches without `SCX_OPS_SWITCH_PARTIAL`, *all* `SCHED_NORMAL/BATCH/IDLE` tasks migrate into the ext class and BORE's burst heuristics in the fair class stop running. BORE then only matters as the fallback after `scx_*` exits/crashes. | Explained in §0.2.2 and §7.3. |
+| F-19 | 🟡 | `slub_tiny` "Saves 20–60 MB RAM" | Overstated by an order of magnitude. Realistic: ~0.3–1 MB of text/metadata plus avoided per-CPU partial-slab slack — single-digit MB on a many-core box, well under 1 MB on a 4-core one. | Corrected; the real reason to use it (and not to) is scalability, documented in §5.3. |
+| F-20 | 🟡 | `numa = false` "saves 15–35 MB" | Overstated. `CONFIG_NUMA=n` removes node structures, `mempolicy` and some per-node arrays: roughly **0.5–2 MB** on a single-socket machine. | Corrected. |
+| F-21 | 🟡 | Trilemma "3% to 8% penalty" for 1000 Hz | On modern out-of-order x86 with `NO_HZ_IDLE`, 1000 Hz vs 250 Hz costs roughly **0.3–2%** on sustained multi-core builds. The 3–8% figure belongs to the pre-tickless era. | Corrected, with the missing insight: **HZ bounds `PREEMPT_LAZY` latency** (§5.4). |
+| F-22 | 🟡 | `init_on_free` "5%–12%" | Typically **1–5%** on desktop workloads (worst case higher for allocation-churn microbenchmarks). `init_on_alloc` is ~0.3–1%. | Corrected. |
+| F-23 | 🟡 | `watermark_scale_factor` | Units never explained: the value is **per 10 000** of the zone (125 → 1.25%). Default upstream is 10 (0.1%). | Explained with the formula. |
+| F-24 | 🟠 | `[cpu].nr_cpus` range `0–8192` | On x86-64 the Kconfig range ends at **512** unless `CPUMASK_OFFSTACK=y` (pulled in by `MAXSMP`); above that the symbol is out of range and `olddefconfig` clamps it. | Documented. |
+| F-25 | 🟠 | `[memory].base_small` | In modern kernels `BASE_SMALL` is **not user-selectable**; it is derived from `BASE_FULL`. The engine must set `CONFIG_BASE_FULL=n`. | Corrected. |
+| F-26 | 🟠 | `[memory].memcg` | Disabling `MEMCG` breaks systemd resource control (`MemoryMax=`, `MemoryHigh=`), `systemd-oomd`, and most container tooling. Never disable on a systemd host. | Hard warning added. |
+| F-27 | 🟠 | `[compiler].modversions` | `RUST depends on !MODVERSIONS \|\| GENDWARFKSYMS`, and MODVERSIONS under LTO needs `GENDWARFKSYMS` too (genksyms cannot read bitcode). `GENDWARFKSYMS` needs `DEBUG_INFO`. | Invariant **I-21** added. |
+| F-28 | 🟠 | `[security].lockdown_early` | Lockdown *integrity* blocks unsigned module loading (kills DKMS unless you sign), `/dev/mem`, unsigned kexec, and **hibernation**; *confidentiality* additionally cripples `perf`, `kprobes` and BPF. Only meaningful with Secure Boot + signed modules. | Invariant **I-22**; §7.10 rewritten. |
+| F-29 | 🟡 | `tickless = "full"` | Correct that `nohz_full=` is required, but the cost was unstated: context tracking on every kernel entry/exit (~1–2% syscall overhead), plus mandatory housekeeping CPU and `rcu_nocbs`. Wrong choice for desktops. | Fully explained in §7.7. |
+| F-30 | 🟠 | `[boot].cmdline = "bake"` | `CONFIG_CMDLINE` requires `CONFIG_CMDLINE_BOOL=y`; on x86 the built-in string is **prepended** and the bootloader's arguments follow (last occurrence wins for most parameters) unless `CMDLINE_OVERRIDE=y`. UKI users must bake or use `ukify`. | Documented precisely in §7.16. |
+| F-31 | 🔵 | `[gaming].ntsync` | Building `NTSYNC=m` is not sufficient for Wine: `/dev/ntsync` needs permissive access, i.e. a udev rule in the **runtime** layer. The manual's "no udev rules" statement left users stranded. | The exact rule is now given in §5.4 and §12 (clearly labelled runtime-layer, not engine). |
+| F-32 | 🔵 | Packaging | Never explained that upstream `make pacman-pkg` names packages from `PACMAN_PKGBASE`, and that the `/usr/lib/modules/<ver>/pkgbase` file is what triggers Arch's mkinitcpio/dracut hooks. | Added to §1 and §11. |
+| F-33 | 🟠 | `preempt_dynamic` | Correct outcome, no reasoning: upstream `PREEMPT_DYNAMIC depends on HAVE_PREEMPT_DYNAMIC && !PREEMPT_RT`. Also unstated: which strings `preempt=` accepts and the debugfs path. | Proven and expanded in §0.2.1 / §7.7. |
+| F-34 | 🟠 | `[memory].kexec` | `KEXEC` (legacy) vs `KEXEC_FILE` (signature-verifying, required under lockdown) never distinguished; `CRASH_DUMP` dependency unstated. | Split in §7.8. |
+| F-35 | 🟡 | `trim_unused_ksyms` | Correct about DKMS, but also: it makes the kernel **unable to build any future out-of-tree module**, and forces a full rebuild to undo. | Expanded. |
+| F-36 | 🔵 | `security.profile = "hardened"` under LLVM | `STACKLEAK` is a **GCC plugin** and is unavailable with Clang; `RANDSTRUCT` *is* available with Clang but `RUST depends on !RANDSTRUCT` and it breaks binary blobs. A "hardened" LLVM build is therefore not KSPP-complete. | Trade-off table added in §7.10. |
+| F-37 | 🟡 | `[memory].swap_backend = "zswap"` | `zbud`/`z3fold` are gone; `zsmalloc` is the only zpool. Also unstated: **zswap in front of a ZRAM device is an anti-pattern** (double compression, no real backing store). | Documented in §5.3/§7.8. |
+| F-38 | 🔵 | `[network].tcp_fastopen` | There is no Kconfig symbol; it is purely `net.ipv4.tcp_fastopen` (bitmask 1=client, 2=server, 3=both). Middlebox blackholing caveat unstated. | Clarified as runtime-only. |
+| F-39 | 🔵 | Non-standard HZ | Unstated that `USER_HZ` stays 100 (no userspace ABI change) and that HZ only quantises jiffies-based timers — hrtimers are unaffected. | Added in §7.7. |
+| F-40 | 🔵 | Bleeding-edge symbols | `SCHED_CACHE`, `RSEQ_SLICE_EXTENSION`, non-standard HZ, `MQ_IOSCHED_DEFAULT_*`, uarch symbols beyond `X86_NATIVE_CPU` and per-vuln `MITIGATION_*` are young or out-of-tree; symbol names drift between -rc trees. | **Appendix B** adds a mandatory verification protocol (`scripts/config -s`, `grep` in Kconfig, `make menuconfig /search`). |
+
+> [!important] The single most consequential fix
+> If you take one thing from this audit: **`debug_info = "reduced"` and `sched_ext` are mutually exclusive.** BTF is generated by `pahole` from the vmlinux DWARF, and `DEBUG_INFO_REDUCED` (`-femit-struct-debug-baseonly`) throws away exactly the struct member information BTF encodes — so upstream forbids the combination outright. Any profile that wants `scx_*`, CO-RE eBPF, `bpftrace`, or `verify.require_btf = true` **must** use `debug_info = "full"`.
+
+---
+
+### 0.2. Mandated Deep Dives
+
+#### 0.2.1. Preemption — is `PREEMPT_LAZY` switchable at boot? Is `PREEMPT_RT`?
+
+**What preemption means.** When a task becomes runnable (a key press wakes your compositor), the kernel must decide whether to interrupt whatever is currently on that CPU. "Preemptible" kernels allow that interruption even while executing kernel code. The trade-off is eternal: interrupting early lowers latency; interrupting less preserves cache locality and throughput.
+
+**The 7.x model set** (a Kconfig `choice`, exactly one is the *built-in default*):
+
+| Symbol | Behaviour | Who wants it |
+| :--- | :--- | :--- |
+| `PREEMPT_NONE` | Only preempt at explicit reschedule points; kernel code runs to completion. | Batch compute, HPC. |
+| `PREEMPT_VOLUNTARY` | Adds `might_sleep()` reschedule points. | Legacy servers. |
+| `PREEMPT` (full) | Kernel code is preemptible almost everywhere. | Pro audio, competitive gaming. |
+| `PREEMPT_LAZY` | **Two-flag** model: urgent (RT/DL) wakeups set `TIF_NEED_RESCHED` and preempt immediately; ordinary fair-class wakeups set `TIF_NEED_RESCHED_LAZY`, which is honoured at the next return-to-userspace or the next scheduler tick. | Desktops — the 7.x default. |
+| `PREEMPT_RT` | Spinlocks become `rt_mutex`es, IRQ handlers become threads, almost everything becomes preemptible. | Hard real-time. |
+
+**Dynamic switching.** `CONFIG_PREEMPT_DYNAMIC` compiles the reschedule hooks behind **static calls/static keys** that are patched at boot, so a single binary can behave as `none`, `voluntary`, `full` — and, in 7.x, `lazy`. Selection: `preempt=<model>` on the kernel command line, or at runtime:
+
+```bash
+cat /sys/kernel/debug/sched/preempt        # -> none voluntary (full) lazy
+echo full | sudo tee /sys/kernel/debug/sched/preempt
+```
+
+**So: is LAZY dynamically switchable?** Yes — `lazy` is one of the models the dynamic machinery can patch to, provided the kernel was built with `PREEMPT_DYNAMIC=y` and a non-RT base model. `timing.preempt = "lazy"` + `preempt_dynamic = true` gives you a kernel that boots lazy and can be flipped to `full` for a mastering session without rebooting.
+
+**Is RT dynamically switchable?** **No, and it cannot be.** Upstream: `config PREEMPT_DYNAMIC … depends on HAVE_PREEMPT_DYNAMIC && !PREEMPT_RT`. The reason is structural, not political: `PREEMPT_RT` changes **data-structure semantics at compile time**. `spinlock_t` becomes a sleeping `rt_mutex`; `local_lock` changes meaning; hardirq handlers are threaded; `raw_spinlock_t` becomes the only true spinning lock. You cannot static-call your way between "this lock spins" and "this lock sleeps" — the calling contexts (whether it is legal to sleep) differ. Hence invariant **I-03**: `preempt = "rt"` forces `preempt_dynamic = false`, and `preempt=` on the cmdline is ignored by an RT kernel.
+
+**The under-documented interaction (new in this revision):** with `PREEMPT_LAZY`, a lazy resched request is consumed at the *next scheduler tick* if the task does not return to userspace first. Therefore **`CONFIG_HZ` is the upper bound on lazy preemption latency**: 1000 Hz → ≤1 ms; 300 Hz → ≤3.3 ms. This is the missing link between §7.7's two tables and the reason a 1000 Hz + lazy desktop feels like full preemption while keeping most of its throughput.
+
+#### 0.2.2. Schedulers — BORE with SCX? Why never BMQ with SCX?
+
+**The class hierarchy.** Linux dispatches by scheduling class, strictly ordered: `stop` → `deadline` → `rt` → **`ext`** → `fair` → `idle`. A CPU picks from the highest non-empty class.
+
+- **EEVDF** *is* the fair class in 7.x. Each task has a virtual runtime `v_i`; it is *eligible* when `V(t) ≥ v_i` (it has not consumed more than its fair share of virtual time), and among eligible tasks the one with the earliest **virtual deadline** `d_i = v_i + q_i / w_i` runs. Short-slice (interactive) tasks therefore get earlier deadlines and preempt long-slice hogs without any heuristic "interactivity bonus".
+- **BORE** (Burst-Oriented Response Enhancer) is a *patch to the fair class*. It measures each task's recent CPU burst length and scales its effective weight/slice so that short-burst (interactive) tasks are favoured. It does **not** add a class.
+- **sched_ext** (`CONFIG_SCHED_CLASS_EXT`) adds the `ext` class, whose policy is a **BPF program** loaded from userspace (`scx_lavd`, `scx_bpfland`, …).
+
+**BORE + SCX: legal, mostly pointless.** They live in different classes, so the build is fine. But when a full SCX scheduler attaches, it takes over *all* `SCHED_NORMAL`, `SCHED_BATCH` and `SCHED_IDLE` tasks (unless it opted into `SCX_OPS_SWITCH_PARTIAL`). Those tasks leave the fair class, so BORE's burst accounting no longer influences anything. BORE remains valuable as the **fallback**: if the BPF scheduler exits, errors out, or hits its watchdog, the kernel instantly reverts every task to fair — and you land on BORE rather than stock EEVDF. Treat `type = "bore"` + `scx = "scx_*"` as "BPF scheduler with a tuned safety net", not as stacked optimisation.
+
+**BMQ + SCX: impossible.** Project C's BMQ/PDS does not patch the fair class — it **replaces** it. `kernel/sched/alt_core.c` substitutes the entire `fair_sched_class` with a bitmap-indexed O(1) runqueue, and `kernel/sched/fair.c` is not built. `sched_ext` is not a standalone island: it is wired into the core through hooks that live in the fair/core scheduler (task enqueue/dequeue paths, the balance and `pick_next_task` fallbacks, `scx_` call sites in `core.c`, and the "give the task back to fair" path used when a BPF scheduler unloads or is disabled by the watchdog). With `fair.c` gone those hooks have no home, `SCHED_CLASS_EXT` fails to build or the resulting kernel has no safe fallback path. Hence invariant **I-04**: `type = "bmq"` forces `scx = "none"` and `scx_enable_class = false`. This is also why BMQ builds cannot use `scx_loader`, and why `verify.require_sched_ext` must be `false` in a BMQ profile.
+
+#### 0.2.3. Rust — why does it vanish when BTF and LTO are both on?
+
+Upstream `init/Kconfig` (verified against current trees):
+
+```
+config RUST
+	bool "Rust support"
+	depends on HAVE_RUST
+	depends on RUST_IS_AVAILABLE
+	select EXTENDED_MODVERSIONS if MODVERSIONS
+	depends on !MODVERSIONS || GENDWARFKSYMS
+	depends on !GCC_PLUGIN_RANDSTRUCT
+	depends on !RANDSTRUCT
+	depends on !DEBUG_INFO_BTF || (PAHOLE_HAS_LANG_EXCLUDE && !LTO)
+	depends on !CFI_CLANG || HAVE_CFI_ICALL_NORMALIZE_INTEGERS_RUSTC
+	select CFI_ICALL_NORMALIZE_INTEGERS if CFI_CLANG
+	depends on !CALL_PADDING || RUSTC_VERSION >= 108100
+	depends on !KASAN_SW_TAGS
+```
+
+Read the BTF line as a sentence: *Rust is allowed if BTF is off; or if BTF is on **and** pahole can exclude Rust **and** LTO is off.*
+
+**Mechanism.** BTF is not emitted by the compiler. `link-vmlinux.sh` runs **pahole** over the linked `vmlinux`'s DWARF and converts it to BTF. Rust's DWARF uses type constructs (and a different `DW_AT_language`) that pahole's C-oriented converter mis-encodes, producing BTF that the kernel BPF verifier then rejects or, worse, silently mis-types. The fix upstream was `pahole --lang_exclude=rust` (advertised to Kconfig as `PAHOLE_HAS_LANG_EXCLUDE`): skip every compilation unit whose language is Rust.
+
+**Why LTO defeats that.** With ThinLTO/Full LTO the compiler emits **bitcode**, and the linker merges and re-optimises across translation-unit boundaries before generating final code and debug info. Compilation units are fused, inlined into one another and re-attributed; the clean 1:1 mapping "this CU is Rust" is destroyed. pahole can no longer reliably identify and exclude Rust CUs, so upstream refuses the combination rather than emit corrupt BTF.
+
+**The practical squeeze.** `sched_ext` requires `DEBUG_INFO_BTF=y`. So the moment you ask for `scx = "scx_lavd"` **and** `lto = "thin"`, Kconfig drops `RUST` — silently, because `olddefconfig` just resolves the dependency. You get three coherent exits:
+
+| Goal | `lto` | `scx` / BTF | `rust` | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| BPF schedulers + Rust drivers | `none` | BTF on | `y` | Lose ~1–3% LTO codegen; keep everything else. **Recommended when you need both.** |
+| BPF schedulers + max codegen | `thin`/`full` | BTF on | **`n`** | The default Dusky choice. You lose Rust in-tree drivers (`nova`, `nvme` Rust bits, `binder`). |
+| Rust + max codegen, no BPF tooling | `thin` | BTF **off** | `y` | Breaks `bpftrace`, CO-RE, `scx_*`, most eBPF observability. Rarely worth it. |
+| GCC toolchain | forced `none` | BTF on | `y` | GCC has no ThinLTO/kCFI; see I-01. |
+
+Two neighbours from the same block: `RUST` also requires a rustc new enough for kCFI integer normalisation when `CFI_CLANG=y`, and — because **FineIBT selects `CALL_PADDING`** — rustc ≥ 1.81 whenever you enable IBT-based CFI. Old rustc + kCFI = Rust silently disappears again.
+
+#### 0.2.4. Allocator — why `SLUB_TINY` kills `SLAB_BUCKETS`, and why it hurts >8 cores
+
+**SLUB in one paragraph.** The slab allocator hands out small fixed-size kernel objects (`struct file`, `dentry`, network skbs) from pages carved into slabs. SLUB's speed comes from a **per-CPU fast path**: each CPU owns an active slab plus a short list of *partial* slabs (`SLUB_CPU_PARTIAL`), so the common alloc/free is a lock-free `this_cpu` freelist pop with a `cmpxchg`. Only when the per-CPU cache is exhausted does it take the per-node `list_lock`.
+
+**What `SLUB_TINY` removes.** It is a *size-optimised* build for memory-constrained systems: it disables per-CPU partial slab lists (`SLUB_CPU_PARTIAL depends on !SLUB_TINY`), disables the SLUB sysfs/debug surface (`SLUB_DEBUG depends on … !SLUB_TINY`), forgoes the bulk-allocation optimisations, and shrinks internal metadata and order heuristics.
+
+- **Why it breaks `SLAB_BUCKETS`:** `config SLAB_BUCKETS … depends on !SLUB_TINY`. SLAB_BUCKETS is a *hardening* feature that creates **separate `kmalloc` bucket sets** for allocations whose size is attacker-controlled (`memdup_user()` and friends), so a heap spray from userspace cannot land in the same cache as a sensitive kernel object (the "cross-cache" exploitation primitive). Extra bucket sets mean extra `kmem_cache` structures, extra per-CPU state and extra partial lists — precisely the memory SLUB_TINY exists to reclaim. Upstream therefore forbids the pair. Invariant **I-10**.
+- **Why >8 cores suffer:** with per-CPU partial slabs gone, every time a CPU's active slab is exhausted or a free empties a slab, the operation escalates to the per-node `list_lock`. That is a **single shared cacheline per NUMA node under contention**. At 4 cores you rarely notice; at 16–32 cores a network-heavy or fork-heavy workload turns that lock into the bottleneck, with cacheline ping-pong across CCX/LLC boundaries. Expect double-digit percentage regressions on `hackbench`, packet forwarding and heavy `open()/close()` loops.
+
+**Rule of thumb:** `slub_tiny = true` only for ≤4 GB RAM **and** ≤8 threads. Above that, use `footprint = "lean"` and keep full SLUB. (See §5.3 for the honest memory numbers — F-19.)
+
+#### 0.2.5. ZRAM vs zswap — architecture, and why recompression needs in-kernel tracking
+
+They are **not** two flavours of the same thing.
+
+```mermaid
+flowchart LR
+    subgraph Z1["ZRAM — a compressed block device"]
+        A1[Anonymous page evicted] --> B1[swap subsystem]
+        B1 --> C1["/dev/zram0 (highest priority swap)"]
+        C1 --> D1["zsmalloc pool in RAM<br>page stays compressed in RAM forever"]
+        D1 -. optional .-> E1["ZRAM_WRITEBACK →<br>real disk for idle/incompressible pages"]
+    end
+    subgraph Z2["zswap — a compressed cache in front of real swap"]
+        A2[Anonymous page evicted] --> B2[swap subsystem]
+        B2 --> C2["zswap hook"]
+        C2 --> D2["zsmalloc pool (≤ max_pool_percent of RAM)"]
+        D2 -->|pool full / shrinker| E2["decompress + write to real swap<br>(partition or file)"]
+    end
+```
+
+- **ZRAM** creates a block device backed by compressed RAM. You `mkswap` it and give it the highest swap priority. A swapped page is compressed once and **stays in RAM**; there is no disk tier unless you configure `ZRAM_WRITEBACK`. Result: swapping costs CPU, never I/O. This is why `swappiness` can be pushed to 150–180 with ZRAM — "swap" is now a memcpy + compress, roughly 1–3 GB/s with LZ4 or ~500 MB/s–1 GB/s with zstd, versus ~50 µs+ for NVMe. ZRAM is a **terminal tier**: when it is full, you OOM.
+- **zswap** is a *write-behind cache* on the path to a **real** swap device. Pages are compressed into a zsmalloc pool; when the pool exceeds `max_pool_percent`, the LRU-coldest entries are decompressed and written out to the actual partition/file. It needs real swap to exist, and it degrades gracefully to disk instead of OOMing.
+- **Never stack them.** zswap in front of a ZRAM device compresses twice, wastes CPU, and gives zswap a "backing store" that is itself RAM. Choose one. Invariant **I-06** covers the Kconfig side; §7.8 states the policy.
+
+**Multi-compression and why the kernel must track pages.** `ZRAM_MULTI_COMP` lets you register up to four algorithms at different priorities — e.g. **LZ4 as the primary** (fast, ~2:1) so the swap-out path stays cheap, and **zstd (or deflate) as a secondary** for *recompression* of pages that turn out to be cold. Recompression is triggered from userspace:
+
+```bash
+echo "type=idle" | sudo tee /sys/block/zram0/recompress
+echo "type=huge_idle threshold=3000 algo=zstd" | sudo tee /sys/block/zram0/recompress
+```
+
+For `type=idle` to mean anything the kernel must know **when each stored object was last accessed**, which is exactly what `CONFIG_ZRAM_TRACK_ENTRY_ACTIME` adds (an access timestamp per zram entry). Without it, the idle selector has no data and the recompression request is rejected/ineffective. Userspace cannot supply this: it never sees the per-entry access events, which occur inside `zram_bio_read()`/lookup paths. Hence: **multi-comp is a Kconfig + kernel-tracking feature; the *policy* (when to recompress) is a runtime timer.** The Dusky engine builds the capability (`ZRAM_MULTI_COMP`, backends, `TRACK_ENTRY_ACTIME`); a systemd timer in the runtime layer performs the sweeps.
+
+#### 0.2.6. DKMS — how `trim_unused_ksyms` destroys out-of-tree modules
+
+The kernel exposes functions to modules by *explicit export*: `EXPORT_SYMBOL(foo)` / `EXPORT_SYMBOL_GPL(foo)`. At build time these become entries in the kernel symbol table (`__ksymtab`), and at `insmod` time the loader resolves each module's undefined references against it.
+
+`CONFIG_TRIM_UNUSED_KSYMS` performs a whole-tree analysis: it collects the symbols required by **the modules being built in this configuration**, then re-builds the kernel with every *other* export removed. On a `modules.mode = "strict"` build — where `localmodconfig` has already deleted thousands of drivers — the surviving set is tiny. Symbols like `__vmalloc_node_range`, `dma_buf_export`, `drm_gem_object_init`, `sched_set_fifo`, or `zstd_*` may have **no in-tree consumer left**, and are deleted.
+
+Now DKMS builds `nvidia.ko` / `zfs.ko` / `v4l2loopback.ko`. Two failure modes:
+
+1. `modpost` during the DKMS build fails: *"ERROR: modpost: 'symbol' undefined!"* — the header/symbol table simply does not contain it.
+2. Rarer and nastier: the module links but `insmod` fails with *"Unknown symbol in module"*, because the exported symbol was trimmed while `Module.symvers` was stale.
+
+There is no runtime remedy: exports are baked into `vmlinux`. Fixing it means editing the config and **recompiling the whole kernel**. Hence invariant **I-11**: `compiler.headers != "never"` (i.e. you intend to build external modules) forces `trim_unused_ksyms = false`. The reciprocal is also true and worth stating plainly: **a `trim_unused_ksyms = true` kernel can never gain a new out-of-tree module for the rest of its life** — not just DKMS, but any `make -C /lib/modules/$(uname -r)/build M=…` build. Use it only for sealed appliance images where the module set is frozen. `modules.keep_symbols` (which forces specific drivers to `=m`) can partially rescue you, but only for symbols consumed by an in-tree module you deliberately keep.
+
+---
 
 ---
 
@@ -99,15 +294,80 @@ flowchart TD
 > [!tip] Build On ZRAM, Not On Your SSD
 > A full kernel tree plus objects is 15–30 GB of mostly-write traffic per build. If the engine finds `/mnt/zram1`, it builds there: RAM-backed, compressed, and it saves your SSD's endurance budget. Rule of thumb: you need **~1.6 GB of RAM per parallel job** with ThinLTO, plus the tree. A 16-thread / 32 GB machine should cap `compiler.jobs` around `12`–`16`, not `32`.
 
+### 1.3. Arch Packaging Contract & Hooks
+
+- Upstream's `make pacman-pkg` uses `scripts/package/PKGBUILD`, whose `pkgbase` comes from the **`PACMAN_PKGBASE`** environment variable (default `linux-upstream`). Dusky sets `PACMAN_PKGBASE=linux-dusky-<suffix>`, which makes `pacman -Q` show clean names and allows multiple Dusky kernels to coexist safely.
+- The package installs `/usr/lib/modules/<kernelrelease>/pkgbase`. **That file is the direct trigger** for Arch's `90-mkinitcpio-install.hook` (or dracut/booster equivalents). If initramfs generation does not happen automatically after installation, verifying the existence and contents of that file is the first triage step.
+- `CONFIG_LOCALVERSION` (derived from `meta.suffix`) becomes part of `uname -r`, e.g. `7.2.4-dusky-gaming`. Keep it short: it appears in module directory paths, BLS entry filenames, and `/usr/lib/modules/`.
+- Headers packages exist for exactly one reason: **out-of-tree module builds** (DKMS: `nvidia`, `zfs`, `v4l2loopback`, `virtualbox`, `xone`). `compiler.headers = "auto"` automatically inspects `dkms status` on the host to determine need.
+
 ---
 
-## 2. Kernel Primer — The Four Configuration Scopes
+## 2. Kernel Primer — Internals, Scopes & Mental Models
+
+> [!info] Read this once if you have never configured a kernel
+> Everything in this manual builds upon the foundational concepts below. They take five minutes to absorb and are the difference between blindly copying profiles and *engineering* them.
+
+### 2.1. What You Are Actually Building (The Five Artifacts)
+
+`vmlinuz` is a compressed executable that the firmware/bootloader hands control to. It contains the scheduler, memory manager, filesystem code, network stack and every driver you compiled **into** it. Around it:
+
+| Artefact | What it is | Where it lives |
+| :--- | :--- | :--- |
+| `vmlinuz-<release>` | The compressed kernel image | `/boot` (or the ESP) |
+| **Modules** (`*.ko.zst`) | Drivers compiled separately, loaded on demand | `/usr/lib/modules/<release>/` |
+| **initramfs** | A tiny throwaway root filesystem containing just enough modules to find and mount your real root | `/boot/initramfs-<release>.img` |
+| **`System.map` / BTF** | Symbol table / type metadata for tracing and eBPF | `/boot`, embedded in the image |
+| **Headers package** | Build system + headers so DKMS can compile modules later | `/usr/lib/modules/<release>/build` |
+
+### 2.2. Kconfig Tristates: `y`, `m`, `n` — And Why Dependencies Matter
+
+Every kernel feature is a **Kconfig symbol**. A symbol is either boolean (`y`/`n`) or **tristate** (`y`/`m`/`n`):
+
+- **`y`** — compiled *into* `vmlinuz`. Always present, costs RAM forever (kernel text is never swapped), available before the initramfs mounts anything.
+- **`m`** — compiled as a **module**. Costs disk, loaded only when the hardware appears (udev matches a device to a module alias). Ideal for drivers.
+- **`n`** — not compiled at all. Zero cost, zero possibility.
+
+Symbols have **dependencies** (`depends on`) and **reverse dependencies** (`select`). If you enable `A` whose `depends on B` is unmet, Kconfig will *refuse* and silently leave `A=n`. This is the single most common reason a profile "didn't work": you asked, `olddefconfig` said no, and the symbol was dropped without error. That is what `--print-matrix` and `verify.strict` exist for.
+
+```bash
+# The three commands that answer "is it really on?"
+./scripts/config -s CONFIG_SCHED_CLASS_EXT     # prints y/m/n/undef in a build tree
+zgrep CONFIG_LRU_GEN /proc/config.gz           # on a running kernel (needs ikconfig)
+grep -rn "config SLAB_BUCKETS" -A8 mm/Kconfig  # read the dependency block yourself
+```
+
+### 2.3. Boot Flow: In The Order Things Can Break
+
+```mermaid
+sequenceDiagram
+    participant FW as UEFI Firmware
+    participant BL as Bootloader (systemd-boot/GRUB/Limine)
+    participant K as vmlinuz
+    participant IR as initramfs
+    participant SD as systemd (PID 1)
+    FW->>BL: Load loader from ESP
+    BL->>K: Load vmlinuz + initramfs, pass cmdline
+    Note over K: CONFIG_CMDLINE (built-in) is prepended;<br>bootloader args follow and usually win
+    K->>K: Decompress, init memory, enumerate CPUs,<br>apply mitigations, start sched/RCU
+    K->>IR: Mount initramfs as temporary root
+    IR->>IR: udev loads storage/crypto modules,<br>assembles LVM/LUKS/RAID
+    IR->>SD: switch_root to real /, exec systemd
+    SD->>SD: Apply sysctl.d, udev rules, units,<br>zram-generator, scx_loader (RUNTIME LAYER)
+```
+
+Two consequences worth memorising:
+
+1. **A missing storage driver = unbootable.** If `strict` module pruning drops your NVMe/AHCI/dm-crypt module and it is not in the initramfs, the kernel panics with `Unable to mount root fs`. Recovery: pick the previous fallback kernel in the bootloader menu (§13.1).
+2. **Everything in layers 3–4 happens *after* PID 1.** So "my swappiness didn't change" is never a kernel-build bug — it is a userspace runtime configuration issue.
+
+### 2.4. The Four Configuration Scopes
 
 > [!note] If you already know Kconfig, skip to §3. If you do not, this section is mandatory — 90% of "my setting did nothing" reports are scope confusion.
 
 The Linux kernel is a single program (`vmlinuz`) plus a set of loadable plugins (`.ko` modules). What that program *contains* and how it *behaves* is decided in four different places, at four different times.
 
-### 2.1. Scope 1 — Kconfig (compile time, immutable)
+#### 2.4.1. Scope 1 — Kconfig (compile time, immutable)
 
 `.config` is a plain-text list of ~14,000 symbols. Each symbol is one of:
 
@@ -131,7 +391,7 @@ flowchart LR
     F -->|no| H["Exit 4 — tell the user exactly which symbol lost"]
 ```
 
-### 2.2. Scope 2 — Kernel command line (boot time, per-boot)
+#### 2.4.2. Scope 2 — Kernel command line (boot time, per-boot)
 
 A string handed to the kernel by the bootloader, e.g. `mitigations=off amd_pstate=active preempt=lazy`. It can:
 - switch between behaviours that were **compiled in as options** (`preempt=lazy` only works if `CONFIG_PREEMPT_DYNAMIC=y`);
@@ -151,14 +411,14 @@ Dusky writes it in one of three ways, controlled by `boot.cmdline`:
 > [!warning] `CONFIG_CMDLINE` and `CONFIG_CMDLINE_OVERRIDE`
 > With `bake`, the baked string is **prepended** to whatever the bootloader passes, unless `CONFIG_CMDLINE_OVERRIDE=y` (which discards the bootloader string entirely — including your `root=` UUID). Dusky never sets `CONFIG_CMDLINE_OVERRIDE`. Duplicate parameters resolve last-wins, so a bootloader entry always beats a baked default.
 
-### 2.3. Scope 3 — sysctl / sysfs / debugfs (runtime, mutable)
+#### 2.4.3. Scope 3 — sysctl / sysfs / debugfs (runtime, mutable)
 
 Live knobs under `/proc/sys/`, `/sys/`, `/sys/kernel/debug/`. Examples: `vm.swappiness`, `/sys/kernel/mm/lru_gen/enabled`, `/sys/kernel/mm/transparent_hugepage/enabled`. Changing them takes effect immediately, and reverts on reboot unless persisted through `/etc/sysctl.d/`, `udev` rules or `systemd` units.
 
 > [!important] Dusky Does Not Touch Scope 3
 > Every profile key that maps to a sysctl/sysfs value is **stored, never applied**. The engine's job ends at Kconfig + cmdline + bootloader. §12 gives you drop-in files for the runtime layer. The keys that are storage-only are listed exhaustively in §7.0.
 
-### 2.4. Scope 4 — Out-of-tree patches (source time)
+#### 2.4.4. Scope 4 — Out-of-tree patches (source time)
 
 Code that is not in Linus' tree: BORE, Project C BMQ, the `pcie_acs_override` patch, the `-march=` micro-architecture table (graysky2 `more-uarches`), the Clear Linux PCIe-PME timeout patch. Dusky fetches and applies these before configuration. If a patch does not apply cleanly against 7.2/7.3-rc, the build either falls back to vanilla (`allow_vanilla_fallback = true`) or aborts (`require_patch = true`).
 
@@ -174,6 +434,17 @@ Code that is not in Linus' tree: BORE, Project C BMQ, the `pcie_acs_override` pa
 | `net.core.default_qdisc=cake` | sysctl | **No Kconfig default exists for cake.** Runtime only. |
 | `/dev/ntsync` permissions | udev | **Not applied by Dusky.** See §12.3. |
 | `scx_lavd` running | systemd | **Not applied by Dusky.** See §12.5. |
+
+### 2.6. How to Read a Trade-Off in This Manual
+
+Every knob in §7 is documented with the same four questions, because that is the only honest way to tune:
+
+1. **What does it do mechanically?** (which code path changes)
+2. **What does it cost?** (CPU cycles, RAM, latency, build time, compatibility)
+3. **When does the benefit appear?** (workload shape, hardware class)
+4. **How do I verify it is live?** (a command that prints the truth)
+
+If a knob cannot answer #4, it is folklore. This manual removes folklore.
 
 ---
 
@@ -253,6 +524,8 @@ flowchart TD
 | **Control-flow integrity** | GCC plugins, or nothing. | **kCFI** (`CONFIG_CFI_CLANG`) + **FineIBT** on CET-IBT hardware. | Every indirect call checks a 4-byte type hash. FineIBT moves the check to the callee's ENDBR landing pad, combining hardware IBT with CFI at ~1–2% cost. |
 | **Compressed swap** | Single-algorithm ZRAM, or `zbud`/`z3fold` zswap pools. | **`ZRAM_MULTI_COMP` + `ZRAM_TRACK_ENTRY_ACTIME`**; zswap on **`zsmalloc` only** (`zbud`/`z3fold` were removed upstream). | Hot pages stay in a fast codec (LZ4/zstd level 1); idle pages get recompressed with a slow high-ratio codec. Idle detection needs per-entry access timestamps, which only exist when `ZRAM_TRACK_ENTRY_ACTIME=y`. |
 | **Boot elevator** | `elevator=deadline` on the kernel command line. | Removed in 5.0. blk-mq picks `none` for multi-queue devices and `mq-deadline` for single-queue devices; overrides are **udev rules**. | The engine can only choose which elevators are *compiled in*. Selection is runtime. |
+| **Page faults** | `mmap_lock` write/read serialised faults. | **`PER_VMA_LOCK`** per-VMA RCU-protected fault path. | Multi-threaded fault storms (game load, JVM start, `fork`-heavy builds) scale cleanly with cores. |
+| **Mitigations** | One global `mitigations=` sledgehammer. | Per-vulnerability `CONFIG_MITIGATION_*` symbols (retpoline, IBPB entry, SRSO, RFDS, BHI, PTI…). | Disable only what does not apply to *your* silicon instead of disabling everything. |
 
 ---
 
@@ -304,6 +577,15 @@ These four archetypes are the ends of the design space. Every shipped profile is
 ### 5.1. Archetype A — Maximum Battery Endurance
 
 **Goal:** maximise the fraction of wall-clock time the CPU package spends in its deepest C-state, and minimise the number of times it is dragged out.
+
+#### The idle problem
+
+A core enters a C-state when the idle loop decides no work is imminent. Deeper states power down more: C1 halts the core clock; C6 flushes and powers off the core's L1/L2 and saves its state; C8/C10 additionally flush the LLC, drop voltage rails and let the package enter its own low-power state. Two costs govern everything:
+
+- **Exit latency** (a few µs for C1, 50–200+ µs for C10). If you wake early, you paid the flush without earning the residency.
+- **Break-even residency** — the minimum time asleep for the energy saved to exceed the energy spent entering and leaving.
+
+Crucially, **package** C-states require *all* cores to be in a deep core C-state simultaneously. One core waking at 1000 Hz keeps the whole package awake. This is why battery tuning is fundamentally about *wakeup elimination*, not frequency.
 
 #### The TEO cpuidle governor (`CONFIG_CPU_IDLE_GOV_TEO`)
 
@@ -435,16 +717,21 @@ This combination is the entire point: you get hugepage benefits without the mult
 
 On a stock Arch kernel, `MemAvailable` after boot is reduced by roughly:
 
-| Consumer | Typical size | Removable by |
-| :--- | :--- | :--- |
-| `vmlinuz` text + rodata (decompressed) | 25–45 MB | `localmodconfig` pruning, `optimize=size`, `kallsyms_all=false` |
-| Loaded modules | 20–120 MB | `modules.mode = "strict"` |
-| BTF blob (`.BTF` in vmlinux, kept resident) | 4–8 MB | `debug_info = "none"` (loses sched_ext, BPF CO-RE) |
-| `struct page` array (`memmap`) | **~1.6% of RAM** (64 B / 4 KB page) | Nothing. It is proportional to RAM. |
-| Per-CPU allocations, cpumasks | 1–6 MB, scales with `NR_CPUS` | `nr_cpus` right-sizing |
-| Slab (dentry, inode, kmalloc caches) | 40–200 MB, workload-dependent | `vfs_cache_pressure`, `SLUB_TINY` |
-| Kernel hash tables (dentry, inode, pid, futex, TCP) | 4–32 MB, scales with RAM | `BASE_SMALL` |
-| Log ring buffer | 128 KB @ `LOG_BUF_SHIFT=17` | `log_buf_shift=15` (→32 KB) |
+| Consumer | Typical size | How to inspect | Removable by |
+| :--- | :--- | :--- | :--- |
+| `vmlinuz` text + rodata (decompressed) | 25–45 MB | `dmesg \| grep -i "Memory:"`, `size vmlinux` | `localmodconfig` pruning, `optimize=size`, `kallsyms_all=false` |
+| Loaded modules | 20–150 MB | `lsmod \| wc -l`, `/proc/meminfo: Slab` | `modules.mode = "strict"` (prunes unneeded drivers) |
+| BTF blob (`.BTF` in vmlinux, kept resident) | 4–8 MB | `readelf -S vmlinux \| grep BTF` | `debug_info = "none"` (loses sched_ext, BPF CO-RE) |
+| Page tables | 5–40 MB | `/proc/meminfo: PageTables` | Proportional to mapped address space |
+| Per-CPU allocations, cpumasks | 2–10 MB | `/proc/meminfo: Percpu` | `nr_cpus` right-sizing |
+| Slab (dentry, inode, kmalloc caches) | 40–200 MB | `slabtop -o`, `/proc/meminfo: Slab` | `vfs_cache_pressure`, `SLUB_TINY` |
+| Kernel vmalloc (module text, kernel stacks) | 20–80 MB | `/proc/vmallocinfo` | Pruning, smaller kernel stacks |
+| `struct page` array (`memmap`) | **~1.6% of RAM** (64 B / 4 KB page) | Inherent to physical RAM | Nothing. It is strictly proportional to RAM capacity. |
+| Kernel hash tables (dentry, inode, pid, futex, TCP) | 4–32 MB | `dmesg \| grep -i "hash table"` | `BASE_SMALL` |
+| Log ring buffer | 128 KB @ `LOG_BUF_SHIFT=17` | `/proc/kmsg` buffer size | `log_buf_shift=15` (→32 KB) |
+
+> [!important] The single biggest lever is module pruning, not SLUB_TINY
+> `modules.mode = "strict"` with a populated `modprobed.db` typically removes **thousands** of drivers. That is tens of MB of module text plus the associated init data — an order of magnitude more than every allocator micro-tweak combined. Do this first, measure, then consider the rest.
 
 #### `SLUB_TINY` — what it really does
 
@@ -506,7 +793,9 @@ On a 4 GB machine you will run out of RAM. The question is whether the machine *
 
 #### 1000 Hz + `PREEMPT_FULL`
 
-- **1000 Hz** bounds the scheduler tick at 1 ms. Under `PREEMPT_LAZY` this bounds the worst-case delay before a lazily-flagged task is forced off a CPU. Under `PREEMPT_FULL` the tick matters less for preemption but still governs timer resolution for `nanosleep`-style frame pacing and load balancing responsiveness.
+- **1000 Hz** bounds the scheduler tick at 1 ms. Under `PREEMPT_LAZY` this bounds the worst-case delay before a lazily-flagged task is forced off a CPU. The mathematical link is rigorous:
+  $$\text{worst-case lazy preemption delay} \approx \frac{1}{\text{CONFIG\_HZ}}$$
+  At 1000 Hz, that delay is bounded by $\le 1\text{ ms}$. At 250 Hz, the delay is $\le 4\text{ ms}$ — which at 240 FPS is an entire display frame! HZ also quantises jiffies-based timeouts throughout the kernel (`schedule_timeout`, many driver waits). Note (F-39): `USER_HZ` remains 100 regardless, so `times()` and `/proc` accounting semantics do not change — there is no userspace ABI break from non-standard HZ values. Under `PREEMPT_FULL` the tick matters less for preemption but still governs timer resolution for `nanosleep`-style frame pacing and load balancing responsiveness.
 - **`PREEMPT_FULL`** (`CONFIG_PREEMPT=y`, or `preempt=full` with `PREEMPT_DYNAMIC`) makes almost all kernel code preemptible. When the compositor or the game's render thread wakes, it can displace a kernel-mode task *immediately* rather than at the next voluntary preemption point.
 - **Cost:** more context switches, more IPIs, more cache pollution — the 3–8% throughput loss from §4.1, plus higher idle power.
 
@@ -530,16 +819,25 @@ Without NTSync, Wine emulates these in the `wineserver` process. Every wait, sig
 
 `CONFIG_NTSYNC=m` provides these objects as kernel objects behind `/dev/ntsync`. A wait becomes a single `ioctl` that sleeps in the kernel and is woken directly by the signaller. Measured results on synchronisation-heavy titles: **substantially improved 1% lows** and, in the worst pre-existing cases, large average FPS gains; on titles that were never wineserver-bound, near zero. It is not a universal speed-up — it removes a specific bottleneck.
 
-> [!warning] NTSync Needs A udev Rule That Dusky Does Not Write
-> The engine compiles the driver. It does **not** create `/etc/udev/rules.d/` entries or `/etc/modules-load.d/`. Without a rule, `/dev/ntsync` is root-only and Wine silently falls back to wineserver. See §12.3 for the exact file. Verify with `ls -l /dev/ntsync` and `WINEDEBUG=+ntsync wine ...`.
+> [!warning] NTSync Needs A udev Rule That Dusky Does Not Write (F-31)
+> The engine compiles the driver (`CONFIG_NTSYNC=m`). It does **not** create `/etc/udev/rules.d/` entries or `/etc/modules-load.d/`. Without a rule, `/dev/ntsync` is root-only and Wine silently falls back to wineserver. In your **runtime** companion layer:
+> ```
+> # /etc/udev/rules.d/70-ntsync.rules
+> KERNEL=="ntsync", MODE="0660", TAG+="uaccess"
+> ```
+> ```
+> # /etc/modules-load.d/ntsync.conf
+> ntsync
+> ```
+> Verify with `ls -l /dev/ntsync` and `WINEDEBUG=+ntsync wine ...` (or check Proton logs for `ntsync: up and running`). See §12.3.
 
-#### Split-lock detection
+#### Split-lock mitigation — the 10–20 ms stutter
 
-A *split lock* is an atomic operation (`LOCK` prefix) on a value that straddles a cache-line boundary. The CPU cannot use normal cache-coherency for it, so it asserts a **bus lock**, stalling *every core* for the duration. It is a genuine, measurable global stall.
+A **split lock** is an atomic operation whose operand straddles a cache line. The CPU cannot use normal cache-coherency locking, so it asserts a **bus lock**, stalling *every core* for the duration. One misaligned atomic in a game or emulator can cost hundreds of microseconds of whole-system stall.
 
-x86 CPUs since Tremont/Ice Lake can trap it (`#AC`). Kernel policy is `split_lock_detect={off|warn|fatal|ratelimit:N}`, default **`warn`**: log once per task and continue. Emulators (RPCS3, Dolphin, Cemu, yuzu-lineage) and a few anti-cheat drivers generate split locks in bulk; each trap costs an exception entry plus (rate-limited) printk, and in `ratelimit` mode the offending thread is deliberately slept.
+The kernel's mitigation (`split_lock_detect=warn`, the default on capable Intel parts; AMD Zen 3+ exposes an analogous bus-lock trap) traps `#AC`, logs, and **rate-limits the offending task by forcibly sleeping it**. That rate-limiting is what turns a microsecond hardware hiccup into a **10–20 ms frame drop**. Windows-targeted binaries and emulators (notably some anti-cheat modules and JIT'd code) do this routinely.
 
-`gaming.split_lock_mitigate = false` makes Dusky pass `split_lock_detect=off`. **Honest magnitude:** for a program producing a storm of split locks this removes clearly visible hitching; the commonly quoted "10–20 ms stutter" is the worst case seen in `ratelimit` mode, not a universal figure. For software that never splits a lock, this option changes nothing.
+`gaming.split_lock_mitigate = false` emits `split_lock_detect=off`: the hardware still pays the bus-lock cost, but the kernel stops adding punitive sleeps. On a single-user gaming box this is nearly free. On a shared/multi-tenant machine it is a denial-of-service vector — one tenant can stall all cores.
 
 #### `uclamp` — and when it does nothing
 
@@ -562,6 +860,27 @@ x86 CPUs since Tremont/Ice Lake can trap it (`#AC`). Kernel policy is `split_loc
 > [!tip] Gaming Archetype Summary
 > `hz=1000` + `preempt=full` + `type=bore` + `scx=scx_bpfland` + `ntsync=true` (+ udev rule) + `split_lock_mitigate=false` + `rt_group=false` + `thp=always/defer+madvise` + `sched_cache=true` + `mitigations=off` (accepting the risk) + `governor=performance`.
 > Expect: meaningfully tighter 1% lows and fewer traversal hitches. Expect *not*: a large average-FPS increase on a GPU-bound title.
+
+#### Trade-offs & Verification (Archetype D)
+
+| You gain | You pay |
+| :--- | :--- |
+| 1 ms bounded scheduling latency; far better 1%/0.1% lows | 0.3–2% multi-core throughput; higher idle power (worse for laptops) |
+| NTSync removes IPC from the frame path | Needs Wine/Proton with ntsync enabled + a udev rule |
+| No split-lock punishment stalls | Misbehaving code can bus-lock all cores (DoS on shared systems) |
+| `mitigations=off` recovers 3–15% syscall throughput | **Genuine security exposure**; unacceptable on shared/hosting machines |
+| BORE/`scx_bpfland` prioritise your game over shader compiles | Background compile/encode jobs finish measurably slower |
+| `PREEMPT_FULL` | More context switches; slightly worse batch cache locality |
+
+```bash
+# Verify Archetype D runtime status
+cat /sys/kernel/debug/sched/preempt         # (full) expected
+grep CONFIG_HZ= /proc/config.gz | tail -1
+ls -l /dev/ntsync
+cat /sys/kernel/cpu_split_lock_detect 2>/dev/null; dmesg | grep -i "split lock"
+cat /proc/cmdline
+sudo cyclictest -m -p 80 -i 250 -h 400 -q -D 60   # tail latency histogram
+```
 
 ---
 
@@ -780,6 +1099,15 @@ Additionally: `cpu.governor` sets only the Kconfig **default** governor; `storag
 | `prefcore` | `bool` | `true` | `true`/`false` | **K/C** | `CONFIG_SCHED_MC_PRIO` (ITMT). Ranks physical cores by silicon quality/max boost and biases single-threaded work to the best ones. Feeds AMD `amd_prefcore` and Intel Turbo Boost Max 3.0. `false` passes `amd_prefcore=disable`. |
 | `compat32` | `bool` | `true` | `true`/`false` | **K** | `CONFIG_IA32_EMULATION`. **Required for Steam, Proton, 32-bit Wine and older native games.** Removing it saves ~0.5–1.5 MB and a historically CVE-rich syscall entry path. |
 
+#### The amd_pstate mode table (fixes F-02)
+
+| Mode | Driver | Who chooses frequency | Governors the policy exposes | Use when |
+| :--- | :--- | :--- | :--- | :--- |
+| `active` | `amd-pstate-epp` | **Hardware** (CPPC autonomous), guided by the EPP hint | **`performance`, `powersave` only** | Laptops and most desktops. Set behaviour via **EPP**, not governor. `uclamp` and `schedutil` are inert here (F-16). |
+| `guided` | `amd-pstate` | Kernel sets min/max perf; hardware picks within | Full generic set incl. `schedutil` | You want `schedutil`/uclamp responsiveness *and* hardware fine-grain. Good middle ground. |
+| `passive` | `amd-pstate` | **Kernel** governor entirely | Full generic set incl. `schedutil` | Maximum kernel control; best for uclamp-driven gaming setups. |
+| `disable` | `acpi-cpufreq` | Legacy ACPI P-states | Full generic set | Fallback for broken firmware/CPPC. |
+
 > [!danger] `amd_pstate = "active"` Removes `schedutil`
 > In `active` mode the `amd-pstate-epp` driver exposes exactly two pseudo-governors: **`performance`** and **`powersave`**. They are not the classic governors — they are EPP presets handed to the CPU's internal controller. `schedutil`, `ondemand` and `conservative` **do not exist** on that driver. The same is true of `intel_pstate` in HWP active mode.
 > Consequences:
@@ -797,6 +1125,16 @@ Additionally: `cpu.governor` sets only the Kconfig **default** governor; `storag
 >
 > Games are rarely syscall-bound, so the frame-rate effect is usually small; the *stutter* effect (fewer expensive kernel entries during asset streaming) is more noticeable. Never enable on a machine that runs untrusted code, browsers with untrusted tabs in a shared VM, or multi-user workloads. Requires `security.acknowledge_risk = true`.
 
+#### Mitigations, precisely
+
+`mitigations=off` disables the runtime mitigations for Meltdown/PTI, Spectre v1/v2, MDS, TAA, SRBDS, RFDS, GDS, SRSO, retbleed and friends — *but not* SMT-related ones you did not ask for (`mitigations=auto,nosmt` does that). Costs recovered are workload-shaped: syscall-heavy and context-switch-heavy code (games, compilers, databases) gains the most; pure userspace compute gains ~0.
+
+Modern trees expose **per-vulnerability** symbols (`MITIGATION_RETPOLINE`, `MITIGATION_IBPB_ENTRY`, `MITIGATION_PAGE_TABLE_ISOLATION`, `MITIGATION_SRSO`, `MITIGATION_RFDS`, `MITIGATION_SPECTRE_BHI`, …). The engineering-grade approach on a trusted machine is **not** the blanket switch, but disabling only what your silicon does not need — e.g. PTI is a Meltdown mitigation and is irrelevant on AMD, while SRSO is AMD-specific and irrelevant on Intel. Use `dusky.extra_config` for that surgical control, and read `/sys/devices/system/cpu/vulnerabilities/*` before and after:
+
+```bash
+grep -r . /sys/devices/system/cpu/vulnerabilities/ | sed 's/:/ -> /'
+```
+
 ---
 
 ### 7.7. `[timing]` — Tick Cadence, Preemption & Tickless
@@ -807,6 +1145,17 @@ Additionally: `cpu.governor` sets only the Kconfig **default** governor; `storag
 | `tickless` | `str` | `"idle"` | `periodic`, `idle`, `full` | **K** | `periodic` = `CONFIG_HZ_PERIODIC` (tick always). `idle` = `CONFIG_NO_HZ_IDLE` (stop the tick on idle CPUs) — **the correct choice for ~every machine**. `full` = `CONFIG_NO_HZ_FULL` (stop the tick on *busy* CPUs running a single task). |
 | `preempt` | `str` | `"lazy"` | `lazy`, `full`, `rt` | **K/C** | `lazy` = `CONFIG_PREEMPT_LAZY`; `full` = `CONFIG_PREEMPT`; `rt` = `CONFIG_PREEMPT_RT`. |
 | `preempt_dynamic` | `bool` | `true` | `true`/`false` | **K/C** | `CONFIG_PREEMPT_DYNAMIC`: compiles all models behind static calls so `preempt=none|voluntary|full|lazy` works at boot and `/sys/kernel/debug/sched/preempt` at runtime. **`depends on !PREEMPT_RT`.** |
+
+#### Choosing HZ
+
+| HZ | Max lazy-preempt delay | Timer IRQs/s per busy CPU | Best for |
+| :---: | :---: | :---: | :--- |
+| 100 | 10 ms | 100 | Nothing on a desktop. Servers/VMs only. |
+| 250 | 4 ms | 250 | Build boxes, render nodes, throughput servers. |
+| 300 | 3.3 ms | 300 | Laptops; divides cleanly into 60/120 Hz frame cadences. |
+| 500 | 2 ms | 500 | Balanced desktop; good compromise on 8–16 core parts. |
+| 600 / 750 | 1.7 / 1.3 ms | 600 / 750 | High-refresh desktops that still compile. |
+| 1000 | 1 ms | 1000 | Competitive gaming, pro audio, anything input-latency bound. |
 
 > [!info] PREEMPT_LAZY, Precisely
 > Two thread-info flags instead of one:
@@ -1229,6 +1578,95 @@ flowchart TD
         C3 --- A3
     end
 ```
+
+### 8.9. Master Invariant Register (I-01 through I-30)
+
+| ID | Condition | Action | Reason |
+| :--- | :--- | :--- | :--- |
+| **I-01** | `toolchain = "gcc"` with any of `lto != "none"`, `kcfi`, `fdo != "none"`, `polly` | Normalise all four off | ThinLTO/Full LTO, kCFI, AutoFDO/Propeller and Polly are LLVM features. |
+| **I-02** | `lto != "thin"` and `thinlto_cache = true` | `thinlto_cache = false` | The cache only exists for ThinLTO's per-module objects. |
+| **I-03** | `preempt = "rt"` and `preempt_dynamic = true` | `preempt_dynamic = false` | `PREEMPT_DYNAMIC depends on … && !PREEMPT_RT`; RT changes lock *semantics* at compile time (§0.2.1). |
+| **I-04** | `type = "bmq"` and (`scx != "none"` or `scx_enable_class`) | `scx = "none"`, `scx_enable_class = false`, and `verify.require_sched_ext` is ignored | Project C replaces the fair class; sched_ext's hooks and fallback path live there (§0.2.2). |
+| **I-05** | `scx != "none"` and `scx_enable_class = false` | `scx_enable_class = true` | A daemon cannot attach without the in-kernel class. |
+| **I-06** | `swap_backend != "zram"` and `zram_multi_comp = true` | `zram_multi_comp = false` | Multi-comp is a ZRAM device feature. |
+| **I-07** | `thp = "never"` and `thp_defrag != "never"` | `thp_defrag = "never"` | Defragmenting for hugepages nobody allocates is pure overhead. |
+| **I-08** | `numa = false` and `numa_balancing = true` | `numa_balancing = false` | No nodes to balance between. |
+| **I-09** | `ksm = false` and `ksm_run = true` | `ksm_run = false` | No `ksmd` to start. |
+| **I-10** | `slub_tiny = true` and `slab_buckets = true` | `slab_buckets = false` | Upstream: `SLAB_BUCKETS depends on !SLUB_TINY` (§0.2.4). |
+| **I-11** | `trim_unused_ksyms = true` and `headers != "never"` | `trim_unused_ksyms = false` | Trimming exports permanently breaks DKMS and all future out-of-tree modules (§0.2.6). |
+| **I-12** | `footprint = "embedded"` | `compat32 = false`, `hibernation = false` | The embedded tier's whole purpose is removing the compat path and the hibernation image machinery. |
+| **I-13** | `mitigations = "off"` and `security.profile = "hardened"` | `mitigations = "on"` | Direct contradiction; hardening wins. |
+| **I-14** | BTF required (`scx_enable_class` / `require_btf`) **and** `lto != "none"` **and** `rust = true` | `rust = false` + loud warning | Upstream `RUST depends on !DEBUG_INFO_BTF \|\| (PAHOLE_HAS_LANG_EXCLUDE && !LTO)` (§0.2.3). |
+| **I-15** | `tickless = "full"` and no `nohz_full=` in the resolved cmdline | Auto-append `nohz_full=<non-housekeeping cpulist> rcu_nocbs=<same>`; warn | Otherwise you pay full context-tracking overhead for zero benefit. |
+| **I-16** | `portable_package = true` and `arch = "native"` | **Fatal** | A native binary faults with `#UD` on different silicon. |
+| **I-17** | `amd_pstate = "active"` and `governor` ∉ {`performance`,`powersave`} | Coerce `governor` from the `epp` intent (`performance`/`balance_performance` → `performance`, else `powersave`); warn | `amd-pstate-epp` exposes only those two (F-02). Choose `guided`/`passive` if you want `schedutil`. |
+| **I-18** | `hibernation = true` and `swap_backend = "zram"` and no disk swap declared | Warn loudly, keep `HIBERNATION=y` | Hibernation needs a persistent, block-addressable resume device; ZRAM vanishes at power-off (F-06). Add a swapfile/partition and `resume=`, or set `hibernation = false`. |
+| **I-19** | `kcfi = true` and NVIDIA proprietary DKMS detected on the host | Warn | The vendor blob has no kCFI preambles; indirect calls into it can trip CFI panics (F-12). |
+| **I-20** | `kcfi = true` and `rust = true` and rustc lacks icall-normalisation / is < 1.81 with FineIBT | `rust = false`; warn | Upstream `RUST depends on !CFI_CLANG \|\| HAVE_CFI_ICALL_NORMALIZE_INTEGERS_RUSTC` and `!CALL_PADDING \|\| RUSTC_VERSION >= 108100`. |
+| **I-21** | `modversions = true` and (`rust = true` or `lto != "none"`) and `debug_info = "none"` | `modversions = false`; warn | Both need `GENDWARFKSYMS`, which needs `DEBUG_INFO` (F-27). |
+| **I-22** | `lockdown_early = true` and `sig_force = false` and DKMS present | Warn | Lockdown integrity refuses unsigned modules; DKMS output would fail to load (F-28). |
+| **I-23** | `rcu_lazy = true` and detected RAM ≤ 4 GB | Warn | Lazy callbacks retain freed memory for up to ~10 s. |
+| **I-24** | `mitigations = "off"` and `acknowledge_risk = false` | **Fatal** | Explicit informed consent required. |
+| **I-25** | `security.profile = "extreme"` and `acknowledge_risk = false` | **Fatal** | Same. |
+| **I-26** | `qdisc = "cake"` | Compile `NET_SCH_CAKE=y`, set Kconfig default `fq_codel`, record cake for runtime | No `DEFAULT_CAKE` symbol exists upstream. |
+| **I-27** | `modules.mode = "strict"` and `modprobed_db = false` and `allow_lsmod_fallback = false` | **Fatal** | Strict pruning with no module inventory would delete essentially every driver. |
+| **I-28** | `debug_info = "reduced"` and BTF required | Promote to `"full"`; warn | `DEBUG_INFO_BTF depends on !DEBUG_INFO_REDUCED` (F-01). |
+| **I-29** | `uclamp = true` and `amd_pstate = "active"` (or Intel HWP active) | Warn | uclamp cannot influence a hardware-chosen P-state (F-16). |
+| **I-30** | `energy_model = true` on symmetric x86 | Warn | EAS requires asymmetric capacity (F-17). |
+
+### 8.10. Compatibility Matrix (Quick Visual)
+
+```mermaid
+flowchart LR
+    RUST["rust = true"]
+    LTO["lto = thin/full"]
+    BTF["BTF / sched_ext"]
+    GCC["toolchain = gcc"]
+    KCFI["kcfi = true"]
+    BMQ["scheduler = bmq"]
+    SCX["scx_* daemon"]
+    RT["preempt = rt"]
+    DYN["preempt_dynamic"]
+    TINY["slub_tiny"]
+    BUCK["slab_buckets"]
+    TRIM["trim_unused_ksyms"]
+    HDR["headers != never (DKMS)"]
+    ZRAM["swap_backend = zram"]
+    HIB["hibernation"]
+
+    RUST ---|"❌ all three together"| LTO
+    LTO --- BTF
+    GCC ---|"❌"| LTO
+    GCC ---|"❌"| KCFI
+    BMQ ---|"❌"| SCX
+    RT ---|"❌"| DYN
+    TINY ---|"❌"| BUCK
+    TRIM ---|"❌"| HDR
+    ZRAM ---|"⚠️ needs real swap"| HIB
+    KCFI -.->|"⚠️ NVIDIA blob"| RUST
+
+    classDef bad fill:#450a0a,stroke:#f87171,color:#fff;
+    classDef warn fill:#422006,stroke:#fbbf24,color:#fff;
+    class RUST,LTO,BTF,GCC,KCFI,BMQ,SCX,RT,DYN,TINY,BUCK,TRIM,HDR bad;
+    class ZRAM,HIB warn;
+```
+
+### 8.11. The Silent Failure Mode Nobody Warns You About
+
+`make olddefconfig` is authoritative. If you request `CONFIG_X=y` and `X`'s `depends on` is unmet, Kconfig **does not error** — it writes `# CONFIG_X is not set` and moves on. Your build succeeds, boots, and quietly lacks the feature.
+
+Three habits prevent this permanently:
+
+```bash
+./dusky_kernal_compile.py -p myprofile --print-matrix      # what SHOULD change
+./dusky_kernal_compile.py -p myprofile --configure-only    # apply + verify, no compile
+# then, on the running kernel:
+zgrep -E "SCHED_CLASS_EXT|DEBUG_INFO_BTF|LRU_GEN|NTSYNC|PREEMPT_LAZY" /proc/config.gz
+```
+
+And keep `verify.strict = true`. That single boolean converts "silently missing feature" into "exit code 4 in 90 seconds".
+
+---
 
 ---
 
@@ -2946,8 +3384,10 @@ w /sys/module/pcie_aspm/parameters/policy         - - - - powersupersave
 | Boots but no network / no keyboard on USB3 | Strict pruning removed the driver. | Re-run `modprobed-db store` with everything attached, or add the symbols to `keep_symbols`. |
 | Freezes on resume from suspend | `pcie_aspm = "powersupersave"` with an intolerant NVMe/NIC. | Set `pcie_aspm = "default"`. |
 | Hangs at "Loading initial ramdisk" after enabling lockdown | Lockdown + unsigned modules, or lockdown + hibernation resume. | `lockdown_early = false`. |
+| `Unknown symbol in module` on load | `trim_unused_ksyms = true` (§0.2.6) deleted symbols needed by out-of-tree modules. | Set `trim_unused_ksyms = false` and rebuild. There is no runtime fix. |
+| Hangs at "Loading initial ramdisk" | Initramfs not regenerated (missing `/usr/lib/modules/<release>/pkgbase` trigger). | Boot fallback; `sudo mkinitcpio -p linux-dusky-<suffix>`. |
 
-**Always recoverable:** hold `Space`/`Shift` at boot, pick `linux` or `linux-lts`, then `./dusky_kernal_compile.py --uninstall <flavor>`.
+**Always recoverable:** hold `Space`/`Shift` at boot, pick `linux` or `linux-lts`, then `./dusky_kernal_compile.py --uninstall <flavor>` (or `sudo pacman -R linux-dusky-<flavor> linux-dusky-<flavor>-headers`).
 
 ### 13.2. It Boots But The Feature Is Missing
 
@@ -2962,6 +3402,19 @@ w /sys/module/pcie_aspm/parameters/policy         - - - - powersupersave
 | Governor list truncated? | `cat .../scaling_available_governors` | `performance powersave` under active mode — this is correct, not a bug |
 | Split lock off? | `cat /proc/cmdline \| grep split_lock` | `split_lock_detect=off` |
 | RCU offloaded? | `cat /sys/kernel/debug/rcu/rcu_preempt/rcugp` or `dmesg \| grep -i nocb` | offloaded CPU list |
+
+> [!tip] Three-Step Feature Absence Triage
+> When a feature is missing despite being enabled in your TOML:
+> ```bash
+> # 1. Is the symbol actually set in the running kernel?
+> zgrep CONFIG_SCHED_CLASS_EXT /proc/config.gz
+> 
+> # 2. If not, WHY did olddefconfig drop it? Check the upstream Kconfig dependencies:
+> grep -rn "config SCHED_CLASS_EXT" -A15 kernel/sched/Kconfig
+> 
+> # 3. Did the invariant engine force-normalise it?
+> ./dusky_kernal_compile.py -p myprofile --show | grep -iE "warn|forced|normalis"
+> ```
 
 ### 13.3. Exit `4` — Verify Error
 
@@ -3002,12 +3455,53 @@ sudo powertop --auto-tune && sudo turbostat --Summary --interval 5
 
 Reality check: a well-tuned kernel changes **tails**, not averages. If your workload is GPU-bound, memory-bandwidth-bound, or network-bound, no scheduler on earth will help — and this manual will not pretend otherwise.
 
+### 13.6. Known Hardware Landmines
+
+| Setting | Symptom | Mitigation |
+| :--- | :--- | :--- |
+| `pcie_aspm = "powersupersave"` | NVMe I/O errors, link retraining, freezes on some SSDs | Drop to `powersave` or `default`; test with `nvme error-log`. |
+| `hda_power_save > 0` | Audible pop on first sound; first ~100 ms clipped | Set `0` for audio work. |
+| `nvme_poll_queues > 0` on a desktop | A core pinned at 100% during I/O | Set `0`; polling is for high-QD server workloads. |
+| `smt = false` | ~20–30% aggregate throughput loss | Only for hardened/isolated systems. |
+| `mitigations = "off"` on a VM host | Cross-VM leakage exposure | Never do this on a hypervisor. |
+| `split_lock_detect=off` on shared boxes | One tenant stalls all cores | Keep `split_lock_mitigate = true` on shared systems. |
+| `localyesconfig = true` | Huge resident kernel; DKMS still needs `MODULES=y` | Use only for appliances. |
+
+### 13.7. Measurement Cookbook (Prove It, Do Not Assume It)
+
+```bash
+# Latency tail (the number that actually matters for "feel")
+sudo cyclictest -m -p 80 -i 250 -h 400 -q -D 300
+
+# Scheduler behaviour
+perf sched latency --sort max | head -25
+perf stat -e context-switches,cpu-migrations,cache-misses -a sleep 30
+
+# Memory pressure and reclaim health
+cat /proc/pressure/{cpu,memory,io}         # PSI: the single best "is it thrashing?" signal
+vmstat 1 20; cat /sys/kernel/mm/lru_gen/enabled
+
+# ZRAM effectiveness
+zramctl; cat /sys/block/zram0/mm_stat      # orig_data_size compr_data_size mem_used_total ...
+
+# Power (laptops)
+sudo turbostat --quiet --show PkgWatt,Pk%pc8,Pk%pc10,Busy%,IRQ --interval 10
+sudo powertop --auto-tune --quiet
+
+# Frametimes (gaming)
+MANGOHUD=1 mangohud --dlsym %command%      # watch 1% and 0.1% lows, not average FPS
+```
+
+> [!tip] Change one axis at a time
+> The scientific method is the only thing that works here. Baseline → change one setting → measure the same workload → keep or revert. Profiles that were assembled by stacking "optimisations" without measurement are how people end up with a 1000 Hz kernel that stutters.
+
 ---
 
 ## Appendix A — Audit Errata
 
 > [!abstract] What This Appendix Is
-> A complete, itemised record of every factual error, false default, invalid dependency, overstated magnitude and internal contradiction found in the **v6.0.0** edition of this manual, together with the correction applied in **v6.1.0**. Each entry states the upstream mechanism that decides the matter.
+> A consolidated record of factual errors, false defaults, invalid dependencies, overstated magnitudes and internal contradictions found in the **v6.0.0** edition, together with the corrections applied in **v6.1.0**.
+> For the complete **40-item Findings Register (F-01 through F-40)** and the **6 Mandated Deep Dives**, see [[#0. Audit Report v6.0.0 → v6.1.0|Section 0: Upfront Audit Report]].
 
 ### A.1. Hard Kconfig Errors (would have failed the build or silently dropped features)
 
@@ -3234,3 +3728,64 @@ Reality check: a well-tuned kernel changes **tails**, not averages. If your work
 > [!success] End of Manual
 > **Dusky Kernel Compiler Manual v6.1.0** — audited, corrected and expanded against upstream Linux 7.2+/7.3-rc semantics.
 > Ground truth is always `zcat /proc/config.gz`. Keep a fallback kernel. Change one thing at a time. Measure tails, not averages.
+
+---
+
+## Appendix D — Version-Drift Verification Protocol
+
+Bleeding-edge means symbols move. Before trusting any young feature, verify it **in the tree you are about to build**.
+
+```bash
+cd <build-root>/src/linux-7.2.x
+
+# 1. Does the symbol exist at all, and what does it depend on?
+grep -rn "config SCHED_CACHE"           -A12 kernel/sched/Kconfig*
+grep -rn "config RSEQ_SLICE_EXTENSION"  -A12 init/Kconfig kernel/Kconfig*
+grep -rn "config ZRAM_BACKEND"          -A6  drivers/block/zram/Kconfig
+grep -rn "config DEBUG_INFO_BTF"        -A10 lib/Kconfig.debug
+grep -rn "config RUST"                  -A16 init/Kconfig
+
+# 2. What is the current value in this .config?
+./scripts/config -s CONFIG_SCHED_CLASS_EXT
+./scripts/config -s CONFIG_LRU_GEN_ENABLED
+
+# 3. Interactive search (type `/`, then the symbol) shows the full dependency chain
+make menuconfig
+
+# 4. Which HZ values does this tree accept?
+grep -n "config HZ_" -A4 kernel/Kconfig.hz
+
+# 5. Which microarchitecture symbols exist?
+grep -rn "config X86_NATIVE_CPU\|config MZEN\|X86_64_VERSION" -A4 arch/x86/Kconfig*
+```
+
+**Runtime side:**
+
+```bash
+ls /sys/kernel/debug/sched/                     # preempt, llc_*, base_slice_ns, ...
+ls /sys/kernel/mm/lru_gen/ /sys/kernel/mm/transparent_hugepage/
+ls /sys/block/zram0/                            # recompress, recomp_algorithm, ...
+cat /sys/devices/system/cpu/cpufreq/policy0/scaling_driver
+```
+
+**Policy for young symbols:** put them in `verify.optional_symbols` so a rename produces a warning instead of exit code `4`:
+
+```toml
+[verify]
+strict = true
+optional_symbols = [
+  "SCHED_CACHE",
+  "RSEQ_SLICE_EXTENSION",
+  "ZRAM_TRACK_ENTRY_ACTIME",
+  "PROPELLER_CLANG",
+  "X86_NATIVE_CPU",
+]
+```
+
+---
+
+> [!success] You are done
+> You now have: the corrected architectural model (§0, §3), the physics of each trade-off (§4, §5), an exhaustive parameter reference with real Kconfig symbols (§7), deterministic conflict resolution (§8), nine audited production profiles (§10), and a verification discipline that makes silent failures impossible (§8.11, §13, Appendix B).
+> Build from the nearest archetype, change **one axis at a time**, measure with the §13.4 cookbook, and keep the stock Arch kernel installed as your parachute.
+
+*Dusky Kernel Compiler Manual — v6.1.0 (post-audit revision). Target: Arch Linux, Linux 7.2+ / 7.3-rc, Clang/LLVM 21+, LLD, Rust-for-Linux, Python 3.14.7+.*
