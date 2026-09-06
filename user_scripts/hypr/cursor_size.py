@@ -4,7 +4,13 @@
 Increases / decreases the compositor cursor size and keeps every layer
 in sync (compositor, GTK/gsettings, session env, persisted Lua config):
 
-  1. ``hyprctl setcursor <theme> <size>``  (live Wayland / XWayland cursor)
+  1. ``hyprctl setcursor <theme> <size>``  (live Wayland / XWayland cursor).
+     Sizes snap to the theme's real bitmaps (parsed from the XCursor TOC),
+     so every step lands on a renderable size; vector themes step freely.
+     Note (compositor behavior, upstream wontfix): the staged size renders
+     once the cursor *image* changes (arrow -> beam -> hand, ...). Bare
+     motion does not refresh it; over real content it lands within a hover
+     or two, and the OSD below confirms each press instantly.
   2. ``gsettings`` ``org.gnome.desktop.interface cursor-size`` + ``cursor-theme``
      (GTK apps; ``dconf`` fallback when schemas are missing, e.g. NixOS)
   3. ``dbus-update-activation-environment --systemd`` (newly launched apps)
@@ -52,6 +58,7 @@ import fcntl
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -283,6 +290,11 @@ def detect_theme(explicit: str | None) -> str:
 # Dynamic detection — size
 # ---------------------------------------------------------------------------
 
+_SIZE_CALL_PAT = re.compile(
+    r"""(?:hl\.env|hl_env)\s*\(\s*["'](?:HYPRCURSOR_SIZE|XCURSOR_SIZE)["']\s*,\s*["']?(\d+)["']?\s*\)"""
+)
+
+
 def _size_from_gsettings() -> int | None:
     if not have("gsettings"):
         return None
@@ -316,15 +328,12 @@ def _size_from_state() -> int | None:
 
 
 def _size_from_lua_configs() -> int | None:
-    pat = re.compile(
-        r"""(?:hl\.env|hl_env)\s*\(\s*["'](?:HYPRCURSOR_SIZE|XCURSOR_SIZE)["']\s*,\s*["']?(\d+)["']?\s*\)"""
-    )
     for path in (USER_ENV_LUA, BASE_ENV_LUA):
         try:
             text = path.read_text(encoding="utf-8")
         except OSError:
             continue
-        m = pat.search(_strip_lua_comments(text))
+        m = _SIZE_CALL_PAT.search(_strip_lua_comments(text))
         if m:
             log_debug(f"size {m.group(1)} from {path}")
             return int(m.group(1))
@@ -356,17 +365,78 @@ def get_default_size() -> int:
     every run), so reading it back as a "default" would be circular and make
     --reset a no-op. The base file is the real configured default.
     """
-    pat = re.compile(
-        r"""(?:hl\.env|hl_env)\s*\(\s*["'](?:HYPRCURSOR_SIZE|XCURSOR_SIZE)["']\s*,\s*["']?(\d+)["']?\s*\)"""
-    )
     try:
         text = BASE_ENV_LUA.read_text(encoding="utf-8")
     except OSError:
         return DEFAULT_FALLBACK_SIZE
-    m = pat.search(_strip_lua_comments(text))
+    m = _SIZE_CALL_PAT.search(_strip_lua_comments(text))
     if m:
         return int(m.group(1))
     return DEFAULT_FALLBACK_SIZE
+
+
+def theme_icon_dir(theme: str) -> Path | None:
+    """Locate an installed cursor theme dir (user dirs first)."""
+    home = _home()
+    for base in (home / ".local" / "share" / "icons",
+                 home / ".icons",
+                 Path("/usr/local/share/icons"),
+                 Path("/usr/share/icons")):
+        cand = base / theme
+        try:
+            if cand.is_dir():
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+def theme_native_sizes(theme: str) -> list[int]:
+    """Discrete bitmap sizes shipped by an XCursor theme (parsed from the
+    left_ptr TOC — dynamic per theme, nothing hardcoded).
+
+    Returns [] for vector (hyprcursor) themes or when undetectable, meaning
+    free stepping is fine.
+    """
+    d = theme_icon_dir(theme)
+    if d is None:
+        return []
+    if (d / "manifest.hl").is_file() or (d / "hyprcursors").is_dir():
+        return []  # vector theme: arbitrary sizes render crisply
+    try:
+        raw = (d / "cursors" / "left_ptr").read_bytes()
+    except OSError:
+        return []
+    try:
+        magic, _blen, _ver, ntoc = struct.unpack("<IIII", raw[:16])
+        if magic != 0x72756358 or ntoc > 256:  # "Xcur" LE
+            return []
+        sizes = set()
+        for i in range(ntoc):
+            typ, subtype, _pos = struct.unpack("<III", raw[16 + i * 12:28 + i * 12])
+            if typ == 0xFFFD0002:  # image TOC entry; subtype = nominal size
+                sizes.add(subtype)
+        return sorted(s for s in sizes if 0 < s < 1000)
+    except (struct.error, IndexError):
+        return []
+
+
+def snap_to_native(target: int, direction: int, native: list[int]) -> int:
+    """Snap a computed size onto the theme's real bitmap sizes.
+
+    Direction-aware so every keypress lands somewhere new: growing rounds
+    up to the next available size, shrinking rounds down, absolute --set
+    takes the nearest. Empty list (vector/unknown theme) passes through.
+    """
+    if not native:
+        return target
+    if direction > 0:
+        bigger = [s for s in native if s >= target]
+        return min(bigger) if bigger else native[-1]
+    if direction < 0:
+        smaller = [s for s in native if s <= target]
+        return max(smaller) if smaller else native[0]
+    return min(native, key=lambda s: (abs(s - target), s))
 
 
 # ---------------------------------------------------------------------------
@@ -454,15 +524,19 @@ def persist_lua_env(theme: str, size: int) -> bool:
               "XCURSOR_THEME": theme, "HYPRCURSOR_THEME": theme}
     # Replace only in live code: split each line into code/comment so the
     # commented template examples in the stock file are never touched.
+    # Patterns hoisted: same four regexes for every line.
+    pats = {
+        key: re.compile(
+            r"""(?:hl\.env|hl_env)\s*\(\s*["']""" + re.escape(key) + r"""["']\s*,\s*["']?[^"'\n\)]*["']?\s*\)"""
+        )
+        for key in ENV_KEYS
+    }
     lines = original.splitlines()
     total_replaced = 0
     for idx, line in enumerate(lines):
         code, comment = _split_code_comment(line)
         for key in ENV_KEYS:
-            pat = re.compile(
-                r"""(?:hl\.env|hl_env)\s*\(\s*["']""" + re.escape(key) + r"""["']\s*,\s*["']?[^"'\n\)]*["']?\s*\)"""
-            )
-            code, n = pat.subn(f'hl.env("{key}", "{values[key]}")', code)
+            code, n = pats[key].subn(f'hl.env("{key}", "{values[key]}")', code)
             total_replaced += n
         lines[idx] = code + comment
     text = "\n".join(lines)
@@ -531,7 +605,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    choices=["+", "-", "up", "down", "increase", "decrease"],
                    help="'+/up/increase grows, -/down/decrease shrinks'")
     p.add_argument("--set", type=int, metavar="N", default=None,
-                   help="jump to absolute size N")
+                   help="jump to size N (snapped to the theme's real bitmaps)")
     p.add_argument("--reset", action="store_true",
                    help="restore the configured default size")
     p.add_argument("--get", action="store_true",
@@ -572,7 +646,7 @@ def resolve_bounds(args: argparse.Namespace) -> tuple[int, int, int]:
 
 def main(argv: list[str] | None = None) -> int:
     global QUIET, DEBUG
-    args = parse_args(argv or sys.argv[1:])
+    args = parse_args(sys.argv[1:] if argv is None else argv)
     if args.quiet:
         QUIET = True
     if args.verbose:
@@ -591,22 +665,30 @@ def main(argv: list[str] | None = None) -> int:
     theme = detect_theme(args.theme or os.environ.get("CURSOR_THEME") or None)
     current = detect_current_size()
     step, lo, hi = resolve_bounds(args)
+    native = theme_native_sizes(theme)
+    if native:
+        log_debug(f"theme {theme!r} native bitmap sizes: {native}")
+
+    def snap(raw: int, sign: int) -> int:
+        return max(lo, min(hi, snap_to_native(raw, sign, native)))
 
     if args.get:
         print(current)
         return 0
 
     if args.reset:
-        target = max(lo, min(hi, get_default_size()))
+        target = snap(get_default_size(), 0)
         reason = "reset"
     elif args.set is not None:
-        target = max(lo, min(hi, args.set))
+        target = snap(args.set, 0)
         reason = "set"
     else:
         direction = args.direction or ""
-        delta = step if direction in ("+", "up", "increase") else -step
-        target = max(lo, min(hi, current + delta))
-        reason = "increase" if delta > 0 else "decrease"
+        if direction in ("+", "up", "increase"):
+            sign, reason = 1, "increase"
+        else:
+            sign, reason = -1, "decrease"
+        target = snap(current + step * sign, sign)
 
     if target == current:
         edge = "maximum" if target >= hi else "minimum" if target <= lo else "current"
@@ -640,8 +722,8 @@ def main(argv: list[str] | None = None) -> int:
             raced = detect_current_size()
             if raced != current and args.set is None and not args.reset:
                 direction = args.direction or ""
-                delta = step if direction in ("+", "up", "increase") else -step
-                recomputed = max(lo, min(hi, raced + delta))
+                sign = 1 if direction in ("+", "up", "increase") else -1
+                recomputed = snap(raced + step * sign, sign)
                 log_debug(f"race: {current} -> {raced}, recomputed target {recomputed}")
                 current, target = raced, recomputed
                 if target == current:
@@ -654,7 +736,7 @@ def main(argv: list[str] | None = None) -> int:
             ok_persist = True
             if not args.no_persist:
                 ok_persist = persist_lua_env(theme, target)
-            write_state(target)
+                write_state(target)
             verified = confirm_size(target)
 
             if not args.no_notify:
