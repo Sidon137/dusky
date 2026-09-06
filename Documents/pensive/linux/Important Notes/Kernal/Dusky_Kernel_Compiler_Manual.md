@@ -1,7 +1,7 @@
 # Dusky Kernel Compiler (v6.0.0) — Architecture, Configuration & Profile Engineering Manual
 
 > [!abstract] Executive Summary
-> `dusky_kernal_compile.py` is a specialized kernel compilation and optimization engine for Arch Linux targeting **Linux 7.2+ and 7.3-rc** (September 2026 specification). It eliminates generic distribution overhead by bridging **compile-time hardware tailoring** (`scripts/config`, Clang ThinLTO, `modprobed-db`) with **boot-time system provisioning** (`systemd`, `udev`, `sysctl`, `zram-generator`, `scx_loader`).
+> `dusky_kernal_compile.py` is a specialized kernel compilation and optimization engine for Arch Linux targeting **Linux 7.2+ and 7.3-rc** (September 2026 specification). It eliminates generic distribution overhead through **compile-time hardware tailoring** (`scripts/config`, Clang ThinLTO, `modprobed-db`) plus **bootloader sync** (`systemd-boot`, GRUB, rEFInd, Limine, `kernel-install`). Runtime tuning (`sysctl`/`sysfs`, `systemd` units, `udev`, `zram-generator`, `scx_loader`) is out of scope — handled by separate scripts.
 
 ---
 
@@ -32,14 +32,14 @@ flowchart TD
     D --> E["<b>5. Declarative Matrix & Invariant Check</b><br>scripts/config batch • olddefconfig • Contract Verification"]
     E --> F["<b>6. Native LLVM/Clang Build</b><br>ThinLTO/Full LTO • kCFI • make pacman-pkg"]
     F --> G["<b>7. Package Installation</b><br>pacman -U linux-dusky-* • DKMS modules"]
-    G --> H["<b>8. Runtime Provisioning & Boot Sync</b><br>sysctl • udev • zram • scx_loader • systemd-boot/GRUB"]
+    G --> H["<b>8. Bootloader Refresh</b><br>systemd-boot entries • GRUB • rEFInd • Limine • kernel-install"]
 ```
 
 ### Filesystem Layout & Storage Topology
 
 | Path Category | Default Location | Environment Override | Purpose |
 | :--- | :--- | :--- | :--- |
-| **Engine Script** | `~/user_scripts/kernel/dusky_kernal_compile.py` | — | Core compiler & provisioning engine |
+| **Engine Script** | `~/user_scripts/kernel/dusky_kernal_compile.py` | — | Core compiler (Kconfig + cmdline + bootloader only) |
 | **System Profiles** | `~/user_scripts/kernel/kernel_profiles/` | `DUSKY_PROFILES_DIR` | Shared TOML profile recipes |
 | **User Profiles** | `~/.config/dusky-kernel/kernel_profiles/` | — | User-authored custom profiles |
 | **Config Snapshots**| `~/.config/dusky-kernel/configs/` | — | Per-profile `.config` snapshots |
@@ -49,8 +49,6 @@ flowchart TD
 | **Package Output** | `~/.cache/dusky-kernel/packages/` | `DUSKY_PKGDEST` | Built `.pkg.tar.zst` packages |
 | **State & Logs** | `~/.local/state/dusky-kernel/logs/` | `XDG_STATE_HOME` | Plain-text build journals & history |
 | **Hardware DB** | `~/.config/modprobed.db` | — | Active modules database (`modprobed-db`) |
-| **Runtime Libs** | `/usr/local/lib/dusky/` | — | Dispatcher & tuning scripts (`dusky-tune.sh`) |
-| **Runtime Manifest**| `/etc/dusky/manifest-<flavor>.txt` | — | Deployed file index for clean uninstallation |
 
 ---
 
@@ -81,8 +79,8 @@ flowchart TD
 
     subgraph MEMORY["🧠 3. Memory & Storage Architecture"]
         direction TB
-        M1["<b>Virtual Memory & Reclaim</b><br>• Multi-Gen LRU (MGLRU) enabled<br>• Concurrent Per-VMA read/write locks<br>• DAMON proactive page reclaim<br>• Watermark scale factor tuning"]
-        M2["<b>Compressed Memory Swap</b><br>• ZRAM Multi-Comp: LZ4/Zstd primary<br>• Hourly idle-page recompression timer<br>• zswap write-through disk cache"]
+        M1["<b>Virtual Memory & Reclaim</b><br>• Multi-Gen LRU (MGLRU) enabled<br>• Concurrent Per-VMA read/write locks<br>• DAMON proactive page reclaim"]
+        M2["<b>Compressed Memory Swap</b><br>• ZRAM Multi-Comp Kconfig (primary + recompress)<br>• zswap write-through disk cache"]
         M3["<b>Paging & Allocator Defenses</b><br>• Transparent Hugepages (THP / mTHP)<br>• SLUB standard vs SLUB_TINY (<= 4 GB)<br>• SLAB_BUCKETS security isolation"]
         M4["<b>Block Layer & Filesystems</b><br>• NVMe IOPOLL sub-2µs completion<br>• Bypass software I/O queues on NVMe<br>• MQ-Deadline (SATA) & BFQ (Rotational)"]
     end
@@ -91,7 +89,7 @@ flowchart TD
         direction TB
         S1["<b>LLVM/Clang 21+ Toolchain</b><br>• ThinLTO with persistent disk cache<br>• Monolithic Full LTO for build boxes<br>• AutoFDO & Propeller basic-block PGO<br>• In-tree Rust-for-Linux support"]
         S2["<b>Exploit Defenses</b><br>• Clang kCFI with hardware FineIBT<br>• Hardened usercopy bounds checking<br>• Stackprotector strong & random kstack<br>• Early lockdown LSM & AppArmor"]
-        S3["<b>Low-Latency Gaming & Wine</b><br>• In-tree NTSync driver (/dev/ntsync)<br>• UCLAMP utilization clamping<br>• Split-lock mitigation penalty bypass<br>• 2B vm.max_map_count ceiling"]
+        S3["<b>Low-Latency Gaming & Wine</b><br>• In-tree NTSync driver (/dev/ntsync)<br>• UCLAMP utilization clamping<br>• Split-lock mitigation bypass"]
         S4["<b>High-Throughput Network</b><br>• TCP BBRv3 congestion pacing<br>• FQ / CAKE bufferbloat elimination<br>• Multipath TCP (MPTCP) & AF_XDP"]
     end
 
@@ -128,7 +126,7 @@ flowchart TD
 | **P-State Control**| Legacy `acpi-cpufreq` software polling loops (10 ms intervals). | **Autonomous CPPC v2 EPP** (`amd_pstate=active` / `intel_pstate`). | Hardware autonomy adjusts clock frequencies in sub-millisecond hardware loops based on autonomous EPP hints. |
 | **Compiler / LTO** | GCC monolithic LTO (high RAM usage, fragile module linking). | **LLVM/Clang 21+ ThinLTO** (`CONFIG_LTO_CLANG_THIN`) with persistent caching. | 95–99% of monolithic Full LTO codegen performance with incremental compilation and parallel multi-core linking. |
 | **Kernel CFI** | Legacy GCC plugins or disabled control flow protection. | **Clang kCFI** (`CONFIG_CFI_CLANG`) paired with hardware **FineIBT**. | Forward-edge indirect call protection via 4-byte type hashes without breaking module loading or BPF JIT compilation. |
-| **Compressed Swap**| Single-algorithm ZRAM (forced compromise between ratio and CPU overhead). | **ZRAM Multi-Compression** (`CONFIG_ZRAM_MULTI_COMP`). | High-speed primary compressor (LZ4/Zstd) paired with background idle-page recompression (Zstd level 9–11). |
+| **Compressed Swap**| Single-algorithm ZRAM (forced compromise between ratio and CPU overhead). | **ZRAM Multi-Compression** (`CONFIG_ZRAM_MULTI_COMP`). | High-speed primary compressor (LZ4/Zstd) plus Kconfig multi-stream recompression. Idle-page policy is left to external runtime scripts. |
 
 ---
 
@@ -177,7 +175,7 @@ flowchart TD
 | `--write-default-profiles` | Emits all 10 built-in reference profiles into the profile directory. |
 | `--export-bundle [FILE]` | Exports local hardware telemetry, `modprobed.db`, and PCI inventory for remote builds. |
 | `--import-bundle FILE` | Ingests a remote bundle and generates a customized `remote_<host>` profile. |
-| `--uninstall FLAVOR` | Cleanly removes `linux-<flavor>{,-headers}`, bootloader entries, and runtime files. |
+| `--uninstall FLAVOR` | Cleanly removes `linux-<flavor>{,-headers}` and bootloader entries. |
 | `--fdo-record SECONDS` | Records branch execution profiles using Linux `perf` for Clang AutoFDO. |
 | `--fdo-propeller` | Used with `--fdo-record`: generates Propeller basic-block layout profiles. |
 | `--menu` | Opens the full-screen interactive terminal configuration and management menu. |
@@ -252,6 +250,9 @@ When entering the granular configuration wizard (`--wizard` or selecting `[n]` a
 
 ## 5. Comprehensive Section & Parameter Reference
 
+> [!note] Compile vs runtime scope
+> The compiler bakes **Kconfig + `CONFIG_CMDLINE`/boot-entry params + bootloader entries** only. Profile keys that are pure `sysctl`/`sysfs`/`debugfs` runtime hints (`swappiness`, `vfs_cache_pressure`, `watermark_*`, `compaction_proactiveness`, `dirty_bytes_mb`, `max_map_count`, `tcp_fastopen`, `epp` runtime hint, `mglru_mask`/`min_ttl`, `ksm_run`, `llc_aggr_*`, `slice_ext_nsec`) are stored in TOML for separate runtime scripts and are **not applied** by this engine. `governor` sets the Kconfig default only; `io_scheduler` sets Kconfig defaults only (no `udev` rules); `ntsync` compiles the driver only (no `udev`/`modules-load`).
+
 ### 5.1. `[meta]` — Package Metadata & Portability
 
 | Key | Type | Default | Choices / Bounds | Description & Architectural Impact |
@@ -307,7 +308,6 @@ When entering the granular configuration wizard (`--wizard` or selecting `[n]` a
 | `sched_cache` | `bool`| `true` | `true`, `false` | `CONFIG_SCHED_CACHE`. Directs scheduler load balancing to respect Last-Level Cache (L3/LLC) domain boundaries. |
 | `llc_aggr_tolerance`| `int` | `1` | `0`–`100` | `0` = disabled. `1` = strict (co-locates tasks only if combined RSS fits in LLC). `>1` = relaxed aggregation. |
 | `llc_aggr_cap` | `int` | `-1` | `-1`–`100` | Runqueue depth cap on an LLC domain before spilling across CCXs. `-1` uses kernel defaults. |
-| `persist` | `bool`| `true` | `true`, `false` | Installs boot-time service (`dusky-tune.service`) to persist CAS sysfs/debugfs tunables across reboots. |
 
 ---
 
@@ -328,7 +328,7 @@ When entering the granular configuration wizard (`--wizard` or selecting `[n]` a
 | `march` | `str` | `""` | Compiler flags | Optional compiler flags appended directly to `KCFLAGS`. |
 | `governor` | `str` | `"schedutil"`| `schedutil`, `performance`, `powersave`, `ondemand`, `conservative` | Default CPU frequency scaling governor (`CONFIG_CPU_FREQ_DEFAULT_GOV_*`). |
 | `amd_pstate` | `str` | `"active"` | `active`, `guided`, `passive`, `disable`, `undefined` | AMD P-State mode (`CONFIG_X86_AMD_PSTATE_DEFAULT_MODE`). `active` enables autonomous hardware EPP. |
-| `epp` | `str` | `"balance_performance"` | `default`, `performance`, `balance_performance`, `balance_power`, `power` | Hardware Energy-Performance Preference register hint applied at boot. |
+| `epp` | `str` | `"balance_performance"` | `default`, `performance`, `balance_performance`, `balance_power`, `power` | EPP hint value stored for external runtime scripts (not applied by compiler). |
 | `mitigations` | `str` | `"on"` | `on`, `off`, `nosmt` | CPU vulnerability mitigations (`CONFIG_CPU_MITIGATIONS`). `"off"` removes runtime overheads on trusted machines. |
 | `nr_cpus` | `int` | `0` | `0`–`8192` | `CONFIG_NR_CPUS`. `0` auto-detects host thread count rounded up to nearest multiple of 8. |
 | `smt` | `bool`| `true` | `true`, `false` | Enables Simultaneous Multi-Threading / Hyper-Threading (`CONFIG_SCHED_SMT=y`). |
@@ -368,7 +368,7 @@ When entering the granular configuration wizard (`--wizard` or selecting `[n]` a
 | `zram_algo` | `str` | `"zstd"` | `zstd`, `lz4`, `lz4hc`, `lzo-rle` | Primary ZRAM compression algorithm (`CONFIG_ZRAM_DEF_COMP_*`). |
 | `zram_recomp_algo`| `str` | `"zstd"` | `zstd`, `lz4`, `lz4hc`, `lzo-rle` | Secondary recompression algorithm for idle pages (`CONFIG_ZRAM_MULTI_COMP`). |
 | `zram_size_pct` | `int` | `100` | `10`–`400` | ZRAM device capacity as a percentage of physical RAM. |
-| `zram_multi_comp`| `bool`| `true` | `true`, `false` | Enables multi-compression streams and hourly idle recompression timer (`CONFIG_ZRAM_MULTI_COMP`). |
+| `zram_multi_comp`| `bool`| `true` | `true`, `false` | Multi-algorithm Kconfig streams (`CONFIG_ZRAM_MULTI_COMP`). |
 | `zswap_compressor`| `str` | `"zstd"` | `zstd`, `lz4`, `lz4hc`, `lzo` | Compression algorithm used by zswap (if `swap_backend = "zswap"`). |
 | `zswap_max_pool_pct`| `int`| `25` | `5`–`80` | Maximum percentage of RAM zswap pool may occupy. |
 | `swappiness` | `int` | `0` | `0`–`200` | `vm.swappiness`. `0` auto-selects: `180` for zram, `100` for zswap, `60` for none. |
@@ -388,13 +388,12 @@ When entering the granular configuration wizard (`--wizard` or selecting `[n]` a
 | `page_reporting`| `bool`| `false` | `true`, `false` | Reports freed pages back to hypervisor (`CONFIG_PAGE_REPORTING`, VM guests only). |
 | `hugetlbfs` | `bool`| `true` | `true`, `false` | Traditional HugeTLB filesystem support (`CONFIG_HUGETLBFS`). |
 | `kallsyms_all` | `bool`| `true` | `true`, `false` | Embeds all symbols in kernel image (`CONFIG_KALLSYMS_ALL`). `false` saves 2–4 MB. |
-| `memcg` | `bool`| `true` | `true`, `false` | Memory cgroup controller (`CONFIG_MEMCG`). Required for `systemd-oomd`. |
+| `memcg` | `bool`| `true` | `true`, `false` | Memory cgroup controller (`CONFIG_MEMCG`). |
 | `base_small` | `bool`| `false` | `true`, `false` | `CONFIG_BASE_SMALL`. Shrinks core kernel hash tables for minimal/embedded footprints. |
 | `log_buf_shift` | `int` | `0` | `0`, `12`–`25` | Kernel log ring-buffer exponent (`CONFIG_LOG_BUF_SHIFT`). `0` auto-selects. |
 | `tracing` | `str` | `"auto"` | `auto`, `full`, `minimal` | ftrace/kprobes/uprobes surface. `auto` enables full tracing only when an SCX daemon is selected. |
 | `kexec` | `bool`| `true` | `true`, `false` | Kernel image fast reloading without BIOS reboot (`CONFIG_KEXEC`). |
 | `ikconfig` | `bool`| `true` | `true`, `false` | Embeds `.config` into `/proc/config.gz` (`CONFIG_IKCONFIG_PROC`). |
-| `systemd_oomd` | `bool`| `false` | `true`, `false` | Configures systemd PSI-based userspace out-of-memory daemon. |
 | `trim_unused_ksyms`| `bool`| `false`| `true`, `false` | Drops unreferenced symbols from kernel binary. Requires `compiler.headers = "never"`. |
 | `dead_code_elimination`| `bool`| `false`| `true`, `false` | `CONFIG_LD_DEAD_CODE_DATA_ELIMINATION` (inert on x86-64; kept for schema completeness). |
 
@@ -462,7 +461,7 @@ When entering the granular configuration wizard (`--wizard` or selecting `[n]` a
 | Key | Type | Default | Choices / Bounds | Description & Architectural Impact |
 | :--- | :---: | :---: | :---: | :--- |
 | `nvme_poll_queues`| `int` | `0` | `0`–`128` | Sets `nvme.poll_queues`. Dedicated completion queues for sub-2 µs polling via `io_uring`. |
-| `io_scheduler` | `str` | `"none"` | `none`, `mq-deadline`, `bfq`, `kyber`, `keep` | NVMe block I/O scheduler udev policy. `none` avoids queue overhead on fast NVMe drives. |
+| `io_scheduler` | `str` | `"none"` | `none`, `mq-deadline`, `bfq`, `kyber`, `keep` | Kconfig block scheduler default. `none` avoids queue overhead on fast NVMe. No `udev` rules installed. |
 | `blk_wbt` | `bool`| `true` | `true`, `false` | `CONFIG_BLK_WBT`. Block writeback throttling to mitigate storage bufferbloat during heavy writes. |
 | `iocost` | `bool`| `false` | `true`, `false` | Proportional I/O control model for cgroup v2 (`CONFIG_BLK_CGROUP_IOCOST`). |
 | `extra_filesystems`| `list`| `[]` | Filesystem names | Additional filesystems compiled into the module set (e.g. `["btrfs", "f2fs", "xfs"]`). |
@@ -508,7 +507,6 @@ When entering the granular configuration wizard (`--wizard` or selecting `[n]` a
 | `lmc_keep_extra` | `list`| `[]` | Subsystem paths | Additional subsystem source paths preserved during `localmodconfig` via `LMC_KEEP`. |
 | `keep_symbols` | `list`| `[]` | Kconfig symbols | Explicit driver symbols forced to `=m` after pruning (e.g. `["WIREGUARD", "TUN", "VETH"]`). |
 | `localyesconfig`| `bool`| `false` | `true`, `false` | Converts all modular drivers directly into monolithic built-in code (`=y`). |
-| `manage_service`| `bool`| `true` | `true`, `false` | Automatically enables `modprobed-db.service` user timer to keep driver logs continuously updated. |
 | `sig_force` | `bool`| `false` | `true`, `false` | `CONFIG_MODULE_SIG_FORCE`. Requires all kernel modules to be signed with a valid build key. |
 
 ---
@@ -617,7 +615,8 @@ flowchart TD
 | :--- | :--- | :--- | :---: | :--- |
 | `dusky_personal` | Daily driver workstation (64 GB RAM) | `dusky-personal` | 10 | EEVDF + CAS + scx_lavd, Full LTO, 1000 Hz, PREEMPT_LAZY, mitigations off |
 | `gaming` | Dedicated gaming & emulation rig | `dusky-gaming` | 20 | BORE + scx_bpfland, THP always, NTSync, CAKE, split-lock mitigation off |
-| `low_ram` | Laptops and PCs with $\le 8\text{ GB}$ RAM | `dusky-lowram` | 30 | Lean footprint, MGLRU anti-thrash, ZRAM zstd, systemd-oomd |
+| `low_ram` | Laptops and PCs with $\le 8\text{ GB}$ RAM | `dusky-lowram` | 30 | Lean footprint, MGLRU anti-thrash, ZRAM zstd, ThinLTO, strict modules |
+| `gaming_custom` | Wizard-derived gaming variant (not built-in) | `dusky-gaming-custom` | — | BORE + scx_bpfland, 250 Hz, lean footprint (see `kernel_profiles/gaming_custom.toml`) |
 | `minimal_strict` | Extreme sub-300MB idle RAM targets | `dusky-minimal` | 31 | Minimal tier, SLUB_TINY, -Os, THP off, DAMON reclaim, strict pruning |
 | `embedded_lowram`| Headless appliances with $\le 4\text{ GB}$ RAM | `dusky-embedded`| 32 | BASE_SMALL, no 32-bit compat, no hibernation, NR_CPUS 8, -Os |
 | `zen4_zen5` | AMD Zen 4 & Zen 5 desktop/mobile | `dusky-zen` | 40 | znver4 codegen, AMD P-State active EPP, EEVDF + CAS, Rust enabled |
@@ -658,7 +657,6 @@ flowchart TD
 > [cache]
 > sched_cache = true
 > llc_aggr_tolerance = 0
-> persist = true
 > 
 > [rseq]
 > slice_extension = true
@@ -744,7 +742,6 @@ flowchart TD
 > mode = "strict"
 > modprobed_db = true
 > allow_lsmod_fallback = true
-> manage_service = true
 > 
 > [boot]
 > cmdline = "bake"
@@ -836,7 +833,6 @@ flowchart TD
 > tracing = "minimal"
 > kexec = false
 > ikconfig = false
-> systemd_oomd = true
 > trim_unused_ksyms = true
 > 
 > [compiler]
@@ -887,7 +883,6 @@ flowchart TD
 > mode = "strict"
 > modprobed_db = true
 > allow_lsmod_fallback = true
-> manage_service = true
 > 
 > [boot]
 > cmdline = "bake"
@@ -926,7 +921,6 @@ flowchart TD
 > [cache]
 > sched_cache = true
 > llc_aggr_tolerance = 1
-> persist = true
 > 
 > [cpu]
 > arch = "native"
@@ -1021,41 +1015,35 @@ Leverage CPU performance counters to optimize branch layout and basic block orde
 ./dusky_kernal_compile.py --profile gaming
 ```
 
-### 8.3. Runtime Provisioning & Systemd Integration Architecture
+### 8.3. Bootloader Refresh & Runtime Separation
 
-When a Dusky kernel package is installed, the engine provisions system tuning files keyed specifically to that flavor:
+Install only writes packages + bootloader entries. No `sysctl`, `udev`, `tmpfiles`, `zram-generator`, `scx_loader`, or `systemd` units are created:
 
-```mermaid
-flowchart LR
-    A["Bootloader: linux-dusky-gaming"] --> B["Kernel Boot: uname -r = *-dusky-gaming"]
-    B --> C["systemd: dusky-tune.service"]
-    C --> D["/usr/local/lib/dusky/dusky-tune.sh"]
-    D --> E["Loads /usr/local/lib/dusky/tune.d/dusky-gaming.sh"]
-    E --> F["sysctl -p /etc/dusky/sysctl-dusky-gaming.conf"]
-    E --> G["sysfs/debugfs: THP • MGLRU • CAS • RSEQ • EPP"]
-```
+- `systemd-boot`: BLS entries in `$ESP/loader/entries/linux-<flavor>*.conf`.
+- `GRUB`: `grub-mkconfig -o /boot/grub/grub.cfg`.
+- `rEFInd`/`Limine`: auto-detect / `limine-update`.
+- Optional `kernel-install add <release>` with `--kernel-install`.
+- `CONFIG_CMDLINE` bake vs entry vs print via `boot.cmdline`.
 
-- **Manifest Indexing**: All installed files are recorded in `/etc/dusky/manifest-<flavor>.txt`.
-- **Clean Uninstallation**: Executing `./dusky_kernal_compile.py --uninstall <flavor>` removes all packages, cleans systemd drop-ins, deletes bootloader entries, and purges the runtime configuration without leaving orphaned files.
+Runtime tuning (`swappiness`, THP/MGLRU/CAS/RSEQ/EPP sysfs, ZRAM recompress timers, SCX daemons, OOMD) lives in separate scripts. `./dusky_kernal_compile.py --uninstall <flavor>` removes packages + BLS entries only.
 
 ---
 
 ## 9. Step-by-Step Operational Runbook
 
-### Step 1: Toolchain Installation & Hardware Logging
+### Step 1: Toolchain Installation & Hardware Snapshot
 
-Install the required Arch Linux packages and initialize the hardware module tracker:
+Install the required Arch Linux packages and snapshot the hardware module tracker:
 
 ```bash
 # Core compiler, linker, LLVM tools, and system utilities
-sudo pacman -S --needed base-devel clang lld llvm rust rust-bindgen bc cpio kmod pahole zram-generator scx-scheds perf curl gnupg
+sudo pacman -S --needed base-devel clang lld llvm rust rust-bindgen bc cpio kmod pahole perf curl gnupg terminus-font
 
 # Install modprobed-db from AUR (using paru or yay)
 paru -S --needed modprobed-db
 
-# Store currently loaded modules and activate the background logging timer
+# Snapshot currently loaded modules (no background service)
 modprobed-db store
-systemctl --user enable --now modprobed-db.service
 ```
 
 > [!tip] Hardware Discovery Window
@@ -1103,14 +1091,13 @@ Build and install your chosen profile:
 
 ### Step 5: Post-Install Bootloader Verification
 
-Verify that bootloader entries have been written and the kernel image is in place:
+Verify bootloader entries and the baked flavor cmdline:
 
 ```bash
 # For systemd-boot:
 bootctl list
 
-# Inspect generated runtime tuning files:
-cat /etc/dusky/manifest-dusky-personal.txt
-systemctl status dusky-tune.service
+# Baked cmdline / recommended params are printed at end of build
+./dusky_kernal_compile.py -p gaming --print-matrix | tail -5
 ```
 Restart your system and select your new **Dusky Linux** kernel from the bootloader menu.
