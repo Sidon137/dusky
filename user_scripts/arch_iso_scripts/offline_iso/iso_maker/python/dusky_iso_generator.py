@@ -279,6 +279,7 @@ AUR_SEED: Tuple[str, ...] = (
     "paru",
     "waybar-git",
     "papirus-folders",
+    "bibata-cursor-theme-bin",
 )
 
 # ==============================================================================

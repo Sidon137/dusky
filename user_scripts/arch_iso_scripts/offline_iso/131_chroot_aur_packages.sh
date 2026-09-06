@@ -18,6 +18,7 @@ declare -ar pkgs_aur=(
   "tray-tui"
   "xdg-terminal-exec"
   "paru"
+  "bibata-cursor-theme-bin"
 )
 
 
