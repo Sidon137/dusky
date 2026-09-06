@@ -15,7 +15,7 @@ branch = "main"
 search_dirs = [
     "user_scripts/arch_setup_scripts/scripts",
     "user_scripts/arch_setup_scripts",
-    "user_scripts/cursor/color"
+    "user_scripts/cursor/color",
     "user_scripts/networking",
     "user_scripts/misc_extra",
     "user_scripts/misc_extra/delete_in_3_weeks",
