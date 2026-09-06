@@ -198,17 +198,17 @@ ALL_GROUPS: Dict[str, List[str]] = {
     ],
     "hyprland": [
         "hyprland", "xorg-xwayland", "xdg-desktop-portal-hyprland", "xdg-desktop-portal-gtk",
-        "localsearch", "polkit", "xdg-utils", "socat", "inotify-tools",
+        "localsearch", "polkit", "dbus", "xdg-utils", "socat", "inotify-tools",
         "libnotify", "mako", "file",
     ],
     "appearance": [
-        "qt5-wayland", "qt6-wayland", "gtk3", "gtk4", "nwg-look", "qt5ct", "qt6ct", "qt6-svg",
+        "qt5-wayland", "qt6-wayland", "gtk3", "gtk4", "glib2", "dconf", "nwg-look", "qt5ct", "qt6ct", "qt6-svg",
         "qt6-multimedia-ffmpeg", "adw-gtk-theme", "upower", "plocate", "matugen",
         "otf-font-awesome", "ttf-jetbrains-mono-nerd", "otf-atkinsonhyperlegiblemono-nerd",
         "ttf-atkinson-hyperlegible", "otf-atkinson-hyperlegible",
         "noto-fonts-emoji", "sassc", "python-packaging", "python", "python-gobject",
         "python-cairo", "python-opengl", "gtk-layer-shell", "python-evdev", "python-pyudev",
-        "fontconfig", "python-pyquery", "python-textual", "python-rich", "papirus-icon-theme",
+        "fontconfig", "python-pyquery", "python-textual", "python-rich", "python-pillow", "papirus-icon-theme",
     ],
     "desktop": [
         #"waybar",
@@ -223,7 +223,7 @@ ALL_GROUPS: Dict[str, List[str]] = {
     ],
     "filesystem": [
         "btrfs-progs", "compsize", "zram-generator", "udisks2", "udiskie", "dosfstools",
-        "xdg-user-dirs", "usbutils", "gnome-disk-utility", "unzip", "zip", "unrar",
+        "xdg-user-dirs", "usbutils", "gnome-disk-utility", "unzip", "zip", "tar", "unrar",
         "7zip", "cpio", "file-roller", "rsync", "nfs-utils", "nilfs-utils", "smartmontools",
         "dmraid", "hdparm", "hwdetect", "lsscsi", "sg3_utils", "cpupower", "dust", "dkms",
         "thunar", "thunar-archive-plugin", "thunar-volman", "thunar-media-tags-plugin",
