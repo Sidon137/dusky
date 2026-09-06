@@ -444,31 +444,31 @@ hl.bind(
 -- so scrolling uses SHIFT here to match the keybinds above.
 hl.bind(
     "SUPER + SHIFT + equal",
-    hl.dsp.exec_cmd(dusky_scripts .. "hypr/cursor_size.py +"),
+    hl.dsp.exec_cmd(dusky_scripts .. "cursor/size/cursor_size.py +"),
     { description = "Cursor Size Up", repeating = true }
 )
 
 hl.bind(
     "SUPER + SHIFT + minus",
-    hl.dsp.exec_cmd(dusky_scripts .. "hypr/cursor_size.py -"),
+    hl.dsp.exec_cmd(dusky_scripts .. "cursor/size/cursor_size.py -"),
     { description = "Cursor Size Down", repeating = true }
 )
 
 hl.bind(
     "SUPER + SHIFT + mouse_up",
-    hl.dsp.exec_cmd(dusky_scripts .. "hypr/cursor_size.py +"),
+    hl.dsp.exec_cmd(dusky_scripts .. "cursor/size/cursor_size.py +"),
     { description = "Cursor Size Up (Scroll)" }
 )
 
 hl.bind(
     "SUPER + SHIFT + mouse_down",
-    hl.dsp.exec_cmd(dusky_scripts .. "hypr/cursor_size.py -"),
+    hl.dsp.exec_cmd(dusky_scripts .. "cursor/size/cursor_size.py -"),
     { description = "Cursor Size Down (Scroll)" }
 )
 
 hl.bind(
     "SUPER + SHIFT + BACKSPACE",
-    hl.dsp.exec_cmd(dusky_scripts .. "hypr/cursor_size.py --reset"),
+    hl.dsp.exec_cmd(dusky_scripts .. "cursor/size/cursor_size.py --reset"),
     { description = "Cursor Size Reset", locked = true }
 )
 
