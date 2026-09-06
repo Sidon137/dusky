@@ -675,6 +675,7 @@ done
         if password is not None:
             ok, err = cls.set_password(password)
             if ok:
+                os.environ.pop("DUSKY_SUDO_PASSWORD", None)
                 sys.stdout.write("\033[1;36m[DUSKY PRE-FLIGHT]\033[0m Sudo credentials cached for this session.\n")
                 return True
             sys.stderr.write(f"\033[1;31m[ERROR]\033[0m Provided sudo password failed: {err}\n")
@@ -6283,6 +6284,18 @@ class DuskyApp(App):
             sys.stderr.flush()
         except Exception:
             pass
+        if SudoEngine._password:
+            os.environ["DUSKY_SUDO_PASSWORD"] = SudoEngine._password
+        with suppress(Exception):
+            SudoEngine.cleanup()
+        with suppress(Exception):
+            if hasattr(self, "_driver") and self._driver:
+                self._driver.stop_application_mode()
+            elif hasattr(self, "driver") and self.driver:
+                self.driver.stop_application_mode()
+        with suppress(Exception):
+            sys.stdout.write("\033[?1049l\033[?25h")
+            sys.stdout.flush()
         release_lock()
         cleaned_args = [a for a in sys.argv[1:] if a != "--post-self-update"]
         os.execv(sys.executable, [sys.executable, str(SCRIPT_PATH), "--post-self-update", *cleaned_args])
