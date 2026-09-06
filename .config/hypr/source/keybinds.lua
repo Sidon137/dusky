@@ -438,6 +438,40 @@ hl.bind(
     { description = "Reset Zoom", locked = true }
 )
 
+-- --- Accessibility: Cursor Size (companion to Zoom above) ---
+-- equal is the =/+ key, so SUPER+SHIFT+equal IS Super+Shift+Plus.
+-- NOTE: plain SUPER+scroll is taken by workspace cycling (see below),
+-- so scrolling uses SHIFT here to match the keybinds above.
+hl.bind(
+    "SUPER + SHIFT + equal",
+    hl.dsp.exec_cmd(dusky_scripts .. "hypr/cursor_size.py +"),
+    { description = "Cursor Size Up", repeating = true }
+)
+
+hl.bind(
+    "SUPER + SHIFT + minus",
+    hl.dsp.exec_cmd(dusky_scripts .. "hypr/cursor_size.py -"),
+    { description = "Cursor Size Down", repeating = true }
+)
+
+hl.bind(
+    "SUPER + SHIFT + mouse_up",
+    hl.dsp.exec_cmd(dusky_scripts .. "hypr/cursor_size.py +"),
+    { description = "Cursor Size Up (Scroll)" }
+)
+
+hl.bind(
+    "SUPER + SHIFT + mouse_down",
+    hl.dsp.exec_cmd(dusky_scripts .. "hypr/cursor_size.py -"),
+    { description = "Cursor Size Down (Scroll)" }
+)
+
+hl.bind(
+    "SUPER + SHIFT + BACKSPACE",
+    hl.dsp.exec_cmd(dusky_scripts .. "hypr/cursor_size.py --reset"),
+    { description = "Cursor Size Reset", locked = true }
+)
+
 
 -- --- Clipboard & Screenshot ---
 local clipboard_state_file = os.getenv("HOME") .. "/.config/dusky/settings/clipboard_state"
