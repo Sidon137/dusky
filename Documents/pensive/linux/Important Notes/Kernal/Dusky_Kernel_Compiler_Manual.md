@@ -39,6 +39,7 @@ If you have never compiled a kernel, read in this order and skip nothing:
 - [[#6. Command-Line Interface & Operational Modes|6. Command-Line Interface & Operational Modes]]
 - [[#7. Complete Parameter Reference (18 Sections)|7. Complete Parameter Reference (18 Sections)]]
 - [[#8. Conflict Matrix & Invariant Resolution|8. Conflict Matrix & Invariant Resolution]]
+  - [[#8.12. Silent Traps — Interactions the Schema Cannot Forbid|8.12. Silent Traps — Interactions the Schema Cannot Forbid]]
 - [[#9. Decision Tree & Profile Catalog|9. Decision Tree & Profile Catalog]]
 - [[#10. Production TOML Profiles|10. Production TOML Profiles]]
 - [[#11. Operational Runbook|11. Operational Runbook + Advanced Workflows (Bundles, AutoFDO, Uninstall)]]
@@ -1666,7 +1667,107 @@ zgrep -E "SCHED_CLASS_EXT|DEBUG_INFO_BTF|LRU_GEN|NTSYNC|PREEMPT_LAZY" /proc/conf
 
 And keep `verify.strict = true`. That single boolean converts "silently missing feature" into "exit code 4 in 90 seconds".
 
----
+### 8.12. Silent Traps — Interactions the Schema Cannot Forbid
+
+These are legal configurations that pass schema validation, compile cleanly, and boot — but produce a kernel that is **not what you intended**. Read all of them once before creating custom profiles.
+
+#### 8.12.1. Rust Vanishes When BTF Meets LTO
+
+Upstream Kconfig dependency (`init/Kconfig`):
+
+```text
+config RUST
+    depends on !MODVERSIONS || GENDWARFKSYMS
+    depends on !DEBUG_INFO_BTF || (PAHOLE_HAS_LANG_EXCLUDE && !LTO)
+```
+
+**Why:** BTF is generated post-link by `pahole`, which converts DWARF into BTF. Because Rust DWARF contains complex type constructs that the BTF encoder cannot represent, the kernel build passes `--lang_exclude=rust` to skip Rust compilation units. That mechanism relies on each compilation unit carrying its source language attribution. **LTO destroys that attribution**: ThinLTO and Full LTO merge, inline, and re-emit code across compilation unit boundaries at link time. Rust-derived DWARF ends up blended into units that are no longer identifiably "rust", so pahole would emit corrupted BTF. Upstream therefore enforces mutual exclusion.
+
+**Consequence:** A gaming or desktop profile with `scx = "scx_lavd"` (requiring `DEBUG_INFO_BTF=y`) **and** `lto = "thin"` **and** `rust = true` compiles without error — and silently boots with `CONFIG_RUST` **disabled**. Any in-kernel Rust driver or experimental module you expected is completely absent.
+
+**Resolution — Pick One Priority:**
+
+| Priority | Setting Resolution | Architectural Trade-Off |
+| :--- | :--- | :--- |
+| **`sched_ext` + LTO** (desktops, gaming) | `rust = false` | Forfeit in-kernel Rust drivers; keep modern BPF schedulers and LTO codegen. |
+| **Rust + `sched_ext`** | `lto = "none"` | Forfeit LTO cross-module optimization; keep Rust and BPF CO-RE. |
+| **Rust + LTO** | `scx = "none"`, `require_btf = false` | Forfeit `sched_ext` and BPF CO-RE tooling; keep Rust and LTO codegen. |
+
+Verify after boot: `zgrep -E 'CONFIG_(RUST|LTO_CLANG|DEBUG_INFO_BTF)=' /proc/config.gz`.
+
+#### 8.12.2. `SLUB_TINY` on High-Core-Count Topologies (>8 Cores)
+
+`CONFIG_SLUB_TINY` is legal on any CPU, but its design target is memory-constrained embedded systems (≤4 GB RAM, ≤4 cores). By forcing `SLUB_CPU_PARTIAL=n`, it eliminates per-CPU partial slab caches to save RAM. On an 8-, 16-, or 32-core workstation, every allocation that cannot be satisfied from the current CPU slab immediately contends on the per-node `list_lock`.
+
+**Symptom:** High kernel CPU time under process-spawning (`make -j`, test suites) or network socket churn; `perf top` dominated by `raw_spin_lock` in `__slab_alloc`.
+**Rule:** **Never enable `slub_tiny = true` on systems with >8 threads.**
+
+#### 8.12.3. `trim_unused_ksyms` Silently Destroying DKMS
+
+Every symbol an out-of-tree module needs must be explicitly exported via `EXPORT_SYMBOL()`. `CONFIG_TRIM_UNUSED_KSYMS` performs a two-pass build that inventories every export referenced by **in-tree** modules and deletes all remaining symbols from the export table.
+
+**Consequence:** Out-of-tree DKMS modules (NVIDIA proprietary driver, ZFS, VirtualBox, `v4l2loopback`, `xone`) fail during DKMS build or refuse to load with `Unknown symbol in module`.
+**Rule:** The engine forces `trim_unused_ksyms = false` unless `compiler.headers = "never"`. Never force this symbol on a machine requiring DKMS.
+
+#### 8.12.4. `tickless = "full"` Without Command-Line Housekeeping Isolation
+
+Setting `timing.tickless = "full"` sets `CONFIG_NO_HZ_FULL=y`. This activates user/kernel context tracking system-wide on **every single syscall entry and exit**, adding ~1–3% overhead across all cores.
+
+**Consequence:** Without an explicit `nohz_full=<cpulist>` and `rcu_nocbs=<cpulist>` on the kernel command line, zero CPUs actually stop their tick. You pay 100% of the tracking overhead with 0% of the tickless latency benefit.
+**Rule:** Only use `tickless = "full"` when intentionally isolating dedicated cores for hard-RT or DPDK, and always reserve at least CPU 0 for housekeeping. Verify: `cat /sys/devices/system/cpu/nohz_full`.
+
+#### 8.12.5. `rcu_lazy` Without Callback Offloading (`RCU_NOCB_CPU`)
+
+`CONFIG_RCU_LAZY` batches non-urgent `call_rcu()` callbacks for up to 10 seconds to allow CPUs to remain in deep C-states. However, upstream RCU only applies lazy batching to **offloaded (NOCB)** callbacks.
+
+**Consequence:** If CPUs are not offloaded via `boot.cmdline_extra = "rcu_nocbs=0-N"` or `CONFIG_RCU_NOCB_CPU_DEFAULT_ALL=y`, `rcu_lazy` is completely inert.
+**Rule:** Always pair `power.rcu_lazy = true` with NOCB offloading. Verify: `cat /sys/module/rcutree/parameters/enable_rcu_lazy` and `dmesg | grep -i "offload"`.
+
+#### 8.12.6. Compiling LSMs (AppArmor/SELinux) Without Adding Them to `CONFIG_LSM`
+
+Compiling `security.apparmor = true` or `security.selinux = true` enables the respective LSM driver code in the kernel binary, but does **not** activate it. Modern kernels initialize LSMs based on the ordered string in `CONFIG_LSM` or the `lsm=` boot parameter.
+
+**Consequence:** An LSM absent from the active list is completely inert dead code.
+**Rule:** Ensure your active LSM string contains your security module (e.g. `lsm=landlock,lockdown,yama,integrity,apparmor,bpf`). Verify: `cat /sys/kernel/security/lsm`.
+
+#### 8.12.7. Expecting `uclamp` Frequency Spikes Under Autonomous P-States (`amd_pstate=active` / Intel HWP)
+
+`CONFIG_UCLAMP_TASK` allows latency-critical tasks to declare a minimum utilisation clamp (`uclamp_min`), signaling `schedutil` to ramp CPU frequencies immediately instead of waiting for PELT load averaging.
+
+**Consequence:** Under `amd_pstate=active` (the `amd-pstate-epp` driver) or Intel HWP, frequency selection is handled autonomously by CPU microcode based on hardware energy counters and the EPP register. The software governor's utilisation signal is out of the loop, making `uclamp` effectively inert for frequency control.
+**Rule:** Only rely on `uclamp` for frequency scaling when paired with `amd_pstate = "guided"` or `"passive"` under the `schedutil` governor.
+
+#### 8.12.8. Hibernation Configured on a ZRAM-Only Swap Topology
+
+ZRAM creates a compressed swap device entirely resident inside volatile RAM. ACPI S4 hibernation writes the active system state to a persistent non-volatile block device before powering down.
+
+**Consequence:** When the machine powers off, RAM drops power and the ZRAM device vanishes instantly. Hibernating into ZRAM is physically impossible. Furthermore, lockdown integrity mode (`security.lockdown_early = true`) forbids hibernation unless a signed resume path is configured.
+**Rule:** If `power.hibernation = true`, ensure a physical swap partition or swapfile exists on an NVMe/SSD, set `boot.cmdline_extra = "resume=UUID=..."`, or set `power.hibernation = false`.
+
+#### 8.12.9. Strict Module Pruning Dropping Intermittent Hardware
+
+`modules.mode = "strict"` uses `modprobed.db` to build only the drivers currently in use by the host.
+
+**The Classic Three Traps:**
+1. **Root Storage / Filesystem:** Storage controller (NVMe, AHCI) or filesystem (Btrfs, XFS, Ext4, dm-crypt) omitted from `/etc/mkinitcpio.conf` `MODULES=()`.
+2. **Intermittent USB Devices:** Gamepads, drawing tablets, DACs, webcams, or SD card readers unplugged during the census.
+3. **Occasional Network Virtual Devices:** `wireguard` or `tun` modules needed for VPNs that were not running during `modprobed-db store`.
+
+**Rule:** Keep all intermittent devices plugged in when storing the database, add critical storage and VPN drivers to `modules.keep_symbols`, and **always keep the distribution fallback kernel installed**.
+
+#### 8.12.10. `bare_metal_only` Preventing Test & Rescue Virtualisation
+
+`footprint.bare_metal_only = true` aggressively disables hypervisor and paravirtualization guest drivers (`CONFIG_PARAVIRT`, `CONFIG_HYPERVISOR_GUEST`, VirtIO block/net/balloon).
+
+**Consequence:** Saves ~0.2–0.5 MB of binary size, but renders the kernel completely unbootable inside QEMU, Proxmox, VirtualBox, or Hyper-V test environments.
+**Rule:** Leave `bare_metal_only = false` if you ever plan to test boot entries in a VM or run nested virtualization.
+
+#### 8.12.11. Assuming Compiled `sched_ext` Equals Running `sched_ext`
+
+`scheduler.scx_enable_class = true` compiles `CONFIG_SCHED_CLASS_EXT=y` into the kernel binary, providing the infrastructure for BPF schedulers.
+
+**Consequence:** The kernel does not run BPF scheduling automatically at boot. Until a userspace daemon (such as `scx_bpfland` or `scx_lavd`) is launched via `scx_loader` or systemd, the system runs standard EEVDF (or BORE).
+**Rule:** Start and enable your desired scheduler daemon in the runtime layer (§12.5). Verify: `cat /sys/kernel/sched_ext/state` (expect `running`).
 
 ---
 
@@ -3158,6 +3259,21 @@ cat /sys/kernel/debug/sched/preempt                         # active preemption 
 journalctl -b -p err                                        # anything angry?
 ```
 
+> [!tip] Keep A Boot-Time Baseline
+> Save the output of your verification commands into a baseline record:
+> ```bash
+> mkdir -p ~/.local/state/dusky-kernel
+> {
+>   uname -r
+>   zcat /proc/config.gz | grep -E '^CONFIG_(HZ|PREEMPT|LTO|SCHED_CLASS_EXT|NTSYNC|LRU_GEN|SLUB_TINY|RUST|CFI_CLANG|DEBUG_INFO_BTF)'
+>   cat /sys/kernel/debug/sched/preempt 2>/dev/null
+>   cat /sys/kernel/mm/lru_gen/enabled 2>/dev/null
+>   cat /sys/kernel/security/lsm 2>/dev/null
+>   zramctl 2>/dev/null
+> } > ~/.local/state/dusky-kernel/verify-$(uname -r).txt
+> ```
+> Diffing this snapshot against future builds (`diff -u verify-old.txt verify-new.txt`) is the fastest way to confirm whether a profile change had the exact desired effect on the running kernel.
+
 ### 11.6. Cross-Machine Hardware Bundles
 
 Build a tailored kernel for a weak laptop on a fast workstation.
@@ -3220,6 +3336,31 @@ Installation likewise only writes packages and bootloader entries:
 - **GRUB** — `grub-mkconfig -o /boot/grub/grub.cfg`.
 - **rEFInd** — auto-detected; **Limine** — `limine-update`.
 - **kernel-install** — `kernel-install add <release> <vmlinuz>` when `--kernel-install` is passed (use this if you build Unified Kernel Images).
+
+### 11.9. Safe A/B Kernel Testing Workflow
+
+You can safely test two tuned kernels side by side without overwriting your working build by using distinct suffixes:
+
+```bash
+# 1. Build kernel A (e.g. daily driver with ThinLTO)
+./dusky_kernal_compile.py -p dusky_personal
+
+# 2. Build kernel B with an experimental knob and unique suffix
+./dusky_kernal_compile.py -p dusky_personal --suffix dusky-personal-full --lto full
+
+# 3. Verify both BLS entries exist in systemd-boot
+bootctl list
+
+# 4. Reboot, select kernel B from the boot menu, run your benchmarks:
+sudo cyclictest -m -p 80 -i 250 -h 400 -q -D 60
+perf stat -a sleep 30
+
+# 5. Keep the winner; cleanly prune the experimental build:
+./dusky_kernal_compile.py --uninstall dusky-personal-full
+```
+
+> [!important] Never Delete Your Rescue Path
+> Always keep the official distribution kernel (`linux` or `linux-lts`) installed as a fallback entry. Rebuilding with the same suffix upgrades in place; changing suffixes creates coexisting boot entries.
 
 ---
 
@@ -3362,6 +3503,12 @@ swap-priority = 100
 fs-type = swap
 ```
 
+```bash
+# Manually trigger idle-page recompression
+echo "type=idle threshold=4096" | sudo tee /sys/block/zram0/recompress
+cat /sys/block/zram0/mm_stat     # Inspect orig_data_size, compr_data_size, and memory used
+```
+
 ### 12.7. `/etc/tmpfiles.d/dusky-power.conf` (battery profiles)
 
 ```ini
@@ -3369,11 +3516,50 @@ w /sys/module/snd_hda_intel/parameters/power_save - - - - 5
 w /sys/module/pcie_aspm/parameters/policy         - - - - powersupersave
 ```
 
+### 12.8. `systemd-oomd` — PSI-Driven User-Space OOM Prevention
+
+The in-kernel OOM killer only acts when memory exhaustion is total and immediate, which often results in minutes of unrecoverable disk/swap thrashing and an unresponsive desktop. `systemd-oomd` operates in userspace, monitoring **Pressure Stall Information (PSI)** to terminate runaway applications within seconds before the system freezes.
+
+```ini
+# /etc/systemd/oomd.conf
+[OOM]
+SwapUsedLimit=90%
+DefaultMemoryPressureLimit=60%
+DefaultMemoryPressureDurationSec=20s
+```
+
+Enable and monitor:
+
+```bash
+sudo systemctl enable --now systemd-oomd
+cat /proc/pressure/memory       # Inspect real-time memory pressure stalls
+```
+
+On memory-constrained systems (≤8 GB RAM) or aggressive ZRAM configurations, pairing MGLRU (`min_ttl_ms`) with `systemd-oomd` is the difference between an immediate 2-second recovery and a hard manual reboot.
+
 ---
 
 ## 13. Troubleshooting & Recovery
 
-### 13.1. It Does Not Boot
+### 13.1. Diagnostic & Failure Decision Tree
+
+```mermaid
+flowchart TD
+    F["Build or Boot Failure"] --> Q1{At which stage did it fail?}
+    Q1 -->|"exit 2 — Profile"| A2["<b>Schema / Conflict Error</b><br>Run --spec and --show; inspect Invariant Register (§8.9)"]
+    Q1 -->|"exit 3 — Network"| A3["<b>kernel.org / PGP Fetch Failure</b><br>Transient network drop; downloads auto-resume on re-run"]
+    Q1 -->|"exit 4 — Verify"| A4["<b>Missing Kconfig Symbol</b><br>olddefconfig dropped symbol; run --print-matrix and check Kconfig depends on"]
+    Q1 -->|"exit 5 — Build"| A5["<b>Compile / Patch Error</b><br>Out-of-tree patch conflict or compiler error; use --fresh or allow_vanilla_fallback"]
+    Q1 -->|"exit 6 — Dependency"| A6["<b>Missing Host Build Tool</b><br>Run --doctor; install required packages from §11 Step 1"]
+    Q1 -->|"Boots but Broken"| B1{Observed Symptom}
+    B1 -->|"No GPU / NVIDIA failure"| C1["DKMS: headers missing, trim_unused_ksyms=true, or kCFI conflict (§13.5)"]
+    B1 -->|"Missing device / filesystem"| C2["Strict pruning pruned driver; update modprobed.db and rebuild, or keep_symbols"]
+    B1 -->|"Kernel panic / no boot"| C3["Emergency rescue: select fallback in boot menu or Arch ISO chroot (§13.2)"]
+    B1 -->|"Stutter / frame hitches"| C4["thp_defrag=always, split locks, or missing BPF scheduler daemon"]
+    B1 -->|"High idle power"| C5["rcu_lazy without NOCB offloading, HZ too high, or ASPM powersupersave link issues"]
+```
+
+### 13.2. It Does Not Boot
 
 | Symptom | Cause | Fix |
 | :--- | :--- | :--- |
@@ -3389,7 +3575,29 @@ w /sys/module/pcie_aspm/parameters/policy         - - - - powersupersave
 
 **Always recoverable:** hold `Space`/`Shift` at boot, pick `linux` or `linux-lts`, then `./dusky_kernal_compile.py --uninstall <flavor>` (or `sudo pacman -R linux-dusky-<flavor> linux-dusky-<flavor>-headers`).
 
-### 13.2. It Boots But The Feature Is Missing
+#### Emergency Rescue via Arch Linux Live ISO
+
+If an unbootable kernel prevents accessing your bootloader or no working entries remain:
+
+1. Boot from an Arch Linux Live USB / ISO.
+2. Mount your root filesystem and EFI partition, then enter chroot:
+   ```bash
+   mount /dev/nvme0n1p2 /mnt       # your root partition (or btrfs subvolume / mapper)
+   mount /dev/nvme0n1p1 /mnt/boot  # your EFI system partition (ESP)
+   arch-chroot /mnt
+   ```
+3. Reinstall the official distribution kernel and clean the broken build:
+   ```bash
+   pacman -Syu linux linux-headers
+   pacman -R linux-dusky-<suffix> linux-dusky-<suffix>-headers
+   mkinitcpio -P
+   bootctl update                  # or: grub-mkconfig -o /boot/grub/grub.cfg
+   exit
+   umount -R /mnt
+   reboot
+   ```
+
+### 13.3. It Boots But The Feature Is Missing
 
 | Check | Command | Expected |
 | :--- | :--- | :--- |
@@ -3416,7 +3624,7 @@ w /sys/module/pcie_aspm/parameters/policy         - - - - powersupersave
 > ./dusky_kernal_compile.py -p myprofile --show | grep -iE "warn|forced|normalis"
 > ```
 
-### 13.3. Exit `4` — Verify Error
+### 13.4. Exit `4` — Verify Error
 
 The report names the symbol and the blocking dependency. The four most common:
 
@@ -3425,7 +3633,7 @@ The report names the symbol and the blocking dependency. The four most common:
 3. **`CONFIG_SCHED_CLASS_EXT` missing** → `debug_info = "none"` or `pahole` too old.
 4. **`CONFIG_NTSYNC` missing** → pruned by `localmodconfig`; add `NTSYNC` to `keep_symbols`.
 
-### 13.4. DKMS Problems
+### 13.5. DKMS Problems
 
 ```bash
 dkms status                                        # what is built for which release
@@ -3435,7 +3643,7 @@ cat /var/lib/dkms/nvidia/*/build/make.log          # the real error
 
 Frequent causes: `headers = "never"` or `auto` when no DKMS module was registered at build time; `trim_unused_ksyms = true`; `kcfi = true` with a binary blob; a `-march` mismatch between the headers package and the machine.
 
-### 13.5. Performance Did Not Improve
+### 13.6. Performance Did Not Improve
 
 Measure before blaming the kernel:
 
@@ -3455,7 +3663,7 @@ sudo powertop --auto-tune && sudo turbostat --Summary --interval 5
 
 Reality check: a well-tuned kernel changes **tails**, not averages. If your workload is GPU-bound, memory-bandwidth-bound, or network-bound, no scheduler on earth will help — and this manual will not pretend otherwise.
 
-### 13.6. Known Hardware Landmines
+### 13.7. Known Hardware Landmines
 
 | Setting | Symptom | Mitigation |
 | :--- | :--- | :--- |
@@ -3467,7 +3675,7 @@ Reality check: a well-tuned kernel changes **tails**, not averages. If your work
 | `split_lock_detect=off` on shared boxes | One tenant stalls all cores | Keep `split_lock_mitigate = true` on shared systems. |
 | `localyesconfig = true` | Huge resident kernel; DKMS still needs `MODULES=y` | Use only for appliances. |
 
-### 13.7. Measurement Cookbook (Prove It, Do Not Assume It)
+### 13.8. Measurement Cookbook (Prove It, Do Not Assume It)
 
 ```bash
 # Latency tail (the number that actually matters for "feel")
@@ -3718,6 +3926,10 @@ MANGOHUD=1 mangohud --dlsym %command%      # watch 1% and 0.1% lows, not average
 | **SLUB** | The kernel's only remaining slab allocator (SLAB and SLOB were removed upstream). |
 | **Split lock** | An atomic operation spanning two cache lines, forcing a bus lock that stalls every core. |
 | **THP** | Transparent Huge Pages — automatic 2 MB backing for anonymous memory. |
+| **hrtimer** | High-Resolution Timers — in-kernel timer subsystem operating on nanosecond resolution independently of `CONFIG_HZ` ticks. |
+| **PSI** | Pressure Stall Information (`/proc/pressure/*`) — kernel accounting mechanism measuring time lost to CPU, memory, and I/O resource starvation; foundation for `systemd-oomd`. |
+| **SCX** | `sched_ext` — kernel framework enabling BPF programs to implement scheduling policy for the fair class. |
+| **TLB** | Translation Lookaside Buffer — hardware MMU cache of virtual-to-physical address translations; hugepages (THP) minimize TLB misses. |
 | **uclamp** | Utilisation clamping — per-task min/max utilisation hints that bias `schedutil` frequency selection. |
 | **VMA** | Virtual Memory Area — one contiguous mapping in a process address space; counted against `vm.max_map_count`. |
 | **ZRAM** | Compressed RAM block device used as swap. |
