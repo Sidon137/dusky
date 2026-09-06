@@ -587,11 +587,11 @@ done
 
         with suppress(Exception):
             proc = subprocess.run(
-                ["sudo", "-n", "-v"],
+                ["sudo", "-k", "-n", "true"],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=15,
+                timeout=10,
             )
             if proc.returncode == 0:
                 cls._password = None
@@ -700,7 +700,11 @@ done
                     return True
                 sys.stderr.write(f"\033[1;31m[ERROR]\033[0m Authentication failed ({attempt}/3): {err}\n")
 
-        sys.stderr.write("\033[1;31m[FATAL]\033[0m Sudo authentication failed. Aborting.\n")
+        if sys.stdin.isatty():
+            sys.stderr.write("\033[1;31m[FATAL]\033[0m Sudo authentication failed after 3 attempts. Aborting before running privileged tasks.\n")
+        else:
+            sys.stderr.write("\033[1;31m[FATAL]\033[0m Sudo password required for privileged tasks (no TTY available to prompt).\n")
+            sys.stderr.write("Provide your password via --sudo-password or DUSKY_SUDO_PASSWORD environment variable.\n")
         return False
 
     @staticmethod
@@ -1642,6 +1646,7 @@ Options:
   --force                  Skip confirmation prompts
   --stop-on-fail           Abort script execution on first hard failure
   --allow-diverged-reset   In non-interactive mode, allow reset on diverged or unrelated history
+  --sudo-password PASS     Sudo password for privileged tasks (or DUSKY_SUDO_PASSWORD)
   --list                   List all active scripts in the update sequence
   --list-once              List persistent run-once markers and exit
   --forget-once SCRIPT...  Remove persistent run-once marker(s) and exit
@@ -1693,6 +1698,25 @@ def run_doctor():
     sys.stdout.write(f"Profiles found: {len(profiles)}\n")
     for p in profiles:
         sys.stdout.write(f"  - {p.name}\n")
+    with suppress(Exception):
+        if os.geteuid() == 0:
+            sys.stdout.write("Sudo:           running as root (no escalation needed)\n")
+        elif not shutil.which("sudo"):
+            sys.stdout.write("Sudo:           sudo not installed\n")
+        elif SudoEngine.detect_nopasswd():
+            sys.stdout.write("Sudo:           passwordless (NOPASSWD: ALL)\n")
+        else:
+            cached = subprocess.run(
+                ["sudo", "-n", "-v"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            ).returncode == 0
+            if cached:
+                sys.stdout.write("Sudo:           password required (active cached session)\n")
+            else:
+                sys.stdout.write("Sudo:           password required\n")
     sys.exit(0)
 
 
