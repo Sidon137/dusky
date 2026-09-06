@@ -23,6 +23,7 @@ xdg-desktop-portal-hyprland
 xdg-desktop-portal-gtk
 localsearch
 polkit
+dbus
 xdg-utils
 socat
 inotify-tools
@@ -34,6 +35,8 @@ qt5-wayland
 qt6-wayland
 gtk3
 gtk4
+glib2
+dconf
 nwg-look
 qt5ct
 qt6ct
@@ -63,6 +66,7 @@ papirus-icon-theme
 python-pyquery
 python-textual
 python-rich
+python-pillow
 # Group 4: Desktop Experience
 waybar
 awww
@@ -112,6 +116,7 @@ usbutils
 gnome-disk-utility
 unzip
 zip
+tar
 unrar
 7zip
 cpio

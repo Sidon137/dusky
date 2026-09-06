@@ -99,7 +99,7 @@ LOCK_FILE = CACHE_HOME / "hypr-cursor-size.lock"
 DEFAULT_STEP = 2
 DEFAULT_MIN = 8
 DEFAULT_MAX = 96
-DEFAULT_FALLBACK_SIZE = 24  # freedesktop default when nothing else is detectable
+DEFAULT_FALLBACK_SIZE = 18  # house default when nothing else is detectable (freedesktop uses 24)
 
 GSETTINGS_SCHEMA = "org.gnome.desktop.interface"
 NOTIFY_TAG = "hypr_cursor_size"
@@ -268,20 +268,24 @@ def _theme_from_lua_configs() -> str | None:
 def detect_theme(explicit: str | None) -> str:
     if explicit:
         return explicit
+    # gsettings first: Hyprland keeps it live via cursor:sync_gsettings_theme,
+    # so it reflects setcursor/dusky_cursor switches immediately. Process env
+    # goes stale after any theme switch (login-time values linger in old
+    # shells) and would otherwise resurrect the previous theme on persist.
+    theme = _theme_from_gsettings()
+    if theme:
+        log_debug(f"theme {theme!r} from gsettings")
+        return theme
     for var in ("HYPRCURSOR_THEME", "XCURSOR_THEME"):
         val = os.environ.get(var, "").strip()
         if val:
             log_debug(f"theme {val!r} from ${var}")
             return val
-    theme = _theme_from_gsettings()
-    if theme:
-        log_debug(f"theme {theme!r} from gsettings")
-        return theme
     theme = _theme_from_lua_configs()
     if theme:
         return theme
-    log_err("Could not detect cursor theme from $HYPRCURSOR_THEME / "
-            "$XCURSOR_THEME, gsettings or Hyprland Lua config. "
+    log_err("Could not detect cursor theme from gsettings, "
+            "$HYPRCURSOR_THEME / $XCURSOR_THEME or Hyprland Lua config. "
             "Pass --theme <name>.")
     sys.exit(1)
 
@@ -505,6 +509,56 @@ def apply_dbus_env(size: int) -> None:
 
 
 ENV_KEYS = ("XCURSOR_SIZE", "HYPRCURSOR_SIZE", "XCURSOR_THEME", "HYPRCURSOR_THEME")
+
+
+_GTK_CURSOR_KEY_RE = re.compile(r"^\s*(gtk-cursor-theme-(?:name|size))\s*=")
+
+
+def apply_gtk_settings(theme: str, size: int) -> bool:
+    """Sync GTK settings.ini cursor keys (gtk-3.0/gtk-4.0). Best-effort.
+
+    Kept in sync with dusky_cursor.update_gtk_settings so keypress steps
+    never leave stale values behind for GTK apps.
+    """
+    ok = True
+    values = {"gtk-cursor-theme-name": theme, "gtk-cursor-theme-size": str(size)}
+    for name in ("gtk-3.0", "gtk-4.0"):
+        path = CONFIG_HOME / name / "settings.ini"
+        try:
+            current = path.read_text(encoding="utf-8") if path.is_file() else ""
+        except OSError:
+            current = ""
+        lines = current.splitlines()
+        if not any(line.strip() == "[Settings]" for line in lines):
+            lines.insert(0, "[Settings]")
+        seen: set[str] = set()
+        kept: list[str] = []
+        for line in lines:
+            m = _GTK_CURSOR_KEY_RE.match(line)
+            if m:
+                key = m.group(1)
+                if key in seen:
+                    continue  # drop duplicates - GTK's key-file parser would error
+                seen.add(key)
+                line = f"{key}={values[key]}"
+            kept.append(line)
+        try:
+            idx = next(i for i, line in enumerate(kept) if line.strip() == "[Settings]")
+        except StopIteration:  # unreachable ([Settings] inserted above), kept for safety
+            kept.insert(0, "[Settings]")
+            idx = 0
+        for key, val in values.items():
+            if key not in seen:
+                kept.insert(idx + 1, f"{key}={val}")
+        text = "\n".join(kept) + "\n"
+        if text == current:
+            continue
+        try:
+            atomic_write(path, text)
+        except OSError as e:
+            log_warn(f"Cannot write {path}: {e}")
+            ok = False
+    return ok
 
 
 def persist_lua_env(theme: str, size: int) -> bool:
@@ -737,6 +791,7 @@ def main(argv: list[str] | None = None) -> int:
             if not args.no_persist:
                 ok_persist = persist_lua_env(theme, target)
                 write_state(target)
+                apply_gtk_settings(theme, target)
             verified = confirm_size(target)
 
             if not args.no_notify:

@@ -15,6 +15,7 @@ branch = "main"
 search_dirs = [
     "user_scripts/arch_setup_scripts/scripts",
     "user_scripts/arch_setup_scripts",
+    "user_scripts/cursor/color"
     "user_scripts/networking",
     "user_scripts/misc_extra",
     "user_scripts/misc_extra/delete_in_3_weeks",
@@ -135,7 +136,8 @@ tasks = [
     # "U | once | 360_obsidian_pensive_vault_configure.sh",
     # "U | 365_cache_purge.sh",
     # "S | once | 370_arch_install_scripts_cleanup.sh",
-    # "U | once | 375_cursor_theme_bibata_classic_modern.sh",
+    "U | once | 375_cursor_theme_bibata_classic_modern.sh",
+    "U | | once | dusky_cursor.py --apply",
     # "S | 380_nvidia_open_source.sh",
     "U | once | 383_configure_hyprland_gpu.py --auto",
     # "S | 385_waydroid_setup.sh",

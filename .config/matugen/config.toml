@@ -180,6 +180,17 @@ post_hook   = 'hyprctl reload config-only || :'
 input_path  = '~/.config/matugen/templates/hyprlock-colors.conf'
 output_path = '~/.config/matugen/generated/hyprlock-colors.conf'
 
+[templates.dusky_cursor]
+input_path  = '~/.config/matugen/templates/dusky-cursor.env'
+output_path = '~/.config/matugen/generated/dusky-cursor.env'
+post_hook   = 'python3 "$HOME/user_scripts/cursor/color/dusky_cursor.py" --apply --quiet || echo "dusky_cursor: exit $?" >&2'
+
+# The script owns its own rotating log ($XDG_CACHE_HOME/dusky-cursor/hook.log),
+# so no shell redirection is needed. --quiet keeps matugen's terminal clean
+# (errors still reach stderr); a non-zero exit is surfaced instead of swallowed
+# by '|| :' so a broken hook is visible in matugen's output.
+
+
 [templates.waybar]
 input_path  = '~/.config/matugen/templates/colors.css'
 output_path = '~/.config/matugen/generated/waybar-colors.css'

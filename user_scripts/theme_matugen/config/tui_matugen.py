@@ -47,6 +47,7 @@ CHECK_CMDS: dict[str, str] = {
     "wlogout": "wlogout",
     "rofi": "rofi",
     "mako": "mako",
+    "dusky_cursor": "hyprctl",
     "kitty": "kitty",
     "foot": "foot",
     "opencode": "opencode",
@@ -209,6 +210,15 @@ SCHEMA: dict[int, list[ConfigItem]] = {
             default=True,
             group="Screen Lock",
             extended_help="**Hyprlock Theming**\n\nGenerates color definitions for the Hyprlock lock screen."
+        ),
+        ConfigItem(
+            label="Dusky Cursor",
+            key="dusky_cursor",
+            scope="DEFAULT",
+            type_="bool",
+            default=True,
+            group="Compositor",
+            extended_help="**Dusky Cursor (Accent-Themed Bibata)**\n\nRecolors Bibata-Modern-Classic bitmaps with the Matugen accent (fill) + mode-aware outline into the `Dusky` XCursor theme and applies it live (`hyprctl setcursor`, gsettings, D-Bus env, Hyprland Lua env, GTK settings). Rebuilds automatically on every theme switch; disable to keep your current cursor untouched."
         ),
         ConfigItem(
             label="Waybar",
@@ -597,6 +607,7 @@ SCHEMA: dict[int, list[ConfigItem]] = {
             preset_payload={
                 "alacritty": False, "beeper": False, "btop": True, "cava": True,
                 "dusky_control_center": False, "dusky_quickpanal": False,
+                "dusky_cursor": True,
                 "dusky_sites": True, "dusky_tui": True, "dusky_visualizer_colors": True,
                 "fastfetch": True, "foot": True, "gtk3": True, "gtk4": True,
                 "gtksourceview": True, "hyprland": True, "hyprlock": True,
@@ -625,6 +636,7 @@ SCHEMA: dict[int, list[ConfigItem]] = {
             preset_payload={
                 "alacritty": False, "beeper": False, "btop": False, "cava": False,
                 "dusky_control_center": False, "dusky_quickpanal": False,
+                "dusky_cursor": False,
                 "dusky_sites": False, "dusky_tui": True, "dusky_visualizer_colors": False,
                 "fastfetch": False, "foot": True, "gtk3": False, "gtk4": False,
                 "gtksourceview": False, "hyprland": True, "hyprlock": False,
@@ -653,6 +665,7 @@ SCHEMA: dict[int, list[ConfigItem]] = {
             preset_payload={
                 "alacritty": True, "beeper": True, "btop": True, "cava": True,
                 "dusky_control_center": True, "dusky_quickpanal": True,
+                "dusky_cursor": True,
                 "dusky_sites": True, "dusky_tui": True, "dusky_visualizer_colors": True,
                 "fastfetch": True, "foot": True, "gtk3": True, "gtk4": True,
                 "gtksourceview": True, "hyprland": True, "hyprlock": True,

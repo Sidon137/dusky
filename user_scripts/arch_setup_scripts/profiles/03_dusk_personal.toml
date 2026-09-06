@@ -23,6 +23,7 @@ remote = "origin"
 dirs = [
     "~/user_scripts/arch_setup_scripts/scripts",
     "~/user_scripts/arch_setup_scripts",
+    "~/user_scripts/cursor/color"
     "~/user_scripts/rofi",
     "~/user_scripts/images",
     "~/user_scripts/theme_matugen",
@@ -125,6 +126,7 @@ scripts = [
     "S | 370_arch_install_scripts_cleanup.sh",
     "U | 375_cursor_theme_bibata_classic_modern.sh",
     "U | 376_generate_colorfiles_for_current_wallpaer.sh",
+    "U | dusky_cursor.py --apply",
     "U | 380_nvidia_open_source.sh",
     "S | 381_nvidia_services.sh",
     "U | 383_configure_hyprland_gpu.py",
