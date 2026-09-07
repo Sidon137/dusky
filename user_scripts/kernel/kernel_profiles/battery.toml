@@ -242,7 +242,7 @@ mode = "strict"                 # Build only drivers captured in modprobed.db
 modprobed_db = true             # Read ~/.config/modprobed.db
 modprobed_db_path = ""
 allow_lsmod_fallback = false
-lmc_keep_extra = ["drivers/input", "drivers/hid", "sound/pci", "drivers/vfio"]
+lmc_keep_extra = ["drivers/input", "drivers/hid", "sound/pci", "drivers/vfio", "drivers/i2c/busses"]
 keep_symbols = [
   # Laptop Battery, Power & USB-C Docking
   "ACPI_BATTERY", "ACPI_AC", "TYPEC", "TYPEC_UCSI", "UCSI_ACPI", "THUNDERBOLT", "USB4",
@@ -254,6 +254,8 @@ keep_symbols = [
   "ASUS_WMI", "ASUS_NB_WMI",
   # VPN Support
   "WIREGUARD", "TUN",
+  # Nouveau future switch (i2c helper, unused with proprietary but kept for later)
+  "I2C_NVIDIA_GPU",
   # VFIO GPU passthrough (tristate only here, bools live in dusky.extra_config)
   "VFIO", "VFIO_PCI", "VFIO_PCI_CORE", "VFIO_IOMMU_TYPE1", "IOMMUFD"
 ]
