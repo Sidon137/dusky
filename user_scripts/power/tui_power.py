@@ -38,6 +38,20 @@ THEME_FILE = "~/.config/matugen/generated/dusky_tui.json"
 ENABLE_USER_PRESETS = True
 USER_PRESETS_TAB = "Profiles"
 
+# Informative bottom banner explaining Suspend vs Sleep on relevant tabs
+TAB_NOTICES = {
+    0: {
+        "level": "info",
+        "message": "**Suspend vs Sleep**: `suspend` is immediate Suspend-to-RAM (fast 1–2s resume). `sleep` executes your dynamic `SleepOperation` policy (suspend-then-hibernate with automatic fallback).",
+        "position": "bottom",
+    },
+    1: {
+        "level": "info",
+        "message": "**Suspend vs Sleep**: `suspend` is immediate Suspend-to-RAM (fast 1–2s resume). `sleep` executes your dynamic `SleepOperation` policy (suspend-then-hibernate with automatic fallback).",
+        "position": "bottom",
+    },
+}
+
 # =============================================================================
 # 3. TABS DEFINITION
 # =============================================================================
@@ -68,11 +82,11 @@ KEY_ACTIONS = [
 KEY_ACTION_HINTS = [
     "Power off the system immediately",
     "Reboot the operating system",
-    "Suspend system to RAM (sleep)",
-    "Hibernate system to disk (swap)",
+    "Suspend directly to RAM (fast 1-2s resume)",
+    "Hibernate system to disk/swap (0W power draw)",
     "Suspend to RAM and hibernate to swap",
     "Suspend first, hibernate after timeout",
-    "Execute configured default SleepOperation",
+    "Dynamic policy: runs configured SleepOperation",
     "Lock all active user graphical sessions",
     "Ignore event; do nothing",
     "Halt the machine hardware",
@@ -90,6 +104,18 @@ LID_ACTIONS = [
     "hybrid-sleep",
     "suspend-then-hibernate",
     "sleep",
+]
+
+LID_ACTION_HINTS = [
+    "Suspend directly to RAM (fast 1-2s resume)",
+    "Ignore event; keep running with lid closed",
+    "Lock active graphical user sessions",
+    "Power off the system cleanly",
+    "Reboot the operating system",
+    "Hibernate system to disk (swap)",
+    "Suspend to RAM and hibernate to swap",
+    "Suspend first, hibernate after timeout",
+    "Dynamic policy: runs configured SleepOperation",
 ]
 
 IDLE_ACTIONS = [
@@ -178,7 +204,8 @@ SCHEMA = {
                 "**Power Key Action**\n\n"
                 "Configures the action taken when the physical power key is pressed.\n\n"
                 "- `poweroff`: Shuts down the machine cleanly.\n"
-                "- `suspend`: Suspends system to RAM.\n"
+                "- `suspend`: Enters Suspend-to-RAM immediately (fast 1–2s resume, RAM powered).\n"
+                "- `sleep`: Dynamic policy — runs your configured `SleepOperation` (e.g. suspend-then-hibernate with fallback).\n"
                 "- `lock`: Screen-locks all active user sessions.\n"
                 "- `ignore`: Disables logind response to the power button."
             ),
@@ -295,10 +322,14 @@ SCHEMA = {
             type_="cycle",
             default="suspend",
             options=LID_ACTIONS,
+            hints=LID_ACTION_HINTS,
             group="Laptop Lid",
             extended_help=(
                 "**Laptop Lid Switch (Battery Power)**\n\n"
-                "Action taken when the laptop lid is closed while running on battery power."
+                "Action taken when the laptop lid is closed while running on battery power.\n\n"
+                "- `suspend`: Enters Suspend-to-RAM immediately (fast 1–2s resume, RAM powered).\n"
+                "- `sleep`: Dynamic policy — executes your configured `SleepOperation` (e.g. suspend-then-hibernate with fallback).\n"
+                "- `ignore`: Keeps system running with lid closed (clamshell mode)."
             ),
         ),
         ConfigItem(
@@ -308,10 +339,14 @@ SCHEMA = {
             type_="cycle",
             default="suspend",
             options=LID_ACTIONS,
+            hints=LID_ACTION_HINTS,
             group="Laptop Lid",
             extended_help=(
                 "**Laptop Lid Switch (External AC Power)**\n\n"
-                "Action taken when the laptop lid is closed while plugged into AC/charger."
+                "Action taken when the laptop lid is closed while plugged into AC/charger.\n\n"
+                "- `suspend`: Direct Suspend-to-RAM.\n"
+                "- `sleep`: Dynamic SleepOperation policy.\n"
+                "- `ignore`: Prevents laptop from sleeping when plugged in."
             ),
         ),
         ConfigItem(
@@ -321,6 +356,7 @@ SCHEMA = {
             type_="cycle",
             default="ignore",
             options=LID_ACTIONS,
+            hints=LID_ACTION_HINTS,
             group="Laptop Lid",
             extended_help=(
                 "**Laptop Lid Switch (Docked / Multi-Monitor)**\n\n"
