@@ -2,12 +2,9 @@
 # Target: Modern Laptops (AMD Ryzen 6000-8000/AI 300, Intel 12th-14th Gen / Core Ultra)
 # Philosophy: Maximize package C-state residency, batch wakeups, minimize timer ticks.
 
-# ==============================================================================
-# [meta] — Profile Identity
-# ==============================================================================
 [meta]
-name = "battery_general"
-description = "General mobile battery profile: 300 Hz, PREEMPT_LAZY, TEO, RCU_LAZY, powersave EPP"
+name = "battery"
+description = "maximum battery savings"
 suffix = "dusky-battery"
 priority = 60
 tags = ["laptop", "battery", "mobile", "efficiency"]
@@ -21,7 +18,7 @@ portable_package = false        # Allows native CPU instruction optimization on 
 [release]
 channel = "stable"              # Track stable 7.2.y releases for daily reliability
 pin = ""
-allow_rc = false                # Laptops need reliability; avoid pre-release RCs
+allow_rc =  true               # Laptops need reliability; avoid pre-release RCs
 min_version = "7.2"
 require_signature = true        # Verify PGP signatures with kernel.org release keys
 
@@ -80,10 +77,10 @@ extra_config = {}
 [cpu]
 arch = "native"                 # Optimize specifically for your laptop's CPU pipeline
 march = ""
-governor = "powersave"          # Autonomous hardware EPP driver default governor
-amd_pstate = "active"           # CPPC v2 autonomous EPP mode (Zen 2+)
-epp = "balance_power"           # EPP 192: balanced efficiency bias (can drop to "power" on battery)
-mitigations = "on"              # Laptops use public Wi-Fi; keep speculative mitigations enabled
+amd_pstate = "undefined"        # You have Intel silicon, not AMD
+governor = "powersave"          # Standard driver for Intel HWP
+epp = "power"                   # Energy-Performance Preference
+mitigations = "off"             # disabled all security stuff for at home stuff, no shared network
 nr_cpus = 0                     # Automatically size per-CPU structures to physical thread count
 smt = true                      # Keep Hyper-Threading/SMT active
 mce = true                      # Machine Check Exception reporting
@@ -104,49 +101,49 @@ preempt_dynamic = true          # Permits dynamic testing via preempt= boot para
 
 
 # ==============================================================================
-# [memory] — Paging, Reclaim, Compressed Swap & Footprint
+# [memory] — Tailored for Intel i7-12700H + 64 GB DDR5 + ZRAM-Only (Lowest Power)
 # ==============================================================================
 [memory]
-footprint = "lean"              # Drops legacy tracing/debug overhead; ideal for 8-16 GB laptops
-thp = "madvise"                 # THP only where applications ask (prevents memory bloat)
-thp_defrag = "defer"            # Background khugepaged compaction (prevents direct reclaim stalls)
-thp_shmem = "never"
-mglru = true                    # Multi-Gen LRU: generational page aging
-mglru_mask = 7
-mglru_min_ttl_ms = 1000         # Anti-thrashing protection
-swap_backend = "zram"           # Compressed RAM swap (avoids battery-draining disk I/O)
-zram_algo = "zstd"              # High-ratio compression (~3:1)
-zram_recomp_algo = "zstd"       # Idle page recompression algorithm
-zram_size_pct = 100             # 100% of physical RAM capacity
-zram_multi_comp = true          # Enables access tracking (CONFIG_ZRAM_TRACK_ENTRY_ACTIME)
-zswap_compressor = "zstd"
-zswap_max_pool_pct = 25
-swappiness = 180                # Recommends swapping anonymous pages to ZRAM before dropping cache
-vfs_cache_pressure = 100
-watermark_scale_factor = 125
-watermark_boost_factor = 0      # Disables erratic fragmentation boosts
-compaction_proactiveness = 0
-dirty_bytes_mb = 128            # Flushes dirty pages in small bursts
-slub_tiny = false               # Keep standard SLUB allocator for SMP core scaling
-slab_buckets = false
-per_vma_lock = true             # Concurrent RCU page faults
-numa = false                    # Single-socket mobile silicon does not need NUMA overhead
-numa_balancing = false
-nodes_shift = 0
-ksm = false                     # KSM scanning consumes unnecessary CPU on laptops
-ksm_run = false
-damon = false
-page_reporting = false
-hugetlbfs = false               # Strip unused static hugepages on mobile
-kallsyms_all = false            # Saves ~1-2 MB by dropping data symbols
-memcg = true                    # Required by systemd
-base_small = false
-log_buf_shift = 16              # 64 KB ring buffer (balanced for mobile)
-tracing = "auto"                # BPF tracing enabled when sched_ext daemon is active
-kexec = false                   # Strip unused kexec crash dump machinery
-ikconfig = true                 # Keeps /proc/config.gz available for auditing
-trim_unused_ksyms = false       # Keep false so DKMS modules continue to link
-dead_code_elimination = false
+footprint = "lean"              # Strips background tracing bloat
+thp = "never"                   # Shuts down khugepaged background scanning completely
+thp_defrag = "never"            # Disables memory compaction wakeups
+thp_shmem = "never"             # Prevents memory bloat in /dev/shm
+mglru = true                    # Modern low-CPU generational page management
+mglru_mask = 7                  # Full hardware MMU page-table walking
+mglru_min_ttl_ms = 0            # Disables unnecessary thrash-detection timers
+swap_backend = "zram"           # Keeps swap in RAM; NVMe SSD stays asleep at ~3 mW
+zram_algo = "zstd"              # Best compression value
+zram_recomp_algo = "lz4"        # Matches primary
+zram_size_pct = 50              # 25% = 16 GB compressed emergency pool (ample for 64 GB)
+zram_multi_comp = false         # Eliminates background recompression timer wakeups
+zswap_compressor = "zstd"       # Dormant (zswap disabled)
+zswap_max_pool_pct = 25         # Dormant (zswap disabled)
+swappiness = 50                 # Keeps programs in raw RAM; stops CPU from compressing idle data
+vfs_cache_pressure = 50         # Keeps file metadata in RAM; keeps NVMe SSD asleep
+watermark_scale_factor = 10     # Standard 64 MB buffer; keeps kswapd asleep
+watermark_boost_factor = 0      # Disables panic-mode aggressive memory eviction
+compaction_proactiveness = 0    # Stops kcompactd from proactively waking CPU cores
+dirty_bytes_mb = 480            # Replaces 12 GB writeback storms with tiny 128 MB bursts
+slub_tiny = false               # Essential for 20 threads: prevents cores fighting over 1 lock
+slab_buckets = false            # Leanest slab cache footprint
+per_vma_lock = true             # Fast parallel memory mapping; lets cores return to sleep sooner
+numa = false                    # Strips multi-node allocator loops; lean single-socket operation
+numa_balancing = false          # Eliminates recurring page-table scans and fake faults
+nodes_shift = 0                 # Sized exactly for 1 node
+ksm = false                     # Eliminates background memory scanning across 64 GB RAM
+ksm_run = false                 # Ensures ksmd is never started
+damon = false                   # Prevents background scanning threads from waking CPU cores
+page_reporting = false          # Excludes VM-only hypervisor ballooning code
+hugetlbfs = false               # Strips unused static database hugepages
+kallsyms_all = false            # Keeps function names in logs while saving ~1 MB of variable tables
+memcg = true                    # Mandatory for systemd on Arch Linux
+base_small = false              # Full-sized hash tables prevent CPU search collisions
+log_buf_shift = 16              # Clean 64 KB log buffer
+tracing = "auto"                # Enables hooks only if scx_lavd needs them
+kexec = false                   # Strips unneeded instant-reboot server code
+ikconfig = true                 # 30 KB configuration tracker for easy auditing (0 Watts)
+trim_unused_ksyms = false       # Mandatory: prevents breaking outside drivers and DKMS
+dead_code_elimination = false   # Unsupported on x86-64 (ThinLTO handles this already)
 
 
 # ==============================================================================
@@ -178,7 +175,7 @@ profile = "balanced"            # Standard Arch Linux security posture
 init_on_alloc = true            # Zero memory on allocation (infoleak prevention)
 init_on_free = false            # Zero on free costs 3-10% CPU; keep false on battery
 hardened_usercopy = true
-stackprotector = "strong"
+stackprotector = "none"
 slab_freelist_hardened = true
 slab_freelist_random = true
 randomize_kstack = true
@@ -186,7 +183,7 @@ ubsan_bounds = true
 apparmor = false
 selinux = false
 lockdown_early = false
-acknowledge_risk = false
+acknowledge_risk = true
 
 
 # ==============================================================================
@@ -197,7 +194,7 @@ ntsync = true                   # Keep NTSync compiled (doesn't hurt battery whe
 uclamp = false                  # Inert under autonomous P-States; avoid bookkeeping
 max_map_count = 1048576         # Safe default for Wine/Proton games
 split_lock_mitigate = true      # Keep protection against misbehaving split-lock code
-controllers = true              # Retain gamepads/input drivers in case you plug one in
+controllers = false              # Retain gamepads/input drivers in case you plug one in
 
 
 # ==============================================================================
@@ -208,7 +205,7 @@ nvme_poll_queues = 0            # NVMe polling wastes continuous CPU; keep off o
 io_scheduler = "none"           # Hardware NVMe queues handle scheduling
 blk_wbt = true                  # Writeback throttling prevents desktop freezes
 iocost = false
-extra_filesystems = ["btrfs", "ext4", "vfat", "exfat", "ntfs3"]
+extra_filesystems = ["btrfs", "ext4", "vfat", "exfat", "ntfs"]
 
 
 # ==============================================================================
@@ -220,8 +217,8 @@ cpu_idle_governor = "teo"       # Timer Events Oriented idle governor (best for 
 rcu_lazy = true                 # Batches non-urgent RCU callbacks for up to 10s
 energy_model = false            # Inert on symmetric x86
 suspend = true                  # System suspend-to-RAM / s2idle
-hibernation = false             # Disabled: pure ZRAM swap cannot store a hibernation image
-pcie_aspm = "powersave"         # Aggressive PCIe ASPM (L1 substates); safe baseline
+hibernation = true              # if you ever want to enable hiberatinon using disk swap, you have the option to. 
+pcie_aspm = "powersupersave"         # Aggressive PCIe ASPM (L1 substates); safe baseline
 hda_power_save = 5              # Power down HD audio codec after 5 seconds of silence
 
 
@@ -230,7 +227,7 @@ hda_power_save = 5              # Power down HD audio codec after 5 seconds of s
 # ==============================================================================
 [network]
 congestion = "bbr"              # Model-based TCP; handles lossy Wi-Fi connections best
-qdisc = "fq_codel"              # Standard queue discipline for general client links
+qdisc = "fq"              # Standard queue discipline for general client links
 mptcp = true
 xdp = false
 nf_conntrack_procfs = false
@@ -247,8 +244,16 @@ modprobed_db_path = ""
 allow_lsmod_fallback = false
 lmc_keep_extra = ["drivers/input", "drivers/hid", "sound/pci"]
 keep_symbols = [
-  "THUNDERBOLT", "USB4", "HID_MULTITOUCH", "IWLWIFI", "BT_HCIBTUSB",
-  "ACPI_BATTERY", "ACPI_AC", "TYPEC", "UCSI_ACPI"
+  # Laptop Battery, Power & USB-C Docking
+  "ACPI_BATTERY", "ACPI_AC", "TYPEC", "TYPEC_UCSI", "UCSI_ACPI", "THUNDERBOLT", "USB4",
+  # Touchpad & Inputs
+  "HID_MULTITOUCH", "I2C_HID_ACPI",
+  # Intel Wi-Fi & Bluetooth
+  "IWLWIFI", "IWLMVM", "BT_HCIBTUSB", "BT_INTEL",
+  # ASUS Laptop Hotkeys, Backlight & Fan Control
+  "ASUS_WMI", "ASUS_NB_WMI",
+  # VPN Support
+  "WIREGUARD", "TUN"
 ]
 localyesconfig = false
 sig_force = false
@@ -271,6 +276,6 @@ acs_override = false
 [verify]
 strict = true                   # Fail build (exit 4) if any required symbol is dropped
 optional_symbols = []
-require_ntsync = false
+require_ntsync = true
 require_btf = true              # Asserts BTF presence for sched_ext
 require_sched_ext = true        # Asserts CONFIG_SCHED_CLASS_EXT presence
