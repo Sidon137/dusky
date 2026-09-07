@@ -1197,7 +1197,7 @@ icon = "preferences-system-power-symbolic"
 style = "suggested"
 [pages.layout.items.on_press]
 type = "exec"
-command = "kitty --class dusky_power.sh --title \"Power Manager\" --hold sh -c \"$HOME/user_scripts/power/dusky_power.sh\""
+command = "kitty --class dusky_tui --title \"Power Manager\" --hold python3 $HOME/user_scripts/power/tui_power.py"
 
 [[pages.layout]]
 type = "section"

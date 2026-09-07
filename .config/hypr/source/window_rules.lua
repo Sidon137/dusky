@@ -933,14 +933,6 @@ hl.window_rule({
     size = {979, 642}
 })
 
---- dusky_power.sh script ---
-hl.window_rule({
-    name = "dusky_power.sh",
-    match = { class = "^(dusky_power.sh)$" },
-    float = true,
-    size = {790, 530},
-    center = true
-})
 
 --- dusky_battery_tui.sh ---
 hl.window_rule({

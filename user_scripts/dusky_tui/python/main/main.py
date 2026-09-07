@@ -632,6 +632,10 @@ EXAMPLES:
             from python.engines.dns_systemd import SystemdDnsEngine
             return SystemdDnsEngine(config_path=config_path)
 
+        elif e_type in ("systemd_power", "systemd_logind", "power_engine"):
+            from python.engines.systemd_power import SystemdPowerEngine
+            return SystemdPowerEngine(config_path=config_path)
+
         elif e_type == "starship":
             from python.engines.starship import StarshipEngine
             return StarshipEngine(config_path=config_path)
@@ -643,7 +647,7 @@ EXAMPLES:
         else:
             print(f"[-] Fatal: Unknown ENGINE_TYPE '{e_type}' specified in schema '{schema_path.name}'.")
             print(
-                "[i] Supported engines are: 'lua', 'ini', 'bridged_ini', 'systemd', 'systemd_dns', 'hyprlang', "
+                "[i] Supported engines are: 'lua', 'ini', 'bridged_ini', 'systemd', 'systemd_dns', 'systemd_power', 'hyprlang', "
                 "'trackpad', 'monitor', 'cmdline', 'systemd_boot', 'flatdotconfig', 'env', "
                 "'waybar', 'network', 'pkg_throttle', 'cpu_core', 'fstab', 'shell_fallback', 'json', "
                 "'dusky_sites', 'locale_gen', 'matugen', 'fontconfig', 'toml', 'kokoro', 'starship', 'hyprlock'"

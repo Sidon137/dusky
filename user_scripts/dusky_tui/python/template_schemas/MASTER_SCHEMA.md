@@ -205,6 +205,7 @@ network engine's status/speed-test/hotspot tabs).
 | `systemd_dns` | [engines/systemd_dns.md](./engines/systemd_dns.md) | `SystemdDnsEngine` | `/etc/systemd/resolved.conf.d/99-dns-tui.conf` | fixed `[Resolve]` keys |
 | `starship` | [engines/starship.md](./engines/starship.md) | `StarshipEngine` | `~/.config/starship.toml` | scope ignored; keys `active_prompt` (preset selector), `custom_prompt_name` (string), `action_save_custom` (trigger) — atomic whole-file TOML swap, hash-matched state file |
 | `hyprlock` | [engines/hyprlock.md](./engines/hyprlock.md) | `HyprlockEngine` | `~/.config/hypr/hyprlock.conf` | scope ignored; keys `hyprlock`/`active_theme_number` (int), `active_theme_folder` (str), `active_theme_name` (str), `toggle_forward`/`toggle_backward` (triggers) |
+| `systemd_power` | [engines/systemd_power.md](./engines/systemd_power.md) | `SystemdPowerEngine` | `/etc/systemd/logind.conf.d/99-power.conf` | scope `Login`; systemd-logind drop-in with base bridging, defaults virtualization, daemon reload |
 
 > `engines/rich_speedtest.py` is **not** an engine — it is a Rich-based speed
 > test UI helper invoked by the `network` engine.
