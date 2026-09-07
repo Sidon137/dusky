@@ -4420,8 +4420,8 @@ def _ops_storage(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     wanted = set(f.filesystems) | set(st["extra_filesystems"])
     for fstype in sorted(wanted):
         for sym in FS_SYMBOLS.get(fstype, ()):
-            if fstype == f.root_fs:
-                mx.y(sym, why=f"root filesystem {fstype}")
+            if fstype in (f.root_fs, "vfat"):
+                mx.y(sym, why=f"boot/root filesystem {fstype} must be built-in")
             elif sym.endswith(("_POSIX_ACL", "_SECURITY", "_UTF8", "NLS_CODEPAGE_437", "NLS_ISO8859_1", "LZX_XPRESS", "NFS_V4")):
                 mx.y(sym)
             else:
@@ -5023,6 +5023,18 @@ def write_bls_entries(p: KernelProfile, facts: HostFacts, d: Derived) -> None:
         files[entries_dir / f"{p.pkgbase}{suffix}.conf"] = ("\n".join(body) + "\n", "0644")
     PRIV.write_files(files)
     ok(f"systemd-boot entries written: {', '.join(f.name for f in files)}")
+
+    # Update loader.conf directly so systemd-boot defaults to this entry
+    loader_conf = Path(root) / "loader" / "loader.conf"
+    if loader_conf.is_file():
+        txt = loader_conf.read_text(encoding="utf-8")
+        if re.search(r"^default\s+", txt, re.M):
+            new_txt = re.sub(r"^default\s+.*$", f"default {p.pkgbase}.conf", txt, flags=re.M)
+        else:
+            new_txt = f"default {p.pkgbase}.conf\n" + txt
+        PRIV.write_files({loader_conf: (new_txt, "0644")})
+        ok(f"Updated {loader_conf} default -> {p.pkgbase}.conf")
+
     if have("bootctl"):
         PRIV.run(["bootctl", "set-default", f"{p.pkgbase}.conf"], check=False)
         ok(f"systemd-boot default entry set to {p.pkgbase}.conf")
