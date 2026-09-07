@@ -68,7 +68,7 @@ hostname = ""
 user = ""
 reproducible = true
 seed = "auto"
-extra_config = { PM_GENERIC_DOMAINS = true, PM_GENERIC_DOMAINS_SLEEP = true, VFIO_DEVICE_CDEV = true, VFIO_GROUP = true, VFIO_CONTAINER = true, VFIO_VIRQFD = true, VFIO_PCI_INTX = true, VFIO_PCI_VGA = true, VFIO_PCI_IGD = true, VFIO_PCI_DMABUF = true, IOMMUFD_DRIVER = true, IOMMUFD_DRIVER_CORE = true }
+extra_config = { VFIO_DEVICE_CDEV = true, VFIO_GROUP = true, VFIO_CONTAINER = true, VFIO_VIRQFD = true, VFIO_PCI_INTX = true, VFIO_PCI_VGA = true, VFIO_PCI_IGD = true, VFIO_PCI_DMABUF = true, IOMMUFD_DRIVER = true, IOMMUFD_DRIVER_CORE = true }
 
 
 # ==============================================================================
@@ -257,7 +257,7 @@ keep_symbols = [
   # NVIDIA dGPU RTD3 (i2c helper for nouveau/pm, never auto-captured with proprietary driver)
   "I2C_NVIDIA_GPU",
   # VFIO GPU passthrough (tristate only here, bools live in dusky.extra_config)
-  "VFIO", "VFIO_PCI", "VFIO_PCI_CORE", "VFIO_IOMMU_TYPE1", "VFIO_MDEV", "IOMMUFD"
+  "VFIO", "VFIO_PCI", "VFIO_PCI_CORE", "VFIO_IOMMU_TYPE1", "IOMMUFD"
 ]
 localyesconfig = false
 sig_force = false
