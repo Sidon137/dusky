@@ -1,0 +1,276 @@
+# Dusky Kernel Compiler v6.1.0 — General Mobile Battery Profile
+# Target: Modern Laptops (AMD Ryzen 6000-8000/AI 300, Intel 12th-14th Gen / Core Ultra)
+# Philosophy: Maximize package C-state residency, batch wakeups, minimize timer ticks.
+
+# ==============================================================================
+# [meta] — Profile Identity
+# ==============================================================================
+[meta]
+name = "battery_general"
+description = "General mobile battery profile: 300 Hz, PREEMPT_LAZY, TEO, RCU_LAZY, powersave EPP"
+suffix = "dusky-battery"
+priority = 60
+tags = ["laptop", "battery", "mobile", "efficiency"]
+bare_metal_only = true          # Strips hypervisor overhead; fine for a physical laptop
+portable_package = false        # Allows native CPU instruction optimization on this PC
+
+
+# ==============================================================================
+# [release] — Upstream Branch & Integrity
+# ==============================================================================
+[release]
+channel = "stable"              # Track stable 7.2.y releases for daily reliability
+pin = ""
+allow_rc = false                # Laptops need reliability; avoid pre-release RCs
+min_version = "7.2"
+require_signature = true        # Verify PGP signatures with kernel.org release keys
+
+
+# ==============================================================================
+# [scheduler] — CPU Scheduling & Dynamic Schedulers
+# ==============================================================================
+[scheduler]
+type = "eevdf"                  # Upstream fair scheduler (most predictable power behavior)
+scx = "scx_lavd"                # Latency-criticality aware scheduler (great on mobile)
+scx_flags = "--autopower"       # Energy-conscious autopilot flag for scx_lavd
+scx_enable_class = true         # Compiles in-tree sched_ext support (CONFIG_SCHED_CLASS_EXT)
+require_patch = false
+allow_vanilla_fallback = true
+autogroup = true                # Per-session desktop task isolation
+rt_group = false                # Prevents starvation of PipeWire/audio RT threads
+sched_core = false              # Disable SMT core scheduling overhead on trusted personal laptops
+patch_sources = ["cachyos", "upstream_author", "tkg"]
+
+
+# ==============================================================================
+# [cache] — Cache-Aware Scheduling (CAS)
+# ==============================================================================
+[cache]
+sched_cache = true              # Preserves core-to-L3 affinity
+llc_aggr_tolerance = 1          # Conservative aggregation threshold
+llc_aggr_cap = -1
+
+
+# ==============================================================================
+# [rseq] — Restartable Sequences
+# ==============================================================================
+[rseq]
+slice_extension = true          # Avoids convoy stalls when preempted in critical sections
+slice_ext_nsec = 10000          # 10us quantum extension
+
+
+# ==============================================================================
+# [dusky] — Enhancement Patches & Kconfig Overrides
+# ==============================================================================
+[dusky]
+enhanced = true                 # Desktop optimizations & faster framebuffer takeover
+patch_sched_inline = true       # Inlines context switch functions (cuts cycle overhead)
+patch_evdev_rcu = true          # Asynchronous evdev detach (eliminates device close delays)
+patch_pci_pme = true            # Clear Linux 4000ms PCI PME polling (reduces idle wakeups)
+hostname = ""
+user = ""
+reproducible = true
+seed = "auto"
+extra_config = {}
+
+
+# ==============================================================================
+# [cpu] — P-States, Governors & Mitigations
+# ==============================================================================
+[cpu]
+arch = "native"                 # Optimize specifically for your laptop's CPU pipeline
+march = ""
+governor = "powersave"          # Autonomous hardware EPP driver default governor
+amd_pstate = "active"           # CPPC v2 autonomous EPP mode (Zen 2+)
+epp = "balance_power"           # EPP 192: balanced efficiency bias (can drop to "power" on battery)
+mitigations = "on"              # Laptops use public Wi-Fi; keep speculative mitigations enabled
+nr_cpus = 0                     # Automatically size per-CPU structures to physical thread count
+smt = true                      # Keep Hyper-Threading/SMT active
+mce = true                      # Machine Check Exception reporting
+prefcore = true                 # AMD Preferred Core / Intel ITMT core ranking
+compat32 = true                 # Keep 32-bit IA32 emulation active for Steam/Wine
+
+
+# ==============================================================================
+# [timing] — Clock Cadence & Preemption
+# ==============================================================================
+[timing]
+# 300 Hz provides clean harmonics with 30/60/120 Hz screen refreshes and cuts
+# timer interrupts by 70% compared to 1000 Hz, while bounding lazy preemption to <= 3.3ms.
+hz = 300
+tickless = "idle"               # NO_HZ_IDLE: stops the scheduler tick on idle cores
+preempt = "lazy"                # PREEMPT_LAZY: high responsiveness with low switch frequency
+preempt_dynamic = true          # Permits dynamic testing via preempt= boot parameter
+
+
+# ==============================================================================
+# [memory] — Paging, Reclaim, Compressed Swap & Footprint
+# ==============================================================================
+[memory]
+footprint = "lean"              # Drops legacy tracing/debug overhead; ideal for 8-16 GB laptops
+thp = "madvise"                 # THP only where applications ask (prevents memory bloat)
+thp_defrag = "defer"            # Background khugepaged compaction (prevents direct reclaim stalls)
+thp_shmem = "never"
+mglru = true                    # Multi-Gen LRU: generational page aging
+mglru_mask = 7
+mglru_min_ttl_ms = 1000         # Anti-thrashing protection
+swap_backend = "zram"           # Compressed RAM swap (avoids battery-draining disk I/O)
+zram_algo = "zstd"              # High-ratio compression (~3:1)
+zram_recomp_algo = "zstd"       # Idle page recompression algorithm
+zram_size_pct = 100             # 100% of physical RAM capacity
+zram_multi_comp = true          # Enables access tracking (CONFIG_ZRAM_TRACK_ENTRY_ACTIME)
+zswap_compressor = "zstd"
+zswap_max_pool_pct = 25
+swappiness = 180                # Recommends swapping anonymous pages to ZRAM before dropping cache
+vfs_cache_pressure = 100
+watermark_scale_factor = 125
+watermark_boost_factor = 0      # Disables erratic fragmentation boosts
+compaction_proactiveness = 0
+dirty_bytes_mb = 128            # Flushes dirty pages in small bursts
+slub_tiny = false               # Keep standard SLUB allocator for SMP core scaling
+slab_buckets = false
+per_vma_lock = true             # Concurrent RCU page faults
+numa = false                    # Single-socket mobile silicon does not need NUMA overhead
+numa_balancing = false
+nodes_shift = 0
+ksm = false                     # KSM scanning consumes unnecessary CPU on laptops
+ksm_run = false
+damon = false
+page_reporting = false
+hugetlbfs = false               # Strip unused static hugepages on mobile
+kallsyms_all = false            # Saves ~1-2 MB by dropping data symbols
+memcg = true                    # Required by systemd
+base_small = false
+log_buf_shift = 16              # 64 KB ring buffer (balanced for mobile)
+tracing = "auto"                # BPF tracing enabled when sched_ext daemon is active
+kexec = false                   # Strip unused kexec crash dump machinery
+ikconfig = true                 # Keeps /proc/config.gz available for auditing
+trim_unused_ksyms = false       # Keep false so DKMS modules continue to link
+dead_code_elimination = false
+
+
+# ==============================================================================
+# [compiler] — LLVM Toolchain, ThinLTO & Caching
+# ==============================================================================
+[compiler]
+toolchain = "llvm"              # Clang/LLD
+optimize = "o2"                 # Standard performance optimization
+polly = false
+lto = "thin"                    # ThinLTO gives cross-module optimization without huge link memory
+thinlto_cache = true            # Persistent bitcode cache for fast rebuilds
+thinlto_cache_size_gb = 20
+fdo = "none"
+fdo_profile_dir = ""
+kcfi = false                    # Keep false to avoid conflicts with out-of-tree modules
+debug_info = "reduced"          # DWARF5 + BTF generation (required for sched_ext)
+module_compress = "zstd"        # Fast decompression at modprobe time
+rust = false                    # Required: BTF (sched_ext) + LTO excludes in-kernel Rust
+jobs = 0                        # Auto-detect parallel jobs from cores and RAM
+headers = "auto"                # Builds linux-headers only if DKMS modules are installed
+modversions = false
+
+
+# ==============================================================================
+# [security] — Hardening Profile
+# ==============================================================================
+[security]
+profile = "balanced"            # Standard Arch Linux security posture
+init_on_alloc = true            # Zero memory on allocation (infoleak prevention)
+init_on_free = false            # Zero on free costs 3-10% CPU; keep false on battery
+hardened_usercopy = true
+stackprotector = "strong"
+slab_freelist_hardened = true
+slab_freelist_random = true
+randomize_kstack = true
+ubsan_bounds = true
+apparmor = false
+selinux = false
+lockdown_early = false
+acknowledge_risk = false
+
+
+# ==============================================================================
+# [gaming] — Gaming Interoperability
+# ==============================================================================
+[gaming]
+ntsync = true                   # Keep NTSync compiled (doesn't hurt battery when unused)
+uclamp = false                  # Inert under autonomous P-States; avoid bookkeeping
+max_map_count = 1048576         # Safe default for Wine/Proton games
+split_lock_mitigate = true      # Keep protection against misbehaving split-lock code
+controllers = true              # Retain gamepads/input drivers in case you plug one in
+
+
+# ==============================================================================
+# [storage] — Block Layer & Filesystems
+# ==============================================================================
+[storage]
+nvme_poll_queues = 0            # NVMe polling wastes continuous CPU; keep off on battery
+io_scheduler = "none"           # Hardware NVMe queues handle scheduling
+blk_wbt = true                  # Writeback throttling prevents desktop freezes
+iocost = false
+extra_filesystems = ["btrfs", "ext4", "vfat", "exfat", "ntfs3"]
+
+
+# ==============================================================================
+# [power] — Idle Governors, RCU & PCIe Power
+# ==============================================================================
+[power]
+wq_power_efficient = true       # Routes workqueues to already-awake cores
+cpu_idle_governor = "teo"       # Timer Events Oriented idle governor (best for tickless)
+rcu_lazy = true                 # Batches non-urgent RCU callbacks for up to 10s
+energy_model = false            # Inert on symmetric x86
+suspend = true                  # System suspend-to-RAM / s2idle
+hibernation = false             # Disabled: pure ZRAM swap cannot store a hibernation image
+pcie_aspm = "powersave"         # Aggressive PCIe ASPM (L1 substates); safe baseline
+hda_power_save = 5              # Power down HD audio codec after 5 seconds of silence
+
+
+# ==============================================================================
+# [network] — Congestion Control & Pacing
+# ==============================================================================
+[network]
+congestion = "bbr"              # Model-based TCP; handles lossy Wi-Fi connections best
+qdisc = "fq_codel"              # Standard queue discipline for general client links
+mptcp = true
+xdp = false
+nf_conntrack_procfs = false
+tcp_fastopen = true             # Saves an RTT on repeat HTTP/TLS connections
+
+
+# ==============================================================================
+# [modules] — Hardware Pruning & Module Census
+# ==============================================================================
+[modules]
+mode = "strict"                 # Build only drivers captured in modprobed.db
+modprobed_db = true             # Read ~/.config/modprobed.db
+modprobed_db_path = ""
+allow_lsmod_fallback = false
+lmc_keep_extra = ["drivers/input", "drivers/hid", "sound/pci"]
+keep_symbols = [
+  "THUNDERBOLT", "USB4", "HID_MULTITOUCH", "IWLWIFI", "BT_HCIBTUSB",
+  "ACPI_BATTERY", "ACPI_AC", "TYPEC", "UCSI_ACPI"
+]
+localyesconfig = false
+sig_force = false
+
+
+# ==============================================================================
+# [boot] — Command Line Delivery & Bootloader
+# ==============================================================================
+[boot]
+cmdline = "bake"                # Bake flavor parameters into CONFIG_CMDLINE
+cmdline_extra = ""              # Add resume=UUID=... here if configuring disk hibernation
+write_entries = true            # Automatically write systemd-boot entries
+nowatchdog = true               # Removes NMI/soft watchdog timer ticks (saves CPU wakeups)
+acs_override = false
+
+
+# ==============================================================================
+# [verify] — Invariant Contract Enforcement
+# ==============================================================================
+[verify]
+strict = true                   # Fail build (exit 4) if any required symbol is dropped
+optional_symbols = []
+require_ntsync = false
+require_btf = true              # Asserts BTF presence for sched_ext
+require_sched_ext = true        # Asserts CONFIG_SCHED_CLASS_EXT presence
