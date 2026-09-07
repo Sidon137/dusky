@@ -264,7 +264,7 @@ sig_force = false
 # ==============================================================================
 [boot]
 cmdline = "bake"                # Bake flavor parameters into CONFIG_CMDLINE
-cmdline_extra = ""              # Add resume=UUID=... here if configuring disk hibernation
+cmdline_extra = "pcie_aspm=force"              # Force ASPM despite FADT claiming unsupported (ASUS TUF needs this)
 write_entries = true            # Automatically write systemd-boot entries
 nowatchdog = true               # Removes NMI/soft watchdog timer ticks (saves CPU wakeups)
 acs_override = false
