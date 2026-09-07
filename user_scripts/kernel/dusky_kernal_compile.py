@@ -2519,10 +2519,10 @@ def is_valid_kernel_tree(p: Path) -> bool:
 
 def tree_version(tree: Path) -> str:
     mf = _read(tree / "Makefile")
-    v = re.search(r"^VERSION\s*=\s*(\d+)", mf, re.M)
-    pl = re.search(r"^PATCHLEVEL\s*=\s*(\d+)", mf, re.M)
-    sl = re.search(r"^SUBLEVEL\s*=\s*(\d+)", mf, re.M)
-    extra = re.search(r"^EXTRAVERSION\s*=\s*(\S*)", mf, re.M)
+    v = re.search(r"^[ \t]*VERSION[ \t]*=[ \t]*(\d+)", mf, re.M)
+    pl = re.search(r"^[ \t]*PATCHLEVEL[ \t]*=[ \t]*(\d+)", mf, re.M)
+    sl = re.search(r"^[ \t]*SUBLEVEL[ \t]*=[ \t]*(\d+)", mf, re.M)
+    extra = re.search(r"^[ \t]*EXTRAVERSION[ \t]*=[ \t]*(\S*)", mf, re.M)
     if not (v and pl):
         return "unknown"
     res = f"{v.group(1)}.{pl.group(1)}"
@@ -4110,7 +4110,7 @@ def _ops_memory(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     thp = m["thp"]
     mx.y("TRANSPARENT_HUGEPAGE")
     mx.choice(("TRANSPARENT_HUGEPAGE_ALWAYS", "TRANSPARENT_HUGEPAGE_MADVISE", "TRANSPARENT_HUGEPAGE_NEVER"), f"TRANSPARENT_HUGEPAGE_{thp.upper()}", why=f"thp={thp}")
-    mx.flag("THP_SWAP", thp != "never")
+    mx.flag("THP_SWAP", thp != "never", optional=True, why="def_bool y in Kconfig when THP and SWAP are enabled")
     mx.flag("READ_ONLY_THP_FOR_FS", thp != "never" and not lean)
     mx.flag("HUGETLBFS", m["hugetlbfs"])
     mx.flag("HUGETLB_PAGE", m["hugetlbfs"])
@@ -4201,7 +4201,8 @@ def _ops_memory(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     mx.flag("BASE_SMALL", m["base_small"])
     mx.flag("BASE_FULL", not m["base_small"])
     mx.flag("KEXEC", m["kexec"])
-    mx.flag("KEXEC_FILE", m["kexec"])
+    mx.flag("KEXEC_FILE", m["kexec"], optional=True)
+    mx.flag("KEXEC_HANDOVER", m["kexec"], optional=True, why="selects KEXEC_FILE in Linux 7.2+")
     mx.flag("CRASH_DUMP", m["kexec"] and not lean)
     mx.flag("PROC_VMCORE", m["kexec"] and not lean)
     mx.flag("PROC_KCORE", not lean)
