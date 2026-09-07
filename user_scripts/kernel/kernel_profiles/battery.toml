@@ -28,8 +28,8 @@ require_signature = true        # Verify PGP signatures with kernel.org release 
 # ==============================================================================
 [scheduler]
 type = "eevdf"                  # Upstream fair scheduler (most predictable power behavior)
-scx = "scx_lavd"                # Latency-criticality aware scheduler (great on mobile)
-scx_flags = "--autopower"       # Energy-conscious autopilot flag for scx_lavd
+scx = "none"                    # Disabled: scx 1.1.3 crashes on 7.2.4 and wakes dGPU every 2s
+scx_flags = ""                  # No daemon until scx updates past 1.1.3
 scx_enable_class = true         # Compiles in-tree sched_ext support (CONFIG_SCHED_CLASS_EXT)
 require_patch = false
 allow_vanilla_fallback = true
@@ -242,7 +242,7 @@ mode = "strict"                 # Build only drivers captured in modprobed.db
 modprobed_db = true             # Read ~/.config/modprobed.db
 modprobed_db_path = ""
 allow_lsmod_fallback = false
-lmc_keep_extra = ["drivers/input", "drivers/hid", "sound/pci", "drivers/vfio", "drivers/i2c/busses"]
+lmc_keep_extra = ["drivers/input", "drivers/hid", "sound/pci", "drivers/vfio"]
 keep_symbols = [
   # Laptop Battery, Power & USB-C Docking
   "ACPI_BATTERY", "ACPI_AC", "TYPEC", "TYPEC_UCSI", "UCSI_ACPI", "THUNDERBOLT", "USB4",
@@ -254,8 +254,6 @@ keep_symbols = [
   "ASUS_WMI", "ASUS_NB_WMI",
   # VPN Support
   "WIREGUARD", "TUN",
-  # NVIDIA dGPU RTD3 (i2c helper for nouveau/pm, never auto-captured with proprietary driver)
-  "I2C_NVIDIA_GPU",
   # VFIO GPU passthrough (tristate only here, bools live in dusky.extra_config)
   "VFIO", "VFIO_PCI", "VFIO_PCI_CORE", "VFIO_IOMMU_TYPE1", "IOMMUFD"
 ]
