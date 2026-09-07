@@ -7,11 +7,10 @@ matugen theme switch (wired via '[templates.dusky_cursor]' post_hook).
 
 Color model (mirrors Bibata's own variant system, cf. ful1e5/bibata
 'COLORS' - Amber is orange *fill* + white outline): the matugen accent
-becomes the cursor *fill*, with a mode-aware outline (white on dark, black
-on light - Classic / Ice precedent):
+becomes the cursor *fill*, with a fixed black outline:
 
   regular shapes : dark pixels  -> ACCENT   (base fill)
-                   light pixels -> OUTLINE  (mode-aware)
+                   light pixels -> OUTLINE  (always black)
   spinner shapes : dark pixels  -> WATCH_BG (matugen background)
   saturated pixels (watch hands) are copied byte-exact, never touched.
 
@@ -103,7 +102,7 @@ DEFAULT_SOURCE_THEME = "Bibata-Modern-Classic"  # --source / $DUSKY_CURSOR_SOURC
 # silently shadow every Dusky pixel. Dusky mirrors every source entry, so
 # hicolor is the only sane last resort.
 THEME_INHERITS = "hicolor"
-FINGERPRINT_VERSION = 4
+FINGERPRINT_VERSION = 5
 FINGERPRINT_NAME = ".dusky-fingerprint.json"
 SPINNER_SHAPES = frozenset({"wait", "left_ptr_watch"})
 # Chroma threshold in premultiplied space: (max-min) <= max(0.30*max, 1 LSB).
@@ -301,7 +300,7 @@ class Palette:
 
     @property
     def outline(self) -> str:
-        return "#ffffff" if self.mode is Mode.DARK else "#000000"
+        return "#000000"
 
 
 def valid_hex(value: object) -> str | None:
@@ -606,7 +605,7 @@ def fingerprint_matches(stored: dict[str, object], want: dict[str, object]) -> b
 def theme_meta(pal: Palette, source_name: str) -> tuple[str, str]:
     index = ("[Icon Theme]\n"
              f"Name={THEME_NAME}\n"
-             f"Comment=Dusky Cursors - matugen accent {pal.accent}, {pal.mode} outline "
+             f"Comment=Dusky Cursors - matugen accent {pal.accent}, black outline "
              f"(recolored {source_name})\n"
              f"Inherits={THEME_INHERITS}\n")
     cursor = f"[Icon Theme]\nName={THEME_NAME}\nInherits={THEME_NAME}\n"
