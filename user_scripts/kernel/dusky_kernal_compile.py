@@ -73,6 +73,7 @@ SCRIPT_DIR: Final = Path(__file__).resolve().parent
 XDG_CONFIG: Final = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
 XDG_CACHE: Final = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
 XDG_STATE: Final = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+XDG_DATA: Final = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
 PROFILES_DIR: Final = Path(os.environ.get("DUSKY_PROFILES_DIR") or SCRIPT_DIR / "kernel_profiles")
 USER_PROFILES_DIR: Final = XDG_CONFIG / "dusky-kernel" / "kernel_profiles"
 CONFIG_SNAPSHOT_DIR: Final = XDG_CONFIG / "dusky-kernel" / "configs"
@@ -113,6 +114,204 @@ def set_build_dir(new_path: Path | str) -> None:
 LOG_DIR: Final = STATE_DIR / "logs"
 HISTORY_FILE: Final = STATE_DIR / "history.json"
 MODPROBED_DB_PATH: Final = XDG_CONFIG / "modprobed.db"
+# Canonical upstream location for modprobed-db v2.50+ (XDG_DATA_HOME aware).
+# Older guides / this script's legacy default used ~/.config/modprobed.db.
+MODPROBED_DB_CANONICAL: Final = XDG_DATA / "modprobed-db" / "modprobed.db"
+
+
+def _modprobed_db_from_conf() -> Path | None:
+    """Read configured DBPATH from modprobed-db.conf if present."""
+    for conf in (XDG_CONFIG / "modprobed-db" / "modprobed-db.conf", XDG_CONFIG / "modprobed-db.conf"):
+        try:
+            if conf.is_file():
+                for raw_line in conf.read_text(encoding="utf-8", errors="replace").splitlines():
+                    clean = raw_line.split("#", 1)[0].strip()
+                    m = re.match(r'^DBPATH=["\']?([^"\']+)["\']?', clean)
+                    if m:
+                        val = m.group(1).strip()
+                        if val:
+                            return Path(val).expanduser() / "modprobed.db"
+        except OSError:
+            pass
+    return None
+
+
+def modprobed_db_candidates() -> tuple[Path, ...]:
+    """Ordered search list for the modprobed.db database (env override first).
+
+    Order: $DUSKY_MODPROBED_DB > modprobed-db.conf DBPATH > canonical XDG_DATA
+    location > legacy ~/.config location. Callers should use resolve_modprobed_db()
+    instead of hard-coding MODPROBED_DB_PATH.
+    """
+    cands: list[Path] = []
+    env = os.environ.get("DUSKY_MODPROBED_DB")
+    if env:
+        cands.append(Path(env).expanduser())
+    conf_db = _modprobed_db_from_conf()
+    if conf_db and conf_db not in cands:
+        cands.append(conf_db)
+    if MODPROBED_DB_CANONICAL not in cands:
+        cands.append(MODPROBED_DB_CANONICAL)
+    if MODPROBED_DB_PATH not in cands:
+        cands.append(MODPROBED_DB_PATH)
+    return tuple(cands)
+
+
+def _is_usable_db(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _extract_module_name(line: str) -> str | None:
+    """Extract a kernel module name from one db/lsmod line, or None if not a module.
+
+    Accepts both formats: single-token modprobed.db lines ("nvidia") and
+    lsmod rows ("nvidia 12345 1 ..."). Rejects the lsmod header wherever it
+    appears, comments/blank lines, and garbage multi-token lines whose second
+    field is not numeric (so "bad name ..." never becomes a bogus "bad").
+    Dashes are normalized to underscores (kernel canonical form).
+    """
+    s = line.split("#", 1)[0].strip()
+    if not s:
+        return None
+    if s.startswith("Module") and "Size" in s:
+        return None  # lsmod header, wherever it appears
+    parts = s.split()
+    first = parts[0].replace("-", "_")
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", first):
+        return None
+    if len(parts) > 1:
+        # lsmod-style row: second field must be the numeric size.
+        if not parts[1].isdigit():
+            return None
+    return first
+
+
+def count_db_modules(path: Path) -> int:
+    """Count usable module entries, tolerating both db and lsmod formats."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return 0
+    seen: set[str] = set()
+    for line in text.splitlines():
+        mod = _extract_module_name(line)
+        if mod is not None:
+            seen.add(mod)
+    return len(seen)
+
+
+def resolve_modprobed_db(custom: str | None = None) -> Path | None:
+    """Resolve the modprobed.db to use.
+
+    Precedence: explicit profile path > $DUSKY_MODPROBED_DB > auto-discovery.
+    Explicit paths are authoritative (returned as-is when they contain at
+    least one valid module, else None so callers fall back instead of
+    pruning against an empty set). Auto-discovery scans candidate locations
+    and prefers the one with the most entries (newest mtime breaks ties)
+    so a stale legacy copy never shadows a fresh canonical DB. Files with
+    zero valid modules are ignored everywhere.
+    """
+    def _usable_with_modules(p: Path) -> Path | None:
+        try:
+            r = p.resolve() if p.exists() else p
+        except (OSError, RuntimeError):
+            r = p
+        for cand in (r, p):
+            try:
+                if cand.is_file() and cand.stat().st_size > 0 and count_db_modules(cand) > 0:
+                    return r
+            except (OSError, RuntimeError):
+                continue
+        return None
+    if custom:
+        p = Path(custom).expanduser()
+        return _usable_with_modules(p)
+    env = os.environ.get("DUSKY_MODPROBED_DB")
+    if env:
+        r = _usable_with_modules(Path(env).expanduser())
+        if r is not None:
+            return r
+        debug(f"$DUSKY_MODPROBED_DB={env} is not usable; falling back to auto-discovery")
+    best: Path | None = None
+    best_key: tuple[int, float] = (-1, -1.0)
+    for cand in modprobed_db_candidates():
+        try:
+            resolved = cand.resolve() if cand.is_symlink() else cand
+        except (OSError, RuntimeError):
+            resolved = cand
+        if not _is_usable_db(resolved):
+            continue
+        try:
+            count = count_db_modules(resolved)
+        except (OSError, RuntimeError):
+            continue
+        if count <= 0:
+            continue
+        try:
+            key = (count, resolved.stat().st_mtime)
+        except (OSError, RuntimeError):
+            key = (count, 0.0)
+        if key > best_key:
+            best_key = key
+            best = resolved
+    return best
+
+
+def ensure_modprobed_compat_link() -> None:
+    """Best-effort legacy symlink: ~/.config/modprobed.db -> canonical DB.
+
+    Keeps old tooling working. Never overwrites a real file; cleans up broken
+    symlinks and only creates the link when legacy is missing and canonical exists.
+    """
+    try:
+        if MODPROBED_DB_PATH.is_symlink() and not MODPROBED_DB_PATH.exists():
+            try:
+                MODPROBED_DB_PATH.unlink()
+            except OSError:
+                return
+        if MODPROBED_DB_PATH.exists():
+            return
+        canon: Path | None = None
+        for cand in (MODPROBED_DB_CANONICAL, _modprobed_db_from_conf()):
+            if cand and _is_usable_db(cand) and count_db_modules(cand) > 0:
+                canon = cand
+                break
+        if canon is None:
+            return
+        MODPROBED_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        MODPROBED_DB_PATH.symlink_to(canon)
+        debug(f"created compat symlink {MODPROBED_DB_PATH} -> {canon}")
+    except (OSError, RuntimeError) as e:
+        debug(f"compat symlink skipped: {e}")
+
+
+def normalize_lsmod_file_to_db(src: Path, dest: Path) -> int:
+    """Convert an lsmod-format listing to modprobed.db format (one name/line).
+
+    Returns the number of modules written. Used when importing bundles that
+    only contain lsmod.txt (copying it verbatim would leave the 'Module ...'
+    header in LSMOD, which streamline_config would treat as a bogus module).
+    """
+    try:
+        text = src.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return 0
+    names: set[str] = set()
+    for line in text.splitlines():
+        mod = _extract_module_name(line)
+        if mod is not None:
+            names.add(mod)
+    if not names:
+        return 0
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("\n".join(sorted(names)) + "\n", encoding="utf-8")
+    except OSError:
+        return 0
+    return len(names)
 KERNEL_ORG_RELEASES: Final = "https://www.kernel.org/releases.json"
 ARCH_UPSTREAM_CONFIG_URL: Final = "https://gitlab.archlinux.org/archlinux/packaging/packages/linux/-/raw/main/config"
 KERNEL_SIGNING_FPRS: Final = frozenset({
@@ -3641,25 +3840,28 @@ def ensure_modprobed_db(p: KernelProfile) -> Path | None:
     if not p.g("modules", "modprobed_db"):
         return None
     custom = p.g("modules", "modprobed_db_path")
-    db = Path(custom).expanduser().resolve() if custom else MODPROBED_DB_PATH
     if not custom and have("modprobed-db"):
         ensure_modprobed_db_service(prompt=False)
-    if db.is_file() and db.stat().st_size > 0:
-        count = len([line for line in _read(db).splitlines() if line.strip()])
-        ok(f"modprobed.db: {db} ({count} modules)")
-        if count < 40 and not custom:
-            warn("modprobed.db is small; use the system for a few days (USB devices, VPN, printers...) before trusting strict mode")
-        return db
+        ensure_modprobed_compat_link()
+    db = resolve_modprobed_db(custom if custom else None)
+    if db is not None:
+        count = count_db_modules(db)
+        if count > 0:
+            ok(f"modprobed.db: {db} ({count} modules)")
+            if count < 40 and not custom:
+                warn("modprobed.db is small; use the system for a few days (USB devices, VPN, printers...) before trusting strict mode")
+            return db
     if not custom:
         for fallback_db in (Path("/mnt/zram1/linux-tkg-master/linux-tkg-config/7.3/minimal-modprobed.db"),
                             Path("/mnt/zram1/linux-tkg-master/linux-tkg-config/7.2/minimal-modprobed.db")):
-            if fallback_db.is_file() and fallback_db.stat().st_size > 0:
-                count = len([line for line in _read(fallback_db).splitlines() if line.strip()])
+            if _is_usable_db(fallback_db):
+                count = count_db_modules(fallback_db)
                 ok(f"modprobed.db: using bundled fallback {fallback_db.name} ({count} modules)")
                 return fallback_db
-        warn("modprobed.db missing (install from AUR: paru -S modprobed-db; modprobed-db store)")
+        searched = ", ".join(str(c) for c in modprobed_db_candidates())
+        warn(f"modprobed.db missing (searched: {searched}; install from AUR: paru -S modprobed-db; modprobed-db store)")
     else:
-        warn(f"modprobed.db not found at {db}")
+        warn(f"modprobed.db not found at {Path(custom).expanduser()} (searched custom path only)")
     return None
 
 
@@ -3671,9 +3873,9 @@ def _generate_modprobed_db_from_lsmod() -> Path | None:
     """Best-effort LSMOD snapshot from the live lsmod set (strict fallback only).
 
     Writes a sorted, unique, validated snapshot to BUILD_DIR (never touches the
-    canonical ~/.config/modprobed.db owned by `modprobed-db store`). No comment
-    lines: streamline_config parses the first token of every line, so a `#`
-    line would become a bogus module. Point-in-time only: unloaded HW
+    canonical DB owned by `modprobed-db store`, see modprobed_db_candidates()).
+    No comment lines: streamline_config parses the first token of every line,
+    so a `#` line would become a bogus module. Point-in-time only: unloaded HW
     (USB/VPN/printer) is missing by definition.
     """
     if not have("lsmod"):
@@ -3685,16 +3887,9 @@ def _generate_modprobed_db_from_lsmod() -> Path | None:
     if cp.returncode != 0 or not cp.stdout:
         return None
     names: set[str] = set()
-    for i, line in enumerate(cp.stdout.splitlines()):
-        s = line.strip()
-        if not s:
-            continue
-        if i == 0 and s.startswith("Module"):
-            continue
-        if s.startswith("#"):
-            continue
-        mod = s.split()[0].strip().replace("-", "_")
-        if re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", mod):
+    for line in cp.stdout.splitlines():
+        mod = _extract_module_name(line)
+        if mod is not None:
             names.add(mod)
     if not names:
         return None
@@ -3713,13 +3908,17 @@ def localmodconfig(tree: Path, p: KernelProfile, db: Path | None, env: Mapping[s
     lm_env = dict(env)
     if db is not None:
         lm_env["LSMOD"] = str(db)
-    elif mode == "strict" and not p.g("modules", "allow_lsmod_fallback"):
+    elif mode == "strict" and p.g("modules", "allow_lsmod_fallback"):
         generated = _generate_modprobed_db_from_lsmod()
         if generated is not None:
             lm_env["LSMOD"] = str(generated)
             warn(f"modprobed.db missing; using point-in-time lsmod snapshot ({generated}) -- unloaded HW may be pruned; prefer expanded mode or a full modprobed.db")
         else:
-            raise ProfileError("strict pruning needs modprobed.db (none found; could not generate from lsmod either)")
+            searched = ", ".join(str(c) for c in modprobed_db_candidates())
+            raise ProfileError(f"strict pruning needs modprobed.db (searched: {searched}; could not generate from lsmod either)")
+    elif mode == "strict":
+        searched = ", ".join(str(c) for c in modprobed_db_candidates())
+        raise ProfileError(f"strict pruning needs modprobed.db (searched: {searched}; none found; set modules.allow_lsmod_fallback=true for a point-in-time lsmod snapshot or use mode=expanded)")
     else:
         warn("Pruning against the live lsmod set only (modules not currently loaded will be dropped)")
     if mode == "expanded":
@@ -5262,6 +5461,8 @@ def do_export_bundle(dest: Path | None) -> Path:
     out.parent.mkdir(parents=True, exist_ok=True)
     if have("modprobed-db"):
         run(["modprobed-db", "store"], check=False, timeout=60)
+        ensure_modprobed_compat_link()
+    db_src = resolve_modprobed_db()
     manifest = {"format": "dusky_bundle_v2", "hostname": hname, "created_at": datetime.now(UTC).isoformat(), "app_version": APP_VERSION,
                 "uarch": facts.uarch, "psabi_level": facts.psabi_level, "vendor": facts.vendor, "model": facts.model, "threads": facts.threads,
                 "mem_gib": round(facts.mem_gib, 2), "gpus": list(facts.gpus), "filesystems": list(facts.filesystems), "root_fs": facts.root_fs,
@@ -5271,8 +5472,15 @@ def do_export_bundle(dest: Path | None) -> Path:
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         (tmp / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-        if MODPROBED_DB_PATH.is_file():
-            MODPROBED_DB_PATH.copy(tmp / "modprobed.db")
+        if db_src is not None and _is_usable_db(db_src):
+            try:
+                shutil.copy2(db_src, tmp / "modprobed.db")
+            except OSError as e:
+                warn(f"could not stage modprobed.db ({db_src}): {e}")
+                db_src = None
+        if db_src is None:
+            searched = ", ".join(str(c) for c in modprobed_db_candidates())
+            warn(f"modprobed.db not found (searched: {searched}); bundle will contain lsmod.txt only -- run 'modprobed-db store' first")
         for src in (Path("/proc/cpuinfo"), Path("/proc/meminfo"), Path("/proc/cmdline")):
             (tmp / src.name).write_text(_read(src), encoding="utf-8")
         if have("lspci"):
@@ -5282,7 +5490,9 @@ def do_export_bundle(dest: Path | None) -> Path:
         with tarfile.open(out, "w:gz") as tar:
             for f in sorted(tmp.iterdir()):
                 tar.add(f, arcname=f.name)
-    ok(f"Exported {out} ({fmt_bytes(out.stat().st_size)}) -- uarch {facts.uarch or 'generic_v' + str(facts.psabi_level)}, {facts.threads} threads, {facts.mem_gib:.1f} GiB")
+    n = count_db_modules(db_src) if db_src else 0
+    detail = f", {n} modules from {db_src}" if db_src else " (no modprobed.db; lsmod.txt fallback only)"
+    ok(f"Exported {out} ({fmt_bytes(out.stat().st_size)}) -- uarch {facts.uarch or 'generic_v' + str(facts.psabi_level)}, {facts.threads} threads, {facts.mem_gib:.1f} GiB{detail}")
     return out
 
 
@@ -5303,12 +5513,16 @@ def do_import_bundle(src: Path) -> str:
         import_dir = IMPORT_DIR / hname
         import_dir.mkdir(parents=True, exist_ok=True)
         db_path = ""
-        if (tmp / "modprobed.db").is_file():
-            (tmp / "modprobed.db").copy(import_dir / "modprobed.db")
+        if (tmp / "modprobed.db").is_file() and count_db_modules(tmp / "modprobed.db") > 0:
+            shutil.copy2(tmp / "modprobed.db", import_dir / "modprobed.db")
             db_path = str(import_dir / "modprobed.db")
         elif (tmp / "lsmod.txt").is_file():
-            (tmp / "lsmod.txt").copy(import_dir / "modprobed.db")
-            db_path = str(import_dir / "modprobed.db")
+            n = normalize_lsmod_file_to_db(tmp / "lsmod.txt", import_dir / "modprobed.db")
+            if n > 0:
+                note(f"bundle had no modprobed.db; normalized lsmod.txt -> {n} modules (point-in-time only)")
+                db_path = str(import_dir / "modprobed.db")
+            else:
+                warn("bundle contained neither a usable modprobed.db nor a parseable lsmod.txt")
         (tmp / "manifest.json").copy(import_dir / "manifest.json")
     arch = manifest.get("uarch") or f"generic_v{int(manifest.get('psabi_level', 3))}"
     if arch not in CPU_ARCHES or arch == "native":
@@ -5576,9 +5790,14 @@ def do_doctor(args: argparse.Namespace) -> int:
     table(["tool", "subsystem", "status"], rows)
     rule("Paths")
     free = shutil.disk_usage(BUILD_DIR if BUILD_DIR.exists() else Path.home()).free
+    _db_resolved = resolve_modprobed_db()
+    if _db_resolved is not None:
+        _db_status = f"{_db_resolved} ({count_db_modules(_db_resolved)} modules)"
+    else:
+        _db_status = f"missing (searched: {', '.join(str(c) for c in modprobed_db_candidates())})"
     table(["path", "value"], [["profiles", ", ".join(str(d) for d in profile_dirs())], ["build dir", f"{BUILD_DIR} ({fmt_bytes(free)} free)"],
                               ["snapshots", str(CONFIG_SNAPSHOT_DIR)], ["ThinLTO cache", str(THINLTO_CACHE_DIR)], ["packages", str(PKGDEST_DIR)], ["logs", str(LOG_DIR)],
-                              ["modprobed.db", f"{MODPROBED_DB_PATH} ({'present' if MODPROBED_DB_PATH.is_file() else 'missing'})"]])
+                              ["modprobed.db", _db_status]])
     hist = load_history()
     if hist:
         rule("Recent builds")
@@ -5996,17 +6215,38 @@ def build_parser() -> argparse.ArgumentParser:
 # Interactive menu
 # ---------------------------------------------------------------------------------------------------
 def install_aur_package(pkg: str) -> bool:
-    """Install an AUR package using paru, yay, or direct makepkg without sudo."""
-    if have("paru"):
-        return run(["paru", "-S", "--needed", pkg], capture=False).returncode == 0
-    if have("yay"):
-        return run(["yay", "-S", "--needed", pkg], capture=False).returncode == 0
-    info(f"No AUR helper detected; building {pkg} directly from AUR via makepkg...")
-    with tempfile.TemporaryDirectory(prefix=f"aur-{pkg}-") as tmp:
-        clone = run(["git", "clone", f"https://aur.archlinux.org/{pkg}.git", str(tmp)], capture=False)
-        if clone.returncode != 0:
-            return False
-        return run(["makepkg", "-si", "--noconfirm", "--needed"], cwd=Path(tmp), capture=False).returncode == 0
+    """Install an AUR package using paru, yay, or direct makepkg without sudo.
+
+    Must stay interactive-capable: AUR helpers invoke sudo internally for the
+    install phase and prompt for PKGBUILD review / confirmation, so stdin must
+    stay attached and no new session may detach from the terminal (unlike the
+    non-interactive run() defaults). check=False so failures return False and
+    the caller can warn instead of crashing with BuildError.
+    """
+    # Non-interactive / -y runs cannot answer prompts: pass --noconfirm.
+    auto = ASSUME_YES or not interactive()
+    extra = ["--noconfirm"] if auto else []
+    # Skip PKGBUILD review only for fully automatic runs; interactive users
+    # keep the security review prompt.
+    review = ["--skipreview"] if auto else []
+    try:
+        if have("paru"):
+            return run(["paru", "-S", "--needed", *extra, *review, pkg],
+                       capture=False, stdin_null=False, own_group=False, check=False).returncode == 0
+        if have("yay"):
+            return run(["yay", "-S", "--needed", *extra, pkg],
+                       capture=False, stdin_null=False, own_group=False, check=False).returncode == 0
+        info(f"No AUR helper detected; building {pkg} directly from AUR via makepkg...")
+        with tempfile.TemporaryDirectory(prefix=f"aur-{pkg}-") as tmp:
+            clone = run(["git", "clone", f"https://aur.archlinux.org/{pkg}.git", str(tmp)],
+                        capture=False, stdin_null=False, own_group=False, check=False)
+            if clone.returncode != 0:
+                return False
+            return run(["makepkg", "-si", "--noconfirm", "--needed"], cwd=Path(tmp),
+                       capture=False, stdin_null=False, own_group=False, check=False).returncode == 0
+    except DuskyError as e:
+        debug(f"AUR install failed: {e}")
+        return False
 
 
 def initialize_toolchains() -> None:
@@ -6024,7 +6264,12 @@ def initialize_toolchains() -> None:
 
     if have("modprobed-db"):
         ensure_modprobed_db_service(prompt=True)
-        ok("modprobed-db storing loaded modules (keep using the machine before strict builds)")
+        ensure_modprobed_compat_link()
+        db = resolve_modprobed_db()
+        if db:
+            ok(f"modprobed-db active: {db} ({count_db_modules(db)} modules logged)")
+        else:
+            warn("modprobed.db not found yet; keep using the machine before strict builds")
 
 
 def live_telemetry() -> None:
@@ -6047,6 +6292,8 @@ def live_telemetry() -> None:
             ["MGLRU", _read("/sys/kernel/mm/lru_gen/enabled").strip() or "n/a"], ["preempt", _read("/sys/kernel/debug/sched/preempt").strip() or "n/a (debugfs)"]]
     for z in Path("/sys/block").glob("zram*"):
         rows.append([z.name, f"{_read(z / 'comp_algorithm').strip()} disksize {int(_read(z / 'disksize').strip() or 0) >> 20} MiB"])
+    db_telemetry = resolve_modprobed_db()
+    rows.append(["modprobed.db", f"{db_telemetry} ({count_db_modules(db_telemetry)} modules)" if db_telemetry else "missing (run modprobed-db store)"])
     table(["metric", "value"], rows)
 
 
