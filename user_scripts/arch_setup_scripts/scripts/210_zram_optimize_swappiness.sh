@@ -121,7 +121,7 @@ if [[ "$MODE" == "AGGRESSIVE" ]] || { [[ "$MODE" == "AUTO" ]] && (( SYSTEM_RAM_K
     EXPECTED_SCALE_FACTOR=100          # 1.0% watermark boost
     EXPECTED_DIRTY_BYTES=1073741824    # 1GiB
     EXPECTED_DIRTY_BG_BYTES=268435456  # 256MiB
-    EXPECTED_DIRTY_WRITEBACK=500       # 5s  (must be < expire)
+    EXPECTED_DIRTY_WRITEBACK=1500      # 15s (powertop-aligned, fewer disk wakeups; must be < expire)
     EXPECTED_DIRTY_EXPIRE=3000         # 30s (kernel default)
     EXPECTED_MGLRU_TTL=1000
 else
@@ -232,14 +232,14 @@ vm.max_map_count = ${EXPECTED_MAX_MAP_COUNT}
 # kernel.printk: Suppresses low-priority kernel dmesg console spam while keeping warnings/errors.
 kernel.printk = 3 3 3 3
 
-# --- MODERN NETWORK STACK (BBR + CAKE) ---
+# --- MODERN NETWORK STACK (BBR + fq) ---
 # net.ipv4.tcp_congestion_control: BBR handles congestion detection by measuring
 # bottleneck bandwidth and round-trip times, offering far better throughput.
 net.ipv4.tcp_congestion_control = bbr
-# net.core.default_qdisc: CAKE (Common Applications Kept Enhanced) performs active
-# queue management and fair queueing, preventing network bufferbloat on local 
-# client interfaces. Modern kernels (>=4.20) pace BBR internally, making CAKE compatible.
-net.core.default_qdisc = cake
+# net.core.default_qdisc: fq (Fair Queueing) performs active queue management
+# and fair queueing, preventing network bufferbloat on local client interfaces.
+# Plain fq matches battery.toml [network] qdisc and powertop's expectation.
+net.core.default_qdisc = fq
 # net.ipv4.tcp_rmem / tcp_wmem: Optimize min, default, and max TCP buffer sizes
 # to allow high-throughput TCP window scaling.
 net.ipv4.tcp_rmem = 4096 65536 4194304
