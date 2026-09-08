@@ -294,7 +294,8 @@ log_info "Applying sysctl parameters to live kernel..."
 if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
     modprobe tcp_bbr 2>/dev/null || log_warn "tcp_bbr module not available, BBR may fail."
 fi
-modprobe sch_cake 2>/dev/null || true
+# NOTE: sch_cake is intentionally NOT loaded — default_qdisc is fq (endpoint
+# pacing for BBR). CAKE is router SQM gear; loading it would only cost RAM.
 
 if [[ -x "/usr/lib/systemd/systemd-sysctl" ]]; then
     /usr/lib/systemd/systemd-sysctl "$CONFIG_FILE" >/dev/null 2>&1 || sysctl -e --load "$CONFIG_FILE" >/dev/null 2>&1 || true
