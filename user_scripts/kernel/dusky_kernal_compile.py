@@ -5475,8 +5475,13 @@ def write_bls_entries(p: KernelProfile, facts: HostFacts, d: Derived) -> None:
             new_txt = re.sub(r"^default\s+.*$", f"default {p.pkgbase}.conf", txt, flags=re.M)
         else:
             new_txt = f"default {p.pkgbase}.conf\n" + txt
+        m_timeout = re.search(r"^timeout\s+(\d+)", new_txt, re.M)
+        if m_timeout and int(m_timeout.group(1)) == 0:
+            new_txt = re.sub(r"^timeout\s+\d+", "timeout 3", new_txt, flags=re.M)
+        elif not m_timeout:
+            new_txt += "timeout 3\n"
         PRIV.write_files({loader_conf: (new_txt, "0644")})
-        ok(f"Updated {loader_conf} default -> {p.pkgbase}.conf")
+        ok(f"Updated {loader_conf} default -> {p.pkgbase}.conf (timeout 3s)")
 
     if have("bootctl"):
         PRIV.run(["bootctl", "set-default", f"{p.pkgbase}.conf"], check=False)

@@ -68,7 +68,7 @@ hostname = ""
 user = ""
 reproducible = true
 seed = "auto"
-extra_config = { VFIO_DEVICE_CDEV = true, VFIO_GROUP = true, VFIO_CONTAINER = true, VFIO_VIRQFD = true, VFIO_PCI_INTX = true, VFIO_PCI_VGA = true, VFIO_PCI_IGD = true, VFIO_PCI_DMABUF = true, IOMMUFD_DRIVER = true, IOMMUFD_DRIVER_CORE = true }
+extra_config = { VFIO_DEVICE_CDEV = true, VFIO_GROUP = true, VFIO_CONTAINER = true, VFIO_VIRQFD = true, VFIO_PCI_INTX = true, VFIO_PCI_VGA = true, VFIO_PCI_IGD = true, VFIO_PCI_DMABUF = true, IOMMUFD_DRIVER = true, IOMMUFD_DRIVER_CORE = true, VIRTIO_MENU = true, VIRTIO_PCI = "m", VIRTIO_BLK = true, VIRTIO_NET = "m", DRM_VIRTIO_GPU = "m", DRM_BOCHS = "m" }
 
 
 # ==============================================================================
@@ -257,7 +257,9 @@ keep_symbols = [
   # Nouveau future switch (i2c helper, unused with proprietary but kept for later)
   "I2C_NVIDIA_GPU",
   # VFIO GPU passthrough (tristate only here, bools live in dusky.extra_config)
-  "VFIO", "VFIO_PCI", "VFIO_PCI_CORE", "VFIO_IOMMU_TYPE1", "IOMMUFD"
+  "VFIO", "VFIO_PCI", "VFIO_PCI_CORE", "VFIO_IOMMU_TYPE1", "IOMMUFD",
+  # KVM / QEMU VirtIO guest drivers (modular, 0-byte cost on bare metal)
+  "VIRTIO_PCI", "VIRTIO_NET", "DRM_VIRTIO_GPU", "DRM_BOCHS"
 ]
 localyesconfig = false
 sig_force = false
