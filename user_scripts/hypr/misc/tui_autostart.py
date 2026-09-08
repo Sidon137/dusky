@@ -105,15 +105,6 @@ SCHEMA = {
             extended_help="**Waybar Status Bar**\n\nAutomatically launches the Waybar panel on startup."
         ),
         ConfigItem(
-            label="Waybar Timer",
-            key="waybar_timer",
-            scope="autostart",
-            type_="bool",
-            default=False,
-            group="Interface & Desktop",
-            extended_help="**Waybar Productivity Timer**\n\nAutomatically launches the pomodoro timer module on Waybar startup."
-        ),
-        ConfigItem(
             label="Network Tray Applet",
             key="nm_applet",
             scope="autostart",
@@ -674,8 +665,7 @@ SCHEMA = {
             group="Optimization",
             preset_payload={
                 "xwayland.enabled": False,
-                "autostart.audio_visualizer": False,
-                "autostart.waybar_timer": False
+                "autostart.audio_visualizer": False
             },
             extended_help="**Lightweight Preset**\n\nOptimizes RAM usage by aggressively disabling XWayland and non-essential background layers."
         ),
