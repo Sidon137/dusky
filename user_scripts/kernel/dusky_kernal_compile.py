@@ -5710,7 +5710,13 @@ def do_install_pkg(args: argparse.Namespace) -> int:
     JOURNAL.open("install-pkg")
     note(f"journal: {JOURNAL.path}")
     for pkgbase, pkgs in sorted(groups.items()):
-        profile = _resolve_install_profile(pkgbase, getattr(args, "profile", None), facts)
+        wanted = getattr(args, "profile", None)
+        profile = _resolve_install_profile(pkgbase, wanted, facts)
+        if wanted is None and not profile.g("boot", "write_entries"):
+            # Auto-matched remote_* profiles set write_entries=False for the build
+            # host; installing means we are on the target, so write entries.
+            profile.set("boot", "write_entries", True, explicit=False)
+            note(f"{pkgbase}: enabled boot entries for this machine (profile '{profile.name}' had write_entries=false)")
         info(f"{pkgbase}: using profile '{profile.name}' for preset and boot entries")
         install_packages(sorted(pkgs), profile)
         krels = sorted(_kernelreleases_for_pkgbases({pkgbase}))
