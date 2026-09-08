@@ -26,8 +26,8 @@ Quick start:
 
 import sys
 
-if sys.version_info < (3, 14):
-    sys.stderr.write(f"Dusky Kernel Compiler requires Python >= 3.14 (running {sys.version.split()[0]}).\n")
+if sys.version_info < (3, 11):
+    sys.stderr.write(f"Dusky Kernel Compiler requires Python >= 3.11 (running {sys.version.split()[0]}).\n")
     raise SystemExit(70)
 
 import argparse
@@ -53,7 +53,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -96,11 +96,11 @@ TARBALL_DIR: Path = BUILD_DIR / "tarballs"
 PATCH_CACHE: Path = Path(os.environ.get("DUSKY_PATCH_CACHE") or BUILD_DIR / "patches")
 THINLTO_CACHE_DIR: Path = Path(os.environ.get("DUSKY_THINLTO_CACHE") or BUILD_DIR / "thinlto-cache")
 PKGDEST_DIR: Path = Path(os.environ.get("DUSKY_PKGDEST") or BUILD_DIR / "packages")
-IMPORT_DIR: Path = BUILD_DIR / "imports"
+IMPORT_DIR: Final = STATE_DIR / "imports"
 
 
 def set_build_dir(new_path: Path | str) -> None:
-    global BUILD_DIR, SRC_DIR, TARBALL_DIR, PATCH_CACHE, THINLTO_CACHE_DIR, PKGDEST_DIR, IMPORT_DIR
+    global BUILD_DIR, SRC_DIR, TARBALL_DIR, PATCH_CACHE, THINLTO_CACHE_DIR, PKGDEST_DIR
     BUILD_DIR = Path(new_path).expanduser()
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
     SRC_DIR = BUILD_DIR / "src"
@@ -108,8 +108,8 @@ def set_build_dir(new_path: Path | str) -> None:
     PATCH_CACHE = Path(os.environ.get("DUSKY_PATCH_CACHE") or BUILD_DIR / "patches")
     THINLTO_CACHE_DIR = Path(os.environ.get("DUSKY_THINLTO_CACHE") or BUILD_DIR / "thinlto-cache")
     PKGDEST_DIR = Path(os.environ.get("DUSKY_PKGDEST") or BUILD_DIR / "packages")
-    IMPORT_DIR = BUILD_DIR / "imports"
-    for d in (SRC_DIR, TARBALL_DIR, PATCH_CACHE, THINLTO_CACHE_DIR, PKGDEST_DIR, IMPORT_DIR, BUILD_DIR / "seeds"):
+    IMPORT_DIR.mkdir(parents=True, exist_ok=True)
+    for d in (SRC_DIR, TARBALL_DIR, PATCH_CACHE, THINLTO_CACHE_DIR, PKGDEST_DIR, BUILD_DIR / "seeds"):
         d.mkdir(parents=True, exist_ok=True)
 LOG_DIR: Final = STATE_DIR / "logs"
 HISTORY_FILE: Final = STATE_DIR / "history.json"
@@ -829,6 +829,7 @@ PROFILE_SPEC: Final[dict[str, tuple[FieldSpec, ...]]] = {
         F("tags", "list", [], "Free-form labels", wizard=False),
         F("bare_metal_only", "bool", False, "Refuse to build inside a VM and strip guest paravirt code"),
         F("portable_package", "bool", False, "Package targets another machine (forbids -march=native)"),
+        F("manifest_path", "str", "", "Path to target hardware manifest.json for remote builds", wizard=False),
     ),
     "release": (
         F("channel", "str", "stable", "Upstream release channel", CHANNEL_CHOICES),
@@ -2480,6 +2481,76 @@ def _virt_guest(facts: HostFacts) -> tuple[bool, str]:
     if sigs:
         return True, "none+" + "+".join(sigs)
     return False, "none"
+
+
+def _is_virt_target(p: KernelProfile, f: HostFacts) -> tuple[bool, str]:
+    if p.name == "vm_guest" or "vm" in p.sections.get("meta", {}).get("tags", []):
+        return True, "vm_guest"
+    return _virt_guest(f)
+
+
+def resolve_profile_manifest(p: KernelProfile) -> Path | None:
+    p_man = p.g("meta", "manifest_path")
+    if p_man:
+        path = Path(p_man).expanduser()
+        if path.is_file():
+            return path
+    tags = p.g("meta", "tags")
+    if "remote" in tags:
+        for tag in tags:
+            if tag != "remote":
+                cand = IMPORT_DIR / tag / "manifest.json"
+                if cand.is_file():
+                    return cand
+    if p.name.startswith("remote_"):
+        hname = p.name.removeprefix("remote_")
+        cand = IMPORT_DIR / hname / "manifest.json"
+        if cand.is_file():
+            return cand
+    return None
+
+
+def target_facts_for_profile(p: KernelProfile, host: HostFacts) -> HostFacts:
+    manifest_file = resolve_profile_manifest(p)
+    if manifest_file is None:
+        if p.name == "vm_guest" or "vm" in p.sections.get("meta", {}).get("tags", []):
+            return replace(
+                host,
+                virt="kvm" if host.virt == "none" else host.virt,
+                gpus=(*host.gpus, "virtio", "bochs") if not any(g in host.gpus for g in ("virtio", "bochs", "qxl")) else host.gpus,
+            )
+        return host
+    try:
+        data = json.loads(manifest_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        warn(f"Could not read bundle manifest {manifest_file}: {e}")
+        return host
+
+    flags = frozenset(data.get("flags", [])) or host.flags
+    return replace(
+        host,
+        vendor=data.get("vendor", host.vendor),
+        model=data.get("model", host.model),
+        flags=flags,
+        threads=int(data.get("threads", host.threads)),
+        cores=int(data.get("cores", host.cores)),
+        mem_gib=float(data.get("mem_gib", host.mem_gib)),
+        virt=data.get("virt", host.virt),
+        gpus=tuple(data.get("gpus", host.gpus)),
+        psabi_level=int(data.get("psabi_level", host.psabi_level)),
+        uarch=data.get("uarch", host.uarch),
+        cmdline=data.get("cmdline", host.cmdline),
+        filesystems=tuple(data.get("filesystems", host.filesystems)),
+        root_fs=data.get("root_fs", host.root_fs),
+        root_luks=bool(data.get("root_luks", host.root_luks)),
+        has_nvme=bool(data.get("has_nvme", host.has_nvme)),
+        rotational=bool(data.get("rotational", host.rotational)),
+        battery=bool(data.get("battery", host.battery)),
+        dkms_modules=tuple(data.get("dkms_modules", host.dkms_modules)),
+        bootloaders=tuple(data.get("bootloaders", host.bootloaders)),
+        initrd_compression=data.get("initrd_compression", host.initrd_compression),
+        microcode_hook=bool(data.get("microcode_hook", host.microcode_hook)),
+    )
 
 
 def auto_jobs(facts: HostFacts, lto: str) -> int:
@@ -4306,12 +4377,13 @@ def _ops_cpu(mx: Matrix, p: KernelProfile, d: Derived) -> None:
         nr = 512
     else:
         nr = max(8, ((f.threads + 7) // 8) * 8)
+    portable = s["meta"]["portable_package"]
     mx.val("NR_CPUS", nr)
     mx.n("MAXSMP")
     mx.flag("CPUMASK_OFFSTACK", nr > 512)
     mx.flag("X86_MCE", c["mce"])
-    mx.flag("X86_MCE_AMD", c["mce"] and f.vendor != "intel")
-    mx.flag("X86_MCE_INTEL", c["mce"] and f.vendor != "amd")
+    mx.flag("X86_MCE_AMD", c["mce"] and (f.vendor != "intel" or portable))
+    mx.flag("X86_MCE_INTEL", c["mce"] and (f.vendor != "amd" or portable))
     mx.n("X86_MCELOG_LEGACY")
     mx.flag("CPU_MITIGATIONS", c["mitigations"] != "off", why=f"cpu.mitigations={c['mitigations']}")
     mx.flag("IA32_EMULATION", c["compat32"])
@@ -4333,13 +4405,12 @@ def _ops_cpu(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     gov = s["power"]["cpu_idle_governor"]
     mx.y("CPU_IDLE")
     mx.flag("CPU_IDLE_GOV_TEO", gov == "teo")
-    mx.flag("CPU_IDLE_GOV_MENU", gov == "menu")
+    mx.flag("CPU_IDLE_GOV_MENU", gov == "menu", optional=True)
     mx.n("CPU_IDLE_GOV_LADDER")
-    _hv, _ = _virt_guest(f)
+    _hv, _ = _is_virt_target(p, f)
     mx.flag("CPU_IDLE_GOV_HALTPOLL", gov == "haltpoll" or _hv, optional=True, why="KVM guests only")
     mx.flag("HALTPOLL_CPUIDLE", _hv, optional=True)
-    mx.flag("INTEL_IDLE", f.vendor != "amd" or s["meta"]["portable_package"])
-    portable = s["meta"]["portable_package"]
+    mx.flag("INTEL_IDLE", f.vendor != "amd" or portable)
     if f.vendor == "intel" or portable:
         mx.y("INTEL_HFI_THERMAL", optional=True, why="Intel Thread Director feedback")
         mx.m("INTEL_TCC_COOLING", optional=True)
@@ -4675,9 +4746,12 @@ def _ops_gaming(mx: Matrix, p: KernelProfile, d: Derived) -> None:
         mx.y("HIDRAW")
         mx.y("HID_GENERIC")
         mx.y("USB_HID")
+        mx.y("NEW_LEDS", optional=True)
+        mx.m("LEDS_CLASS", optional=True)
+        mx.m("LEDS_CLASS_MULTICOLOR", optional=True)
         for sym in ("INPUT_UINPUT", "INPUT_JOYDEV", "JOYSTICK_XPAD", "HID_PLAYSTATION", "HID_SONY", "HID_NINTENDO", "HID_STEAM", "HID_MICROSOFT",
                     "HID_LOGITECH", "HID_LOGITECH_DJ", "HID_LOGITECH_HIDPP", "HID_MULTITOUCH", "INPUT_FF_MEMLESS", "HID_APPLE", "HID_WACOM"):
-            mx.m(sym, why="controllers")
+            mx.m(sym, why="controllers", optional=True)
         for sym in ("JOYSTICK_XPAD_FF", "JOYSTICK_XPAD_LEDS", "PLAYSTATION_FF", "SONY_FF", "NINTENDO_FF", "STEAM_FF", "LOGITECH_FF", "LOGIWHEELS_FF", "LOGIG940_FF", "LOGIRUMBLEPAD2_FF"):
             mx.y(sym, optional=True)
     mx.flag("USER_EVENTS", d.tracing == "full", optional=True)
@@ -4695,8 +4769,9 @@ FS_SYMBOLS: Final[dict[str, tuple[str, ...]]] = {
 def _ops_storage(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     s, f = p.sections, d.facts
     st = s["storage"]
+    portable = s["meta"]["portable_package"]
     lean = p.lean("lean")
-    if f.has_nvme or st["nvme_poll_queues"]:
+    if f.has_nvme or st["nvme_poll_queues"] or portable:
         mx.y("BLK_DEV_NVME")
         mx.y("NVME_HWMON")
         mx.n("NVME_MULTIPATH")
@@ -4728,8 +4803,8 @@ def _ops_storage(mx: Matrix, p: KernelProfile, d: Derived) -> None:
                 mx.y(sym)
             else:
                 mx.m(sym, why=f"filesystem {fstype} in use")
-    if f.root_luks:
-        mx.y("DM_CRYPT", why="root on dm-crypt")
+    if f.root_luks or portable:
+        mx.y("DM_CRYPT", why="root on dm-crypt or portable")
         for sym in ("CRYPTO_AES", "CRYPTO_XTS", "CRYPTO_SHA256", "CRYPTO_SHA512", "CRYPTO_AES_NI_INTEL"):
             mx.y(sym)
     mx.y("FS_ENCRYPTION")
@@ -4799,7 +4874,7 @@ def _ops_virt(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     # If any of these hold we must keep the guest/virtio stack enabled,
     # otherwise a kernel built in a VM silently loses video (black screen)
     # because DRM_VIRTIO_GPU depends on VIRTIO_MENU.
-    virt_detected, virt_reason = _virt_guest(f)
+    virt_detected, virt_reason = _is_virt_target(p, f)
     if virt_detected:
         for sym in ("HYPERVISOR_GUEST", "PARAVIRT", "PARAVIRT_SPINLOCKS", "KVM_GUEST", "VIRTIO_MENU", "VIRTIO_PCI", "VIRTIO_BLK", "VIRTIO_NET", "VIRTIO_CONSOLE",
                     "VIRTIO_BALLOON", "VIRTIO_INPUT", "VIRTIO_FS", "VSOCKETS", "VIRTIO_VSOCKETS", "VIRTIO_MEM", "SCSI_VIRTIO", "HW_RANDOM_VIRTIO", "MEMORY_BALLOON",
@@ -4815,26 +4890,30 @@ def _ops_virt(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     if p.g("meta", "bare_metal_only"):
         for sym in ("HYPERVISOR_GUEST", "PARAVIRT", "KVM_GUEST", "XEN", "VIRTIO_MENU", "HYPERV", "VMWARE_VMCI", "VBOXGUEST"):
             mx.n(sym, why="bare_metal_only")
+    elif p.g("meta", "portable_package"):
+        for sym in ("HYPERVISOR_GUEST", "PARAVIRT", "PARAVIRT_SPINLOCKS", "KVM_GUEST", "VIRTIO_MENU", "VIRTIO_PCI", "VIRTIO_BLK", "VIRTIO_NET", "VIRTIO_CONSOLE"):
+            mx.y(sym, why="portable_package paravirt/virtio support", optional=True)
 
 
 def _ops_gpu(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     f = d.facts
     gpus = set(f.gpus)
-    if "amd" in gpus:
-        mx.m("DRM_AMDGPU", why="AMD GPU present")
-        mx.y("DRM_AMD_DC")
+    portable = p.g("meta", "portable_package")
+    if "amd" in gpus or portable:
+        mx.m("DRM_AMDGPU", why="AMD GPU present/portable")
+        mx.y("DRM_AMD_DC", optional=True)
         mx.y("DRM_AMDGPU_SI", optional=True)
         mx.y("DRM_AMDGPU_CIK", optional=True)
         mx.y("DRM_AMDGPU_USERPTR", optional=True)
         mx.m("HSA_AMD", optional=True)
         mx.y("AMD_PRIVATE_COLOR", optional=True, why="enable AMD KMS color management for Gamescope/HDR")
-    if "intel" in gpus:
-        mx.m("DRM_I915", why="Intel GPU present")
-        mx.m("DRM_XE", why="Intel GPU present")
+    if "intel" in gpus or portable:
+        mx.m("DRM_I915", why="Intel GPU present/portable")
+        mx.m("DRM_XE", why="Intel GPU present/portable")
         mx.y("DRM_XE_DISPLAY", optional=True)
-    if "nvidia" in gpus and "nvidia" not in " ".join(f.dkms_modules):
+    if ("nvidia" in gpus or portable) and "nvidia" not in " ".join(f.dkms_modules):
         mx.m("DRM_NOUVEAU", why="NVIDIA GPU without nvidia-dkms")
-    if gpus & {"virtio", "qxl", "bochs", "vmware"}:
+    if (gpus & {"virtio", "qxl", "bochs", "vmware"}) or portable or p.name == "vm_guest" or _is_virt_target(p, f)[0]:
         for sym in ("DRM_VIRTIO_GPU", "DRM_QXL", "DRM_BOCHS", "DRM_VMWGFX"):
             mx.m(sym, optional=True)
     mx.m("DRM", why="modular DRM core (mkinitcpio kms hook ships it in the initramfs)")
@@ -5037,7 +5116,7 @@ def verify_config(tree: Path, p: KernelProfile, mx: Matrix, d: Derived) -> Verif
 def save_config_snapshot(tree: Path, p: KernelProfile) -> Path:
     CONFIG_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
     dest = snapshot_path(p)
-    (tree / ".config").copy(dest)
+    shutil.copy2(tree / ".config", dest)
     ok(f"Config snapshot saved: {dest}")
     return dest
 
@@ -5270,7 +5349,7 @@ def compile_kernel(tree: Path, p: KernelProfile, d: Derived, env: Mapping[str, s
     b_env["PACMAN_PKGBASE"] = p.pkgbase
     b_env["PKGDEST"] = str(pkgdest)
     b_env["PACKAGER"] = f"{APP_NAME} <dusky@localhost>"
-    b_env["PACMAN_EXTRAPACKAGES"] = "headers" if resolve_build_headers(p, facts) else ""
+    b_env["PACMAN_EXTRAPACKAGES"] = "headers" if resolve_build_headers(p, d.facts) else ""
     b_env["MAKEFLAGS"] = f"-j{jobs}"
     b_env["ZSTD_CLEVEL"] = "9"
     info(f"pkgbase={p.pkgbase} jobs={jobs} lto={d.lto} toolchain={d.toolchain} headers={'yes' if b_env['PACMAN_EXTRAPACKAGES'] else 'no'} rust={'yes' if d.rust else 'no'}")
@@ -5371,18 +5450,7 @@ def audit_dkms(pkgbases: set[str]) -> bool:
 def install_packages(pkgs: Sequence[Path], profile: KernelProfile) -> None:
     rule("Install packages (pacman -U)")
     PRIV.ensure()
-    PRIV.run(["pacman", "-U", "--noconfirm", "--overwrite", "*", *[str(x) for x in pkgs]], capture=False)
-    ok("Kernel packages installed (mkinitcpio and DKMS pacman hooks have run)")
-    # Fresh-install path: (re)assert the modprobed-db writer so future
-    # strict localmodconfig builds keep accumulating modules. User unit -> no sudo.
-    if profile.g("modules", "modprobed_db") and have("modprobed-db"):
-        ensure_modprobed_db_service(prompt=False)
-    # Same-version reinstalls can leave DKMS objects stale ("built" instead of
-    # "installed", then Exec format error at modprobe). Audit and force-rebuild.
-    if not audit_dkms({profile.pkgbase}):
-        warn("Some DKMS modules failed to rebuild; fix manually, e.g.: sudo dkms install --force <module>/<version> -k <kernelrelease>")
-
-    # Ensure /etc/mkinitcpio.d/<pkgbase>.preset exists for custom flavors
+    # Ensure /etc/mkinitcpio.d/<pkgbase>.preset exists so the pacman mkinitcpio hook runs for this kernel
     preset_path = Path(f"/etc/mkinitcpio.d/{profile.pkgbase}.preset")
     if not preset_path.is_file():
         preset_content = (
@@ -5396,6 +5464,17 @@ def install_packages(pkgs: Sequence[Path], profile: KernelProfile) -> None:
         )
         PRIV.write_files({preset_path: (preset_content, "0644")})
         ok(f"Created mkinitcpio preset: {preset_path}")
+
+    PRIV.run(["pacman", "-U", "--noconfirm", "--overwrite", "*", *[str(x) for x in pkgs]], capture=False)
+    ok("Kernel packages installed (mkinitcpio and DKMS pacman hooks have run)")
+    # Fresh-install path: (re)assert the modprobed-db writer so future
+    # strict localmodconfig builds keep accumulating modules. User unit -> no sudo.
+    if profile.g("modules", "modprobed_db") and have("modprobed-db"):
+        ensure_modprobed_db_service(prompt=False)
+    # Same-version reinstalls can leave DKMS objects stale ("built" instead of
+    # "installed", then Exec format error at modprobe). Audit and force-rebuild.
+    if not audit_dkms({profile.pkgbase}):
+        warn("Some DKMS modules failed to rebuild; fix manually, e.g.: sudo dkms install --force <module>/<version> -k <kernelrelease>")
 
     # Build initramfs if missing
     initramfs_img = Path(f"/boot/initramfs-{profile.pkgbase}.img")
@@ -5532,6 +5611,7 @@ def do_export_bundle(dest: Path | None) -> Path:
                 "mem_gib": round(facts.mem_gib, 2), "gpus": list(facts.gpus), "filesystems": list(facts.filesystems), "root_fs": facts.root_fs,
                 "root_luks": facts.root_luks, "has_nvme": facts.has_nvme, "rotational": facts.rotational, "virt": facts.virt, "battery": facts.battery,
                 "dkms_modules": list(facts.dkms_modules), "bootloaders": list(facts.bootloaders), "initrd_compression": facts.initrd_compression,
+                "microcode_hook": facts.microcode_hook,
                 "kernel": facts.kernel, "cmdline": facts.cmdline, "flags": sorted(facts.flags)}
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
@@ -5577,33 +5657,51 @@ def do_import_bundle(src: Path) -> str:
         import_dir = IMPORT_DIR / hname
         import_dir.mkdir(parents=True, exist_ok=True)
         db_path = ""
-        if (tmp / "modprobed.db").is_file() and count_db_modules(tmp / "modprobed.db") > 0:
-            shutil.copy2(tmp / "modprobed.db", import_dir / "modprobed.db")
+        mods: set[str] = set()
+        if (tmp / "modprobed.db").is_file():
+            for line in (tmp / "modprobed.db").read_text(encoding="utf-8", errors="replace").splitlines():
+                m = _extract_module_name(line)
+                if m:
+                    mods.add(m)
+        if (tmp / "lsmod.txt").is_file():
+            for line in (tmp / "lsmod.txt").read_text(encoding="utf-8", errors="replace").splitlines():
+                m = _extract_module_name(line)
+                if m:
+                    mods.add(m)
+        is_virt = manifest.get("virt", "none") != "none" or any("virtio" in g for g in manifest.get("gpus", []))
+        if is_virt:
+            for vmod in ("virtio", "virtio_ring", "virtio_pci", "virtio_pci_legacy_dev", "virtio_pci_modern_dev", "virtio_net", "virtio_blk", "virtio-gpu", "virtio_dma_buf", "virtio_console", "virtio_balloon", "virtio_scsi"):
+                mods.add(vmod)
+        if mods:
+            (import_dir / "modprobed.db").write_text("\n".join(sorted(mods)) + "\n", encoding="utf-8")
             db_path = str(import_dir / "modprobed.db")
-        elif (tmp / "lsmod.txt").is_file():
-            n = normalize_lsmod_file_to_db(tmp / "lsmod.txt", import_dir / "modprobed.db")
-            if n > 0:
-                note(f"bundle had no modprobed.db; normalized lsmod.txt -> {n} modules (point-in-time only)")
-                db_path = str(import_dir / "modprobed.db")
-            else:
-                warn("bundle contained neither a usable modprobed.db nor a parseable lsmod.txt")
-        (tmp / "manifest.json").copy(import_dir / "manifest.json")
+            note(f"Imported {len(mods)} unique modules for {hname} from bundle")
+        else:
+            warn("bundle contained neither a usable modprobed.db nor a parseable lsmod.txt")
+        shutil.copy2(tmp / "manifest.json", import_dir / "manifest.json")
     arch = manifest.get("uarch") or f"generic_v{int(manifest.get('psabi_level', 3))}"
     if arch not in CPU_ARCHES or arch == "native":
         arch = f"generic_v{min(3, int(manifest.get('psabi_level', 3)))}"
     mem = float(manifest.get("mem_gib", 16))
+    manifest_path = str(import_dir / "manifest.json")
     tweaks: dict[str, dict[str, Any]] = {
-        "meta": {"portable_package": True, "bare_metal_only": False, "tags": ["remote", hname]},
+        "meta": {"portable_package": True, "bare_metal_only": False, "tags": ["remote", hname], "manifest_path": manifest_path},
         "release": {"channel": "stable"},
-        "scheduler": {"type": "eevdf", "scx": "scx_bpfland" if mem > 6 else "none", "scx_flags": "", "scx_enable_class": mem > 6},
+        "scheduler": {"type": "eevdf", "scx": "scx_bpfland" if mem > 6 and not is_virt else "none", "scx_flags": "", "scx_enable_class": mem > 6 and not is_virt},
         "cpu": {"arch": arch, "nr_cpus": int(manifest.get("threads", 8)), "amd_pstate": "active" if manifest.get("vendor") == "amd" else "undefined", "mitigations": "on"},
-        "memory": {"footprint": suggest_footprint(mem), "swap_backend": "zram", "page_reporting": manifest.get("virt", "none") != "none"},
+        "power": {"cpu_idle_governor": "haltpoll" if is_virt else "teo"},
+        "memory": {"footprint": suggest_footprint(mem), "swap_backend": "zram", "page_reporting": is_virt},
         "compiler": {"toolchain": "llvm", "lto": "thin", "headers": "always" if manifest.get("dkms_modules") else "never", "rust": False},
         "storage": {"extra_filesystems": [fs for fs in manifest.get("filesystems", []) if fs in FS_SYMBOLS]},
         "modules": {"mode": "strict" if db_path else "expanded", "modprobed_db": bool(db_path), "modprobed_db_path": db_path},
         "security": {"profile": "balanced"},
+        "gaming": {"ntsync": not is_virt, "controllers": not is_virt},
         "boot": {"write_entries": False},
+        "verify": {"require_ntsync": not is_virt},
     }
+    if is_virt:
+        tweaks["modules"]["keep_symbols"] = ["VIRTIO_MENU", "VIRTIO_PCI", "VIRTIO_BLK", "VIRTIO_NET", "DRM_VIRTIO_GPU", "DRM_BOCHS"]
+        tweaks["dusky"] = {"extra_config": {"CONFIG_VIRTIO_MENU": "y", "CONFIG_VIRTIO_PCI": "m", "CONFIG_VIRTIO_BLK": "y", "CONFIG_VIRTIO_NET": "m", "CONFIG_DRM_VIRTIO_GPU": "m", "CONFIG_DRM_BOCHS": "m"}}
     pname = f"remote_{hname}"
     prof = profile_from_tweaks(pname, f"Remote bundle for {hname}: {manifest.get('model', 'unknown CPU')}, {mem:.0f} GiB, {', '.join(manifest.get('gpus', [])) or 'no GPU info'}",
                                f"dusky-{hname.replace('_', '-')}"[:40], tweaks, priority=90)
@@ -5699,13 +5797,17 @@ def do_build(args: argparse.Namespace) -> int:
     localmodconfig(tree, profile, db, env0)
     idx = KconfigIndex.scan(tree)
     note(f"Kconfig index: {len(idx.symbols):,} symbols (x86 view), X86_64_VERSION range max {idx.x86_64_version_max}")
+    target_facts = target_facts_for_profile(profile, facts)
+    if target_facts is not facts:
+        note(f"Target hardware profile: {target_facts.model} ({target_facts.vendor}), {target_facts.threads} threads, uarch={target_facts.uarch or 'generic_v' + str(target_facts.psabi_level)}, gpus={', '.join(target_facts.gpus) or 'none'}, virt={target_facts.virt}")
     rust_ok, rust_out = (rust_probe(tree, env0) if profile.g("compiler", "rust") else (False, ""))
-    d = derive(profile, facts, idx, tree, sched, rust_ok, rust_out)
+    d = derive(profile, target_facts, idx, tree, sched, rust_ok, rust_out)
     d.seed_source = seed_source
     inject_dkms_march_in_makefile(tree, d.march, d.mtune)
     mx = build_config_matrix(profile, d)
     apply_matrix(tree, mx)
-    env = build_env(profile, d, facts, tarball.stat().st_mtime)
+    env = build_env(profile, d, target_facts, tarball.stat().st_mtime)
+    (tree / "include" / "config" / "kernel.release").unlink(missing_ok=True)
     finalize_config(tree, env)
     d.kernelrelease = kernelrelease(tree, env)
     info(f"kernelrelease: {d.kernelrelease}")
