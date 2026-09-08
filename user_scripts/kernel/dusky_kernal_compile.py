@@ -3580,13 +3580,45 @@ def seed_config(tree: Path, p: KernelProfile, env: Mapping[str, str], override: 
     raise BuildError(f"No usable seed found for dusky.seed={p.g('dusky', 'seed')}")
 
 
+def ensure_modprobed_db_service(*, prompt: bool = True) -> bool:
+    """Enable --now the modprobed-db user service (DB writer for localmodconfig).
+
+    Empirically: package ships ONLY user units
+    (/usr/lib/systemd/user/modprobed-db.service + .timer, no system unit,
+    timer is static). Enabling the service pulls in the timer (Wants=).
+    Must run WITHOUT sudo: `sudo systemctl --user` fails (no user bus for root).
+    Idempotent; safe to call on every fresh install / build.
+    """
+    if not have("modprobed-db"):
+        return False
+    if not have("systemctl"):
+        warn("systemctl not found; cannot enable modprobed-db.service")
+        return False
+    if prompt and not ask_yes("Enable modprobed-db user service (auto-store loaded modules every 6h + at boot for localmodconfig)?", True):
+        note("Skipping modprobed-db.service enable (one-shot store only)")
+        run(["modprobed-db", "store"], check=False, timeout=60)
+        return False
+    run(["modprobed-db", "store"], check=False, timeout=60)
+    enabled = (run(["systemctl", "--user", "is-enabled", "modprobed-db.service"], check=False, timeout=10).stdout or "").strip()
+    timer = (run(["systemctl", "--user", "is-active", "modprobed-db.timer"], check=False, timeout=10).stdout or "").strip()
+    if enabled == "enabled" and timer == "active":
+        ok("modprobed-db.service already enabled (timer active)")
+        return True
+    cp = run(["systemctl", "--user", "enable", "--now", "modprobed-db.service"], check=False, timeout=30)
+    if cp.returncode == 0:
+        ok("modprobed-db.service enabled --now (timer stores every 6h + at boot)")
+        return True
+    warn("could not enable modprobed-db.service; run manually: systemctl --user enable --now modprobed-db.service")
+    return False
+
+
 def ensure_modprobed_db(p: KernelProfile) -> Path | None:
     if not p.g("modules", "modprobed_db"):
         return None
     custom = p.g("modules", "modprobed_db_path")
     db = Path(custom).expanduser().resolve() if custom else MODPROBED_DB_PATH
     if not custom and have("modprobed-db"):
-        run(["modprobed-db", "store"], check=False, timeout=60)
+        ensure_modprobed_db_service(prompt=False)
     if db.is_file() and db.stat().st_size > 0:
         count = len([line for line in _read(db).splitlines() if line.strip()])
         ok(f"modprobed.db: {db} ({count} modules)")
@@ -4951,6 +4983,10 @@ def install_packages(pkgs: Sequence[Path], profile: KernelProfile) -> None:
     PRIV.ensure()
     PRIV.run(["pacman", "-U", "--noconfirm", *[str(x) for x in pkgs]], capture=False)
     ok("Kernel packages installed (mkinitcpio and DKMS pacman hooks have run)")
+    # Fresh-install path: (re)assert the modprobed-db writer so future
+    # strict localmodconfig builds keep accumulating modules. User unit -> no sudo.
+    if profile.g("modules", "modprobed_db") and have("modprobed-db"):
+        ensure_modprobed_db_service(prompt=False)
 
     # Ensure /etc/mkinitcpio.d/<pkgbase>.preset exists for custom flavors
     preset_path = Path(f"/etc/mkinitcpio.d/{profile.pkgbase}.preset")
@@ -5754,7 +5790,7 @@ def initialize_toolchains() -> None:
                 warn("Could not install modprobed-db automatically; install manually with: paru -S modprobed-db")
 
     if have("modprobed-db"):
-        run(["modprobed-db", "store"], check=False)
+        ensure_modprobed_db_service(prompt=True)
         ok("modprobed-db storing loaded modules (keep using the machine before strict builds)")
 
 
