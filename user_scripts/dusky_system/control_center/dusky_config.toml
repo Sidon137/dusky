@@ -3621,7 +3621,7 @@ icon = "package-x-generic-symbolic"
 style = "suggested"
 [pages.layout.items.on_press]
 type = "exec"
-command = "kitty --class 080_aur_paru_fallback_yay.sh --hold sh -c \"$HOME/user_scripts/arch_setup_scripts/scripts/080_aur_paru_fallback_yay.sh\""
+command = "kitty --class 058_aur_paru_fallback_yay.sh --hold sh -c \"$HOME/user_scripts/arch_setup_scripts/scripts/058_aur_paru_fallback_yay.sh\""
 
 [[pages.layout.items]]
 type = "button"
