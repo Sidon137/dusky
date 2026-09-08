@@ -1075,8 +1075,10 @@ def cross_validate(p: KernelProfile, facts: "HostFacts | None" = None, *, force:
         if pinned.key() < KVer(*MIN_KERNEL).key():
             raise ProfileError(f"release.pin {s['release']['pin']} is below the {MIN_KERNEL[0]}.{MIN_KERNEL[1]} floor")
     if facts is not None:
-        if s["meta"]["bare_metal_only"] and facts.virt != "none" and not force:
-            raise ProfileError(f"profile is bare_metal_only but this host is a '{facts.virt}' guest (use --force to override)")
+        if s["meta"]["bare_metal_only"] and not force:
+            _det, _reason = _virt_guest(facts)
+            if _det:
+                raise ProfileError(f"profile is bare_metal_only but this host looks virtualized ({_reason}) (use --force to override)")
         if s["cpu"]["nr_cpus"] and s["cpu"]["nr_cpus"] < facts.threads:
             warn(f"cpu.nr_cpus={s['cpu']['nr_cpus']} is below the host thread count ({facts.threads}); extra CPUs stay offline")
         if s["compiler"]["lto"] == "full" and facts.mem_gib + facts.swap_gib < 16:
@@ -2256,6 +2258,29 @@ def host_facts() -> HostFacts:
         tools=_tool_versions(), sched_ext_live=Path("/sys/kernel/sched_ext").is_dir(),
         initrd_compression=(comp_m.group(1) if comp_m else "zstd"), microcode_hook="microcode" in hooks,
     )
+
+
+_VIRT_GPUS: Final = frozenset({"virtio", "qxl", "bochs", "vmware"})
+
+
+def _virt_guest(facts: HostFacts) -> tuple[bool, str]:
+    """Detect a VM guest via detect-virt OR hypervisor CPU flag OR virt GPU.
+
+    Returns (detected, reason); reason is audit-friendly, e.g. "kvm" or
+    "none+hypervisor-flag+virtio-gpu". "hypervisor" alone is ~never set on
+    true bare metal; GPU IDs are PCI display-class virt vendors only.
+    """
+    if facts.virt != "none":
+        return True, facts.virt
+    sigs: list[str] = []
+    if "hypervisor" in facts.flags:
+        sigs.append("hypervisor-flag")
+    vgpus = sorted(set(facts.gpus) & _VIRT_GPUS)
+    if vgpus:
+        sigs.append("+".join(vgpus) + "-gpu")
+    if sigs:
+        return True, "none+" + "+".join(sigs)
+    return False, "none"
 
 
 def auto_jobs(facts: HostFacts, lto: str) -> int:
@@ -3642,6 +3667,46 @@ LMC_KEEP_BASE: Final = ("drivers/usb", "drivers/gpu", "drivers/net", "drivers/hi
                         "drivers/thunderbolt", "drivers/platform/x86", "drivers/media/usb", "sound", "fs", "net/wireless", "crypto")
 
 
+def _generate_modprobed_db_from_lsmod() -> Path | None:
+    """Best-effort LSMOD snapshot from the live lsmod set (strict fallback only).
+
+    Writes a sorted, unique, validated snapshot to BUILD_DIR (never touches the
+    canonical ~/.config/modprobed.db owned by `modprobed-db store`). No comment
+    lines: streamline_config parses the first token of every line, so a `#`
+    line would become a bogus module. Point-in-time only: unloaded HW
+    (USB/VPN/printer) is missing by definition.
+    """
+    if not have("lsmod"):
+        return None
+    try:
+        cp = run(["lsmod"], check=False, timeout=30)
+    except DuskyError:
+        return None
+    if cp.returncode != 0 or not cp.stdout:
+        return None
+    names: set[str] = set()
+    for i, line in enumerate(cp.stdout.splitlines()):
+        s = line.strip()
+        if not s:
+            continue
+        if i == 0 and s.startswith("Module"):
+            continue
+        if s.startswith("#"):
+            continue
+        mod = s.split()[0].strip().replace("-", "_")
+        if re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", mod):
+            names.add(mod)
+    if not names:
+        return None
+    dest = BUILD_DIR / "lsmod-fallback.db"
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("\n".join(sorted(names)) + "\n", encoding="utf-8")
+    except OSError:
+        return None
+    return dest if dest.is_file() and dest.stat().st_size > 0 else None
+
+
 def localmodconfig(tree: Path, p: KernelProfile, db: Path | None, env: Mapping[str, str]) -> None:
     mode = p.g("modules", "mode")
     rule(f"Module pruning ({mode})")
@@ -3649,7 +3714,12 @@ def localmodconfig(tree: Path, p: KernelProfile, db: Path | None, env: Mapping[s
     if db is not None:
         lm_env["LSMOD"] = str(db)
     elif mode == "strict" and not p.g("modules", "allow_lsmod_fallback"):
-        raise ProfileError("strict pruning needs modprobed.db (set modules.allow_lsmod_fallback=true to use the live lsmod set)")
+        generated = _generate_modprobed_db_from_lsmod()
+        if generated is not None:
+            lm_env["LSMOD"] = str(generated)
+            warn(f"modprobed.db missing; using point-in-time lsmod snapshot ({generated}) -- unloaded HW may be pruned; prefer expanded mode or a full modprobed.db")
+        else:
+            raise ProfileError("strict pruning needs modprobed.db (none found; could not generate from lsmod either)")
     else:
         warn("Pruning against the live lsmod set only (modules not currently loaded will be dropped)")
     if mode == "expanded":
@@ -4066,8 +4136,9 @@ def _ops_cpu(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     mx.flag("CPU_IDLE_GOV_TEO", gov == "teo")
     mx.flag("CPU_IDLE_GOV_MENU", gov == "menu")
     mx.n("CPU_IDLE_GOV_LADDER")
-    mx.flag("CPU_IDLE_GOV_HALTPOLL", gov == "haltpoll" or f.virt != "none", optional=True, why="KVM guests only")
-    mx.flag("HALTPOLL_CPUIDLE", f.virt != "none", optional=True)
+    _hv, _ = _virt_guest(f)
+    mx.flag("CPU_IDLE_GOV_HALTPOLL", gov == "haltpoll" or _hv, optional=True, why="KVM guests only")
+    mx.flag("HALTPOLL_CPUIDLE", _hv, optional=True)
     mx.flag("INTEL_IDLE", f.vendor != "amd" or s["meta"]["portable_package"])
     portable = s["meta"]["portable_package"]
     if f.vendor == "intel" or portable:
@@ -4138,7 +4209,7 @@ def _ops_memory(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     m, sec = s["memory"], s["security"]
     lean, minimal, embedded = p.lean("lean"), p.lean("minimal"), p.lean("embedded")
     hardened, extreme = sec["profile"] == "hardened", sec["profile"] == "extreme"
-    vm = f.virt != "none"
+    vm = _virt_guest(f)[0]
     thp = m["thp"]
     mx.y("TRANSPARENT_HUGEPAGE")
     mx.choice(("TRANSPARENT_HUGEPAGE_ALWAYS", "TRANSPARENT_HUGEPAGE_MADVISE", "TRANSPARENT_HUGEPAGE_NEVER"), f"TRANSPARENT_HUGEPAGE_{thp.upper()}", why=f"thp={thp}")
@@ -4524,15 +4595,21 @@ def _ops_network(mx: Matrix, p: KernelProfile, d: Derived) -> None:
 
 def _ops_virt(mx: Matrix, p: KernelProfile, d: Derived) -> None:
     f = d.facts
-    if f.virt != "none":
+    # A VM may be reported by systemd-detect-virt OR inferred from the
+    # hypervisor CPU flag OR from a virtualized GPU (virtio/qxl/bochs/vmware).
+    # If any of these hold we must keep the guest/virtio stack enabled,
+    # otherwise a kernel built in a VM silently loses video (black screen)
+    # because DRM_VIRTIO_GPU depends on VIRTIO_MENU.
+    virt_detected, virt_reason = _virt_guest(f)
+    if virt_detected:
         for sym in ("HYPERVISOR_GUEST", "PARAVIRT", "PARAVIRT_SPINLOCKS", "KVM_GUEST", "VIRTIO_MENU", "VIRTIO_PCI", "VIRTIO_BLK", "VIRTIO_NET", "VIRTIO_CONSOLE",
                     "VIRTIO_BALLOON", "VIRTIO_INPUT", "VIRTIO_FS", "VSOCKETS", "VIRTIO_VSOCKETS", "VIRTIO_MEM", "SCSI_VIRTIO", "HW_RANDOM_VIRTIO", "MEMORY_BALLOON",
                     "BALLOON_COMPACTION", "PAGE_REPORTING", "PTP_1588_CLOCK_KVM", "X86_HV_CALLBACK_VECTOR"):
-            mx.y(sym, why=f"{f.virt} guest", optional=sym in ("PTP_1588_CLOCK_KVM", "X86_HV_CALLBACK_VECTOR", "VIRTIO_MEM"))
+            mx.y(sym, why=f"virtualized guest ({virt_reason})", optional=sym in ("PTP_1588_CLOCK_KVM", "X86_HV_CALLBACK_VECTOR", "VIRTIO_MEM"))
         if f.virt in ("microsoft", "hyperv"):
             for sym in ("HYPERV", "HYPERV_STORAGE", "HYPERV_NET", "HYPERV_BALLOON", "HYPERV_UTILS"):
                 mx.m(sym)
-        if f.virt == "vmware":
+        if f.virt == "vmware" or "vmware" in set(f.gpus):
             for sym in ("VMWARE_VMCI", "VMWARE_BALLOON", "VMWARE_PVSCSI", "VMXNET3", "DRM_VMWGFX"):
                 mx.m(sym)
         return
