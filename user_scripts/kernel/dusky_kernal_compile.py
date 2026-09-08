@@ -4126,7 +4126,7 @@ def derive(p: KernelProfile, facts: HostFacts, idx: KconfigIndex, tree: Path, sc
 
 MANAGED_CMDLINE_KEYS: Final = frozenset({"mitigations", "nosmt", "amd_pstate", "amd_prefcore", "preempt", "cpuidle.governor", "nvme.poll_queues", "zswap.enabled",
                                          "zswap.compressor", "zswap.zpool", "zswap.max_pool_percent", "zswap.shrinker_enabled", "split_lock_detect", "nowatchdog",
-                                         "nmi_watchdog", "pcie_aspm.policy", "transparent_hugepage", "rcu_nocbs", "rcutree.enable_rcu_lazy", "pcie_acs_override"})
+                                         "nmi_watchdog", "pcie_aspm", "pcie_aspm.policy", "transparent_hugepage", "rcu_nocbs", "rcutree.enable_rcu_lazy", "pcie_acs_override"})
 
 
 def flavor_cmdline(p: KernelProfile, facts: HostFacts) -> list[str]:
@@ -5408,11 +5408,14 @@ def install_packages(pkgs: Sequence[Path], profile: KernelProfile) -> None:
 # ---------------------------------------------------------------------------------------------------
 def base_cmdline_tokens(facts: HostFacts) -> list[str]:
     out: list[str] = []
+    seen: set[str] = set()
     for tok in shlex.split(facts.cmdline):
         key = tok.split("=", 1)[0]
         if key in ("BOOT_IMAGE", "initrd", "initrdefi") or key in MANAGED_CMDLINE_KEYS:
             continue
-        out.append(tok)
+        if tok not in seen:
+            seen.add(tok)
+            out.append(tok)
     return out
 
 
@@ -5447,10 +5450,20 @@ def write_bls_entries(p: KernelProfile, facts: HostFacts, d: Derived) -> None:
                 ucode.append(f"initrd  /{img}")
     entries_dir = Path(root) / "loader" / "entries"
     files: dict[Path, tuple[str, str]] = {}
-    for suffix, title in (("", ""), ("-fallback", " (fallback initramfs)")):
-        body = [f"title   Arch Linux ({p.pkgbase}){title}", f"version {d.kernelrelease or d.version}", f"sort-key dusky-{p.suffix}", f"linux   /vmlinuz-{p.pkgbase}",
-                *ucode, f"initrd  /initramfs-{p.pkgbase}{suffix}.img", "options " + " ".join(params)]
-        files[entries_dir / f"{p.pkgbase}{suffix}.conf"] = ("\n".join(body) + "\n", "0644")
+    default_body = [f"title   Arch Linux ({p.pkgbase})", f"version {d.kernelrelease or d.version}", f"sort-key dusky-{p.suffix}", f"linux   /vmlinuz-{p.pkgbase}",
+                    *ucode, f"initrd  /initramfs-{p.pkgbase}.img", "options " + " ".join(params)]
+    files[entries_dir / f"{p.pkgbase}.conf"] = ("\n".join(default_body) + "\n", "0644")
+
+    fallback_img = f"initramfs-{p.pkgbase}-fallback.img"
+    fallback_conf = entries_dir / f"{p.pkgbase}-fallback.conf"
+    has_fallback = (Path(root) / fallback_img).is_file() or (Path("/boot") / fallback_img).is_file()
+    if has_fallback:
+        fb_body = [f"title   Arch Linux ({p.pkgbase}) (fallback initramfs)", f"version {d.kernelrelease or d.version}", f"sort-key dusky-{p.suffix}", f"linux   /vmlinuz-{p.pkgbase}",
+                   *ucode, f"initrd  /{fallback_img}", "options " + " ".join(params)]
+        files[fallback_conf] = ("\n".join(fb_body) + "\n", "0644")
+    elif fallback_conf.is_file():
+        PRIV.run(["rm", "-f", str(fallback_conf)], check=False)
+
     PRIV.write_files(files)
     ok(f"systemd-boot entries written: {', '.join(f.name for f in files)}")
 
@@ -5913,6 +5926,22 @@ def do_uninstall(args: argparse.Namespace) -> int:
         if entries:
             PRIV.run(["rm", "-f", *[str(e) for e in entries]], check=False)
             ok(f"Removed boot entries: {', '.join(e.name for e in entries)}")
+        loader_conf = Path(root) / "loader" / "loader.conf"
+        if loader_conf.is_file():
+            txt = loader_conf.read_text(encoding="utf-8")
+            m = re.search(r"^default\s+(.+)$", txt, re.M)
+            if m and f"linux-{flavor}" in m.group(1):
+                remaining = [e.name for e in sorted((Path(root) / "loader" / "entries").glob("*.conf")) if f"linux-{flavor}" not in e.name]
+                new_default = remaining[0] if remaining else "@saved"
+                new_txt = re.sub(r"^default\s+.*$", f"default {new_default}", txt, flags=re.M)
+                PRIV.write_files({loader_conf: (new_txt, "0644")})
+                ok(f"Reset {loader_conf} default -> {new_default}")
+                if have("bootctl"):
+                    PRIV.run(["bootctl", "set-default", new_default], check=False)
+    preset = Path(f"/etc/mkinitcpio.d/linux-{flavor}.preset")
+    if preset.is_file():
+        PRIV.run(["rm", "-f", str(preset)], check=False)
+        ok(f"Cleaned up {preset}")
     if "grub" in facts.bootloaders and have("grub-mkconfig"):
         PRIV.run(["grub-mkconfig", "-o", "/boot/grub/grub.cfg"], check=False, capture=False)
     return 0
@@ -5961,6 +5990,9 @@ def _resolve_install_profile(pkgbase: str, wanted: str | None, facts: HostFacts)
 def do_install_pkg(args: argparse.Namespace) -> int:
     banner()
     rule("Install saved kernel packages")
+    PRIV.ensure()
+    check_pacman_preflight(require_install=True)
+    check_disk_space("none")
     facts = host_facts()
     files: list[Path] = []
     for a in args.install_pkg:
