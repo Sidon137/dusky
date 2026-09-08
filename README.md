@@ -4,7 +4,7 @@
 
 A community Discord server has been created! You can join it below. Please note that the original developer is not involved with this community server in any capacity.
 
-[Join Community Discord Server](https://discord.gg/V2EeUJwd4)
+[Join Community Discord Server](https://discord.gg/gmyAxpAQYK)
 
 ## Updated demo video now out on YouTube with all major features covered! 
 (since the release of this video around 5 major features have been added, scroll down to the `overview` section for details)
