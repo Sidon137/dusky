@@ -1379,6 +1379,14 @@ icon = ""
 compact = true
 
 [[pages.layout]]
+type = "warning_banner"
+[pages.layout.properties]
+title = ""
+message = "Wayclick needs to be setup first from the setup page"
+icon = ""
+compact = true
+
+[[pages.layout]]
 type = "grid_section"
 [pages.layout.properties]
 title = "Quick Audio"
