@@ -336,8 +336,9 @@ build_helper() {
 
     log_info "Installing ${main_pkg}..."
     wait_for_pacman_lock || return 1
-    # Use --overwrite '*' to ensure corrupted/residual unowned files from prior broken builds are cleanly overwritten.
-    if ! pacman -U --needed --overwrite '*' --noconfirm -- "$main_pkg"; then
+    # No --overwrite: conflicts must fail loudly (handled by the fallback path),
+    # never silently clobber files owned by other packages.
+    if ! pacman -U --needed --noconfirm -- "$main_pkg"; then
         log_error "Failed to install package ${main_pkg}."
         return 1
     fi
