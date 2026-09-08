@@ -5055,6 +5055,74 @@ def compile_kernel(tree: Path, p: KernelProfile, d: Derived, env: Mapping[str, s
     return pkgs
 
 
+_DKMS_STATUS_RE: Final = re.compile(r"^([^/,]+)/([^,]+),\s*([^,]+),\s*[^:]+:\s*(.+)$")
+
+
+def _kernelreleases_for_pkgbases(pkgbases: set[str]) -> dict[str, str]:
+    """Map installed kernelrelease -> pkgbase via /usr/lib/modules/*/pkgbase."""
+    found: dict[str, str] = {}
+    mods = Path("/usr/lib/modules")
+    if not mods.is_dir():
+        return found
+    for d in mods.iterdir():
+        if not d.is_dir():
+            continue
+        try:
+            base = (d / "pkgbase").read_text(encoding="utf-8").strip().splitlines()
+        except OSError:
+            continue
+        if base and base[0].strip() in pkgbases:
+            found[d.name] = base[0].strip()
+    return found
+
+
+def audit_dkms(pkgbases: set[str]) -> bool:
+    """Force-rebuild DKMS modules that are not 'installed' for the given pkgbases.
+
+    Catches same-version reinstall staleness: `dkms status` reports e.g.
+    "nvidia/610.57.04, 7.2.4-dusky-battery: built" and modprobe then fails with
+    "Exec format error / struct module size must match". Best-effort: warns,
+    never raises.
+    """
+    if not have("dkms"):
+        return True
+    try:
+        targets = _kernelreleases_for_pkgbases(set(pkgbases))
+    except OSError:
+        targets = {}
+    if not targets:
+        note("DKMS audit skipped: no installed module dirs match " + ", ".join(sorted(pkgbases)))
+        return True
+    try:
+        cp = run(["dkms", "status"], check=False, timeout=60)
+    except DuskyError as e:
+        warn(f"DKMS audit skipped (dkms status failed): {e}")
+        return True
+    stale: list[tuple[str, str, str, str]] = []
+    for line in (cp.stdout or "").splitlines():
+        m = _DKMS_STATUS_RE.match(line.strip())
+        if not m:
+            continue
+        mod, ver, krel, state = m.group(1), m.group(2), m.group(3), m.group(4)
+        if krel in targets and not state.startswith("installed"):
+            stale.append((mod, ver, krel, state))
+    if not stale:
+        ok("DKMS modules up to date for " + ", ".join(f"{k} ({b})" for k, b in sorted(targets.items())))
+        return True
+    PRIV.ensure()
+    failed: list[str] = []
+    for mod, ver, krel, state in stale:
+        warn(f"DKMS {mod}/{ver} for {krel} is '{state.strip()}' (not installed) -- rebuilding")
+        r = PRIV.run(["dkms", "install", "--force", f"{mod}/{ver}", "-k", krel], check=False)
+        if r.returncode != 0:
+            failed.append(f"{mod}/{ver} for {krel}")
+    if failed:
+        warn("DKMS rebuild failed for: " + ", ".join(failed))
+        return False
+    ok("DKMS modules rebuilt for " + ", ".join(sorted({k for _, _, k, _ in stale})))
+    return True
+
+
 def install_packages(pkgs: Sequence[Path], profile: KernelProfile) -> None:
     rule("Install packages (pacman -U)")
     PRIV.ensure()
@@ -5064,6 +5132,10 @@ def install_packages(pkgs: Sequence[Path], profile: KernelProfile) -> None:
     # strict localmodconfig builds keep accumulating modules. User unit -> no sudo.
     if profile.g("modules", "modprobed_db") and have("modprobed-db"):
         ensure_modprobed_db_service(prompt=False)
+    # Same-version reinstalls can leave DKMS objects stale ("built" instead of
+    # "installed", then Exec format error at modprobe). Audit and force-rebuild.
+    if not audit_dkms({profile.pkgbase}):
+        warn("Some DKMS modules failed to rebuild; fix manually, e.g.: sudo dkms install --force <module>/<version> -k <kernelrelease>")
 
     # Ensure /etc/mkinitcpio.d/<pkgbase>.preset exists for custom flavors
     preset_path = Path(f"/etc/mkinitcpio.d/{profile.pkgbase}.preset")
@@ -5371,7 +5443,7 @@ def do_build(args: argparse.Namespace) -> int:
     pkgs = compile_kernel(tree, profile, d, env, facts)
     d.kernelrelease = kernelrelease(tree, env)
     if args.no_install:
-        ok("Packages built (--no-install). Install later with: sudo pacman -U " + " ".join(str(x) for x in pkgs))
+        ok("Packages built (--no-install). Install later with: sudo pacman -U " + " ".join(str(x) for x in pkgs) + " or --install-pkg " + " ".join(str(x) for x in pkgs))
         return 0
     install_packages(pkgs, profile)
     refresh_boot(profile, facts, d, kernel_install=bool(args.kernel_install))
@@ -5580,6 +5652,82 @@ def do_uninstall(args: argparse.Namespace) -> int:
     return 0
 
 
+def _pkg_file_pkgbase(pkg: Path) -> str:
+    """pkgbase (linux-<flavor>) for a pacman package file, via .PKGINFO or filename."""
+    try:
+        with tarfile.open(pkg, "r:*") as tf:
+            try:
+                member = tf.extractfile(".PKGINFO")
+            except KeyError:
+                member = None
+            if member is not None:
+                with member:
+                    for raw in member.read().decode("utf-8", "replace").splitlines():
+                        if raw.startswith("pkgname = "):
+                            return raw.split("=", 1)[1].strip().removesuffix("-headers")
+    except (tarfile.TarError, OSError, EOFError):
+        pass
+    stem = pkg.name
+    for suf in (".pkg.tar.zst", ".pkg.tar.xz", ".pkg.tar.gz", ".pkg.tar.bz2", ".pkg.tar.lzo", ".pkg.tar"):
+        if stem.endswith(suf):
+            stem = stem[: -len(suf)]
+            break
+    parts = stem.rsplit("-", 3)
+    if len(parts) == 4:
+        return parts[0].removesuffix("-headers")
+    raise ProfileError(f"Cannot determine pkgbase for package file: {pkg}")
+
+
+def _resolve_install_profile(pkgbase: str, wanted: str | None, facts: HostFacts) -> KernelProfile:
+    """Profile driving boot entries for a saved package: --profile, else the
+    known profile with the same pkgbase, else defaults (base cmdline only)."""
+    profiles = ensure_profiles_exist()
+    if wanted:
+        return select_profile(profiles, wanted, facts).clone()
+    for p in profiles:
+        if p.pkgbase == pkgbase:
+            return p.clone()
+    suffix = pkgbase.removeprefix("linux-")
+    info(f"No profile with pkgbase {pkgbase}; using defaults for boot entries (base cmdline only)")
+    return profile_from_tweaks(f"install-{suffix}", f"Reinstall {pkgbase} from saved packages", suffix, {}, 90)
+
+
+def do_install_pkg(args: argparse.Namespace) -> int:
+    banner()
+    rule("Install saved kernel packages")
+    facts = host_facts()
+    files: list[Path] = []
+    for a in args.install_pkg:
+        p = Path(a).expanduser()
+        if not p.is_file():
+            raise ProfileError(f"Package file not found: {p}")
+        if ".pkg.tar" not in p.name:
+            raise ProfileError(f"Not a pacman package file: {p}")
+        files.append(p)
+    groups: dict[str, list[Path]] = {}
+    for f in files:
+        groups.setdefault(_pkg_file_pkgbase(f), []).append(f)
+    JOURNAL.open("install-pkg")
+    note(f"journal: {JOURNAL.path}")
+    for pkgbase, pkgs in sorted(groups.items()):
+        profile = _resolve_install_profile(pkgbase, getattr(args, "profile", None), facts)
+        info(f"{pkgbase}: using profile '{profile.name}' for preset and boot entries")
+        install_packages(sorted(pkgs), profile)
+        krels = sorted(_kernelreleases_for_pkgbases({pkgbase}))
+        if not krels:
+            warn(f"No /usr/lib/modules/<krel> with pkgbase {pkgbase} after install; skipping bootloader refresh")
+            continue
+        for krel in krels:
+            d = Derived(facts=facts, idx=KconfigIndex(frozenset(), 3), tree=Path("."), version=krel, sched="eevdf",
+                        toolchain="llvm", lto="none", btf=False, tracing="minimal", rust=False, rust_reason="",
+                        fdo="none", fdo_reason="", kernelrelease=krel)
+            refresh_boot(profile, facts, d, kernel_install=bool(getattr(args, "kernel_install", False)))
+    rule("Done")
+    ok("Saved packages installed; reboot to test.")
+    send_notification("Kernel packages installed", ", ".join(sorted(groups)), icon="dialog-information")
+    return 0
+
+
 def do_fdo_record(args: argparse.Namespace) -> int:
     banner()
     rule("AutoFDO / Propeller profile recording")
@@ -5780,6 +5928,7 @@ EPILOG: Final = textwrap.dedent(f"""\
       %(prog)s -p zen4_zen5 --configure-only --print-matrix
       %(prog)s --export-bundle / --import-bundle FILE   cross-machine hardware bundles
       %(prog)s --uninstall dusky-gaming        remove packages and boot entries
+      %(prog)s --install-pkg PKG...          install saved packages + preset/initramfs/DKMS/boot entries
     environment: DUSKY_PROFILES_DIR DUSKY_BUILD_DIR DUSKY_PATCH_CACHE DUSKY_THINLTO_CACHE DUSKY_PKGDEST DUSKY_CPU_ARCH DUSKY_LTO DUSKY_JOBS ...
     exit codes: 1 generic, 2 profile, 3 network, 4 verification, 5 build, 6 dependency, 130 aborted
     """)
@@ -5802,6 +5951,7 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--export-bundle", nargs="?", const="", default=None, metavar="FILE", help="export a hardware bundle for remote builds")
     mode.add_argument("--import-bundle", type=Path, metavar="FILE", help="import a hardware bundle and register remote_<host>")
     mode.add_argument("--uninstall", metavar="FLAVOR", help="remove linux-<flavor>{,-headers} and boot entries")
+    mode.add_argument("--install-pkg", nargs="+", metavar="PKG", help="install saved kernel packages by path (pacman -U), then refresh preset/initramfs, DKMS audit and bootloader entries")
     mode.add_argument("--fdo-record", metavar="SECONDS", help="record an AutoFDO profile for --profile (needs perf + create_llvm_prof)")
     mode.add_argument("--fdo-propeller", action="store_true", help="with --fdo-record: also emit Propeller profiles")
     mode.add_argument("--menu", action="store_true", help="interactive main menu")
@@ -5939,9 +6089,9 @@ def interactive_menu() -> int:
         banner()
         say(f"{C.ACCENT}  Main menu{C.RESET}")
         say(" 1) Install toolchains & snapshot the hardware profiler (modprobed-db)\n 2) Live hardware telemetry\n 3) Diagnostics (--doctor)\n 4) Configuration manager & profiles\n"
-            " 5) Export / import remote hardware bundle\n 6) Compile & install a kernel (profile picker)\n 7) Uninstall a Dusky flavor\n 8) Clean caches\n 9) Exit\n")
+            " 5) Export / import remote hardware bundle\n 6) Compile & install a kernel (profile picker)\n 7) Uninstall a Dusky flavor\n 8) Install saved kernel packages\n 9) Clean caches\n 10) Exit\n")
         try:
-            choice = ask_index("Select", 9, 6)
+            choice = ask_index("Select", 10, 6)
         except KeyboardInterrupt:
             return 0
         try:
@@ -5965,6 +6115,10 @@ def interactive_menu() -> int:
                     if flavor:
                         do_uninstall(argparse.Namespace(uninstall=flavor))
                 case 8:
+                    paths = ask("Saved package files (space-separated)", "")
+                    if paths:
+                        do_install_pkg(argparse.Namespace(install_pkg=paths.split(), profile=None, kernel_install=False))
+                case 9:
                     do_clean(argparse.Namespace(clean=ask("What to clean (all|src|tarballs|patches|packages|thinlto|logs|seeds)", "packages,logs")))
                 case _:
                     return 0
@@ -5995,6 +6149,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.uninstall:
             return do_uninstall(args)
+        if args.install_pkg:
+            return do_install_pkg(args)
         if args.fdo_record:
             return do_fdo_record(args)
         if args.spec:
