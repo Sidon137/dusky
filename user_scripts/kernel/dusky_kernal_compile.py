@@ -5161,6 +5161,52 @@ def check_disk_space(lto: str) -> None:
         raise BuildError(f"Only {fmt_bytes(free)} free in {BUILD_DIR}; a kernel build needs >= {fmt_bytes(need)}")
     if free < need:
         warn(f"{fmt_bytes(free)} free in {BUILD_DIR}; builds with debug info can exceed {fmt_bytes(need)}")
+    boot = Path("/boot")
+    if boot.exists():
+        try:
+            boot_free = shutil.disk_usage(boot).free
+            if boot_free < 200 * 1024 * 1024:
+                raise BuildError(f"Only {fmt_bytes(boot_free)} free in /boot; at least 200 MiB required for kernel image and initramfs")
+        except OSError:
+            pass
+    mod_dir = Path("/usr/lib/modules")
+    if mod_dir.exists():
+        try:
+            mod_free = shutil.disk_usage(mod_dir).free
+            if mod_free < 500 * 1024 * 1024:
+                warn(f"Low disk space on {mod_dir}: {fmt_bytes(mod_free)} free")
+        except OSError:
+            pass
+
+
+def check_pacman_preflight(require_install: bool = True) -> None:
+    """Validate pacman readiness before starting compilation to prevent late install failures."""
+    if not require_install:
+        return
+    db_lck = Path("/var/lib/pacman/db.lck")
+    if db_lck.exists():
+        holder = ""
+        try:
+            cp = run(["fuser", str(db_lck)], check=False, capture=True)
+            holder = (cp.stdout or "").strip()
+        except DuskyError:
+            pass
+        if not holder:
+            try:
+                cp = run(["pgrep", "-x", "pacman|paru|yay|makepkg"], check=False, capture=True)
+                holder = (cp.stdout or "").strip()
+            except DuskyError:
+                pass
+        if holder:
+            raise BuildError(f"Pacman database is currently locked by active process PID(s): {holder} ({db_lck}). "
+                             "Please complete or close other package manager operations before compiling.")
+        else:
+            warn(f"Stale pacman database lock detected ({db_lck}) but no active process found holding it. "
+                 "If a previous package manager operation crashed, remove it with: sudo rm /var/lib/pacman/db.lck")
+    try:
+        run(["pacman", "-Qq", "pacman"], check=True, capture=True, timeout=10)
+    except Exception as e:
+        raise BuildError(f"Pacman sanity check failed before compilation: {e}")
 
 
 def check_dependencies(p: KernelProfile, facts: HostFacts, d_toolchain: str, want_rust: bool) -> None:
@@ -5325,7 +5371,7 @@ def audit_dkms(pkgbases: set[str]) -> bool:
 def install_packages(pkgs: Sequence[Path], profile: KernelProfile) -> None:
     rule("Install packages (pacman -U)")
     PRIV.ensure()
-    PRIV.run(["pacman", "-U", "--noconfirm", *[str(x) for x in pkgs]], capture=False)
+    PRIV.run(["pacman", "-U", "--noconfirm", "--overwrite", "*", *[str(x) for x in pkgs]], capture=False)
     ok("Kernel packages installed (mkinitcpio and DKMS pacman hooks have run)")
     # Fresh-install path: (re)assert the modprobed-db writer so future
     # strict localmodconfig builds keep accumulating modules. User unit -> no sudo.
@@ -5615,6 +5661,7 @@ def do_build(args: argparse.Namespace) -> int:
 
     if not args.no_install and not args.configure_only:
         PRIV.ensure()
+        check_pacman_preflight(require_install=True)
     JOURNAL.open(profile.name)
     note(f"journal: {JOURNAL.path}")
     check_dependencies(profile, facts, profile.g("compiler", "toolchain"), bool(profile.g("compiler", "rust")))
