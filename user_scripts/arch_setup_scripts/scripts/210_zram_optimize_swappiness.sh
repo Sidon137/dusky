@@ -121,7 +121,7 @@ if [[ "$MODE" == "AGGRESSIVE" ]] || { [[ "$MODE" == "AUTO" ]] && (( SYSTEM_RAM_K
     EXPECTED_SCALE_FACTOR=100          # 1.0% watermark boost
     EXPECTED_DIRTY_BYTES=1073741824    # 1GiB
     EXPECTED_DIRTY_BG_BYTES=268435456  # 256MiB
-    EXPECTED_DIRTY_WRITEBACK=1500      # 15s (powertop-aligned, fewer disk wakeups; must be < expire)
+    EXPECTED_DIRTY_WRITEBACK=500       # 5s  (must be < expire)
     EXPECTED_DIRTY_EXPIRE=3000         # 30s (kernel default)
     EXPECTED_MGLRU_TTL=1000
 else
